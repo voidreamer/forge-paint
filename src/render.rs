@@ -65,6 +65,7 @@ pub struct Renderer {
     pub frame_bgl: wgpu::BindGroupLayout,
     /// Material bind group layout — used by `PaintTarget` to construct its bind group.
     pub material_bgl: wgpu::BindGroupLayout,
+    pub env_bgl: wgpu::BindGroupLayout,
     pub frame_buf: wgpu::Buffer,
     pub frame_bg: wgpu::BindGroup,
     pub depth: Option<(wgpu::Texture, wgpu::TextureView, [u32; 2])>,
@@ -172,9 +173,10 @@ impl Renderer {
             }],
         });
 
+        let env_bgl = crate::env::env_bgl(device);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pbr_pl"),
-            bind_group_layouts: &[&frame_bgl, &material_bgl],
+            bind_group_layouts: &[&frame_bgl, &material_bgl, &env_bgl],
             push_constant_ranges: &[],
         });
 
@@ -218,6 +220,7 @@ impl Renderer {
             pipeline,
             frame_bgl,
             material_bgl,
+            env_bgl,
             frame_buf,
             frame_bg,
             depth: None,

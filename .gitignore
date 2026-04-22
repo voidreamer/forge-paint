@@ -2,6 +2,11 @@
 **/*.rs.bk
 .DS_Store
 
+# HDRIs — bring your own (Poly Haven CC0 recommended). Keep the folder,
+# skip the heavy binaries.
+/assets/hdri/*.hdr
+/assets/hdri/*.exr
+
 # Editor
 .vscode/
 .idea/

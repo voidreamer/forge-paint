@@ -3,6 +3,7 @@
 mod accel;
 mod app;
 mod camera;
+mod env;
 mod export;
 mod mesh;
 mod paint;

@@ -4,6 +4,7 @@ use glam::Vec2;
 
 use crate::accel::MeshAccel;
 use crate::camera::OrbitCamera;
+use crate::env::{Environment, EnvUniforms};
 use crate::mesh::{CpuMesh, GpuMesh};
 use crate::paint::{
     target::MaterialUniforms, udim, BrushPipeline, BrushUniforms, Compositor, Layer, LayerStack,
@@ -31,6 +32,11 @@ pub struct Viewport {
     /// Material uniform buffer (factors + tile table). Rebuilt on factor
     /// changes via `queue.write_buffer`.
     material_buf: wgpu::Buffer,
+
+    pub env: Environment,
+    pub env_intensity: f32,
+    pub env_rotation_y: f32,
+    pub env_skybox_visible: bool,
 
     pub camera: OrbitCamera,
 
@@ -118,6 +124,8 @@ impl Viewport {
             mapped_at_creation: false,
         });
 
+        let env = Environment::new_procedural(device, queue);
+
         let mut camera = OrbitCamera::default();
         camera.target = gpu.center;
         camera.distance = (gpu.radius * 2.5).max(1.5);
@@ -135,6 +143,10 @@ impl Viewport {
             paint_target,
             layer_stack,
             material_buf,
+            env,
+            env_intensity: 1.0,
+            env_rotation_y: 0.0,
+            env_skybox_visible: false,
             camera,
             brush: BrushState::default(),
             base_color_factor: [1.0, 1.0, 1.0],
@@ -316,6 +328,18 @@ impl Viewport {
                 &self.material_buf,
                 0,
                 bytemuck::bytes_of(&material_uniforms),
+            );
+
+            // Push env uniforms (intensity / rotation / skybox flag — mip_count
+            // is baked by the environment at load time).
+            self.env.write_uniforms(
+                &render_state.queue,
+                &EnvUniforms {
+                    intensity: self.env_intensity,
+                    rotation_y: self.env_rotation_y,
+                    skybox_visible: if self.env_skybox_visible { 1 } else { 0 },
+                    mip_count: self.env.mip_count as f32,
+                },
             );
 
             // Build the material bind group for THIS frame so the active layer's
@@ -524,6 +548,7 @@ impl Viewport {
                 pass.set_pipeline(&self.renderer.pipeline);
                 pass.set_bind_group(0, &self.renderer.frame_bg, &[]);
                 pass.set_bind_group(1, &material_bg, &[]);
+                pass.set_bind_group(2, &self.env.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.mesh.index_count, 0, 0..1);

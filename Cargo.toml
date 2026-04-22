@@ -21,7 +21,8 @@ env_logger = "0.11"
 anyhow = "1"
 thiserror = "2"
 rfd = "0.15"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "hdr", "exr"] }
+half = { version = "2", features = ["bytemuck"] }
 clap = { version = "4", features = ["derive"] }
 
 [profile.dev]

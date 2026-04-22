@@ -23,6 +23,13 @@ struct Material {
     tile_ids: array<vec4<u32>, 8>,  // 32 tile ids packed
 }
 
+struct Env {
+    intensity: f32,
+    rotation_y: f32,
+    skybox_visible: u32,
+    mip_count: f32,
+};
+
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(1) @binding(0) var<uniform> material: Material;
 @group(1) @binding(1) var base_color_tex: texture_2d_array<f32>;
@@ -30,6 +37,9 @@ struct Material {
 @group(1) @binding(3) var normal_tex: texture_2d_array<f32>;
 @group(1) @binding(4) var active_mask_tex: texture_2d_array<f32>;
 @group(1) @binding(5) var texset_sampler: sampler;
+@group(2) @binding(0) var<uniform> env: Env;
+@group(2) @binding(1) var env_tex: texture_2d<f32>;
+@group(2) @binding(2) var env_sampler: sampler;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -98,6 +108,28 @@ fn f_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
+// Equirectangular mapping: world-space direction → (u, v) in [0, 1].
+// Applies env.rotation_y so the user can spin the sky around the mesh.
+fn dir_to_equirect_uv(dir: vec3<f32>) -> vec2<f32> {
+    let c = cos(env.rotation_y);
+    let s = sin(env.rotation_y);
+    let rotated = vec3<f32>(
+        dir.x * c + dir.z * s,
+        dir.y,
+        -dir.x * s + dir.z * c,
+    );
+    let phi = atan2(rotated.z, rotated.x);
+    let theta = asin(clamp(rotated.y, -1.0, 1.0));
+    let u = (phi + PI) / (2.0 * PI);
+    let v = 0.5 - theta / PI;
+    return vec2<f32>(u, v);
+}
+
+fn sample_env(dir: vec3<f32>, lod: f32) -> vec3<f32> {
+    let uv = dir_to_equirect_uv(dir);
+    return textureSampleLevel(env_tex, env_sampler, uv, lod).rgb * env.intensity;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let layer = uv_to_layer(in.uv);
@@ -161,11 +193,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let direct = (diffuse + specular) * frame.light_color.rgb * frame.light_color.w * n_dot_l;
 
-    let hemi_t = 0.5 * (n.y + 1.0);
-    let ambient_color = mix(frame.ambient_ground.rgb, frame.ambient_sky.rgb, hemi_t);
-    let ambient = base_color * ambient_color * (1.0 - metallic * 0.5);
+    // IBL — cheap direct-equirect sampling, no split-sum prefiltering yet.
+    // Diffuse takes the most-blurred mip (low-freq irradiance approximation).
+    // Specular picks a mip by roughness so glossy surfaces look sharp and
+    // rough ones blur out toward the LF environment.
+    let ibl_diffuse_raw = sample_env(n, max(env.mip_count - 1.0, 0.0));
+    let ibl_diffuse = base_color * ibl_diffuse_raw * (1.0 - metallic);
 
-    let lit = direct + ambient;
+    let r = reflect(-v, n);
+    let spec_lod = roughness * max(env.mip_count - 1.0, 0.0);
+    let ibl_spec_raw = sample_env(r, spec_lod);
+    // Re-use the `f0` computed above for the direct lobe — same surface.
+    let ibl_f = f_schlick(n_dot_v, f0);
+    let ibl_specular = ibl_spec_raw * ibl_f;
+
+    let lit = direct + ibl_diffuse + ibl_specular;
     let tonemapped = lit / (lit + vec3<f32>(1.0));
 
     // View mode override — isolate a channel for debugging / inspection.

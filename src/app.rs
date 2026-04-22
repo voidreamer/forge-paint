@@ -240,6 +240,9 @@ impl eframe::App for App {
                     layer_panel(ui, vp, frame);
                     ui.add_space(6.0);
                     ui.separator();
+                    env_panel(ui, vp, frame);
+                    ui.add_space(6.0);
+                    ui.separator();
                 }
                 ui.heading("Paint target");
                 if let Some(vp) = &mut self.viewport {
@@ -532,6 +535,87 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
         }
         if needs_recomposite {
             vp.recomposite(&render_state.device, &render_state.queue);
+        }
+    }
+}
+
+fn env_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
+    ui.heading("Environment");
+
+    // Dropdown of anything in assets/hdri/ + "Procedural default".
+    let bundled = crate::env::discover_bundled_hdris(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
+    let current_name = vp.env.name.clone();
+    let mut load_path: Option<std::path::PathBuf> = None;
+    let mut load_procedural = false;
+
+    ui.horizontal(|ui| {
+        ui.label("sky");
+        egui::ComboBox::from_id_salt("env_dropdown")
+            .selected_text(&current_name)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(current_name == "procedural_studio", "procedural (default)")
+                    .clicked()
+                {
+                    load_procedural = true;
+                }
+                for (name, path) in &bundled {
+                    if ui
+                        .selectable_label(current_name == *name, name.as_str())
+                        .clicked()
+                    {
+                        load_path = Some(path.clone());
+                    }
+                }
+            });
+    });
+
+    ui.horizontal(|ui| {
+        if ui.button("Load HDRI…").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("HDRI", &["hdr", "exr"])
+                .set_title("Load environment HDRI")
+                .pick_file()
+            {
+                load_path = Some(path);
+            }
+        }
+    });
+
+    ui.add(egui::Slider::new(&mut vp.env_intensity, 0.0..=4.0).text("intensity"));
+    ui.add(
+        egui::Slider::new(&mut vp.env_rotation_y, -std::f32::consts::PI..=std::f32::consts::PI)
+            .text("rotation"),
+    );
+
+    if let Some(render_state) = frame.wgpu_render_state() {
+        if load_procedural {
+            vp.env = crate::env::Environment::new_procedural(
+                &render_state.device,
+                &render_state.queue,
+            );
+        } else if let Some(path) = load_path {
+            match crate::env::Environment::load_hdr(
+                &render_state.device,
+                &render_state.queue,
+                &path,
+            ) {
+                Ok(env) => {
+                    log::info!(
+                        "loaded HDRI {} ({}×{}, {} mips)",
+                        env.name,
+                        env.width,
+                        env.height,
+                        env.mip_count
+                    );
+                    vp.env = env;
+                }
+                Err(e) => {
+                    log::error!("failed to load {}: {e:#}", path.display());
+                }
+            }
         }
     }
 }
