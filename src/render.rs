@@ -24,6 +24,7 @@ pub enum ViewMode {
     Roughness,
     Metallic,
     Normal,
+    Mask,
 }
 
 impl ViewMode {
@@ -34,6 +35,7 @@ impl ViewMode {
             ViewMode::Roughness => 2,
             ViewMode::Metallic => 3,
             ViewMode::Normal => 4,
+            ViewMode::Mask => 5,
         }
     }
 
@@ -44,6 +46,7 @@ impl ViewMode {
             ViewMode::Roughness => "Roughness",
             ViewMode::Metallic => "Metallic",
             ViewMode::Normal => "Normal",
+            ViewMode::Mask => "Mask",
         }
     }
 
@@ -53,6 +56,7 @@ impl ViewMode {
         ViewMode::Roughness,
         ViewMode::Metallic,
         ViewMode::Normal,
+        ViewMode::Mask,
     ];
 }
 
@@ -131,8 +135,20 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Active layer mask (R8 D2Array) — shown in Mask view mode,
+                // falls back to a dummy all-1.0 array when the layer has no mask.
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,

@@ -52,8 +52,12 @@ pub struct PaintTarget {
     pub normal_layer_views: Vec<wgpu::TextureView>,
 
     pub sampler: wgpu::Sampler,
-    pub material_buf: wgpu::Buffer,
-    pub material_bg: wgpu::BindGroup,
+
+    /// Shared fully-visible mask bound when the active layer has none. D2Array
+    /// with the same tile count as the content textures so shaders can sample
+    /// it with the UDIM layer index like any real mask.
+    pub dummy_mask: wgpu::Texture,
+    pub dummy_mask_view: wgpu::TextureView,
 }
 
 impl PaintTarget {
@@ -70,7 +74,7 @@ impl PaintTarget {
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        material_bgl: &wgpu::BindGroupLayout,
+        _material_bgl: &wgpu::BindGroupLayout,
         mesh: &CpuMesh,
         resolution: u32,
     ) -> Self {
@@ -219,46 +223,62 @@ impl PaintTarget {
             ..Default::default()
         });
 
-        let mut material_uniforms = MaterialUniforms::default();
-        material_uniforms.tile_count = layer_count;
-        for (i, &tid) in tiles.iter().enumerate() {
-            material_uniforms.tile_ids[i / 4][i % 4] = tid;
+        // Dummy "all 1.0" mask D2Array sized to the same tile count so the
+        // PBR shader can address it with the UDIM layer index when the active
+        // layer has no mask of its own.
+        let dummy_mask = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("paint.dummy_mask"),
+            size: wgpu::Extent3d {
+                width: resolution,
+                height: resolution,
+                depth_or_array_layers: layer_count,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let dummy_mask_view = dummy_mask.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("paint.dummy_mask.array_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        // Clear-fill each layer of the dummy to 1.0
+        {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("paint.dummy_mask.init"),
+            });
+            for layer in 0..layer_count {
+                let view = dummy_mask.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("paint.dummy_mask.init_view"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                });
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("paint.dummy_mask.init_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 1.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+            }
+            queue.submit(Some(encoder.finish()));
         }
-
-        let material_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("paint.material_buf"),
-            size: std::mem::size_of::<MaterialUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&material_buf, 0, bytemuck::bytes_of(&material_uniforms));
-
-        let material_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("paint.material_bg"),
-            layout: material_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: material_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&base_color_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&rough_metal_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&normal_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
 
         Self {
             tiles,
@@ -273,20 +293,21 @@ impl PaintTarget {
             normal_view,
             normal_layer_views,
             sampler,
-            material_buf,
-            material_bg,
+            dummy_mask,
+            dummy_mask_view,
         }
     }
 
-    pub fn update_material_factors(
+    /// Produce a MaterialUniforms value reflecting the tile table + the
+    /// artist's material factors. Viewport owns the buffer; call this to get
+    /// a POD it can `queue.write_buffer` into its own `material_buf`.
+    pub fn material_uniforms(
         &self,
-        queue: &wgpu::Queue,
         base_color_factor: [f32; 4],
         metallic: f32,
         roughness: f32,
         normal_scale: f32,
-    ) {
-        // Preserve tile table — it's static for the lifetime of this paint target.
+    ) -> MaterialUniforms {
         let mut u = MaterialUniforms::default();
         u.base_color_factor = base_color_factor;
         u.params = [metallic, roughness, normal_scale, 0.0];
@@ -294,7 +315,7 @@ impl PaintTarget {
         for (i, &tid) in self.tiles.iter().enumerate() {
             u.tile_ids[i / 4][i % 4] = tid;
         }
-        queue.write_buffer(&self.material_buf, 0, bytemuck::bytes_of(&u));
+        u
     }
 }
 

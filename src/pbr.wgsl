@@ -9,7 +9,7 @@ struct Frame {
     light_color: vec4<f32>,
     ambient_sky: vec4<f32>,
     ambient_ground: vec4<f32>,
-    view_mode: u32,        // 0 Material, 1 BaseColor, 2 Rough, 3 Metal, 4 Normal
+    view_mode: u32,        // 0 Material, 1 BaseColor, 2 Rough, 3 Metal, 4 Normal, 5 Mask
     // 12 bytes of implicit trailing padding — matches Rust's `_pad: [u32; 3]`
     // and the struct's 16-byte alignment requirement.
 }
@@ -28,7 +28,8 @@ struct Material {
 @group(1) @binding(1) var base_color_tex: texture_2d_array<f32>;
 @group(1) @binding(2) var rough_metal_tex: texture_2d_array<f32>;
 @group(1) @binding(3) var normal_tex: texture_2d_array<f32>;
-@group(1) @binding(4) var texset_sampler: sampler;
+@group(1) @binding(4) var active_mask_tex: texture_2d_array<f32>;
+@group(1) @binding(5) var texset_sampler: sampler;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -186,6 +187,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             // Visualise the tangent-space normal as the typical (0.5,0.5,1.0)-
             // biased RGB.
             out_rgb = n_tangent_space * 0.5 + vec3<f32>(0.5);
+        }
+        case 5u: {
+            // Mask preview — grayscale R of the active layer's mask.
+            if layer < 0 {
+                out_rgb = vec3<f32>(0.5);
+            } else {
+                let local_uv = fract(in.uv);
+                let m = textureSample(active_mask_tex, texset_sampler, local_uv, layer).r;
+                out_rgb = vec3<f32>(m);
+            }
         }
         default: {
             out_rgb = tonemapped;

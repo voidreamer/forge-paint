@@ -153,22 +153,54 @@ impl eframe::App for App {
                 ui.heading("Brush");
                 if let Some(vp) = &mut self.viewport {
                     use crate::paint::PaintChannel;
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut vp.brush.channel, PaintChannel::BaseColor, "Color");
-                        ui.radio_value(&mut vp.brush.channel, PaintChannel::Roughness, "Rough");
-                        ui.radio_value(&mut vp.brush.channel, PaintChannel::Metallic, "Metal");
-                    });
-                    match vp.brush.channel {
-                        PaintChannel::BaseColor => {
-                            ui.horizontal(|ui| {
-                                ui.label("color");
-                                ui.color_edit_button_rgb(&mut vp.brush.color_srgb);
-                            });
-                        }
-                        PaintChannel::Roughness
-                        | PaintChannel::Metallic
-                        | PaintChannel::Mask => {
-                            ui.add(egui::Slider::new(&mut vp.brush.value, 0.0..=1.0).text("value"));
+                    if vp.brush.mask_edit {
+                        ui.weak("painting mask — black/white only");
+                        ui.horizontal(|ui| {
+                            let mut white = vp.brush.value >= 0.5;
+                            if ui.radio_value(&mut white, true, "paint (white)").changed()
+                                && white
+                            {
+                                vp.brush.value = 1.0;
+                            }
+                            if ui.radio_value(&mut white, false, "erase (black)").changed()
+                                && !white
+                            {
+                                vp.brush.value = 0.0;
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.radio_value(
+                                &mut vp.brush.channel,
+                                PaintChannel::BaseColor,
+                                "Color",
+                            );
+                            ui.radio_value(
+                                &mut vp.brush.channel,
+                                PaintChannel::Roughness,
+                                "Rough",
+                            );
+                            ui.radio_value(
+                                &mut vp.brush.channel,
+                                PaintChannel::Metallic,
+                                "Metal",
+                            );
+                        });
+                        match vp.brush.channel {
+                            PaintChannel::BaseColor => {
+                                ui.horizontal(|ui| {
+                                    ui.label("color");
+                                    ui.color_edit_button_rgb(&mut vp.brush.color_srgb);
+                                });
+                            }
+                            PaintChannel::Roughness
+                            | PaintChannel::Metallic
+                            | PaintChannel::Mask => {
+                                ui.add(
+                                    egui::Slider::new(&mut vp.brush.value, 0.0..=1.0)
+                                        .text("value"),
+                                );
+                            }
                         }
                     }
                     ui.add(egui::Slider::new(&mut vp.brush.radius, 0.002..=0.3).text("radius"));
@@ -302,12 +334,23 @@ impl eframe::App for App {
                             match vp.view_mode {
                                 ViewMode::BaseColor => {
                                     vp.brush.channel = PaintChannel::BaseColor;
+                                    vp.brush.mask_edit = false;
                                 }
                                 ViewMode::Roughness => {
                                     vp.brush.channel = PaintChannel::Roughness;
+                                    vp.brush.mask_edit = false;
                                 }
                                 ViewMode::Metallic => {
                                     vp.brush.channel = PaintChannel::Metallic;
+                                    vp.brush.mask_edit = false;
+                                }
+                                ViewMode::Mask => {
+                                    // Switch to mask edit if the active layer has
+                                    // one; otherwise leave the brush alone and the
+                                    // viewer just previews the dummy mask.
+                                    if vp.layer_stack.active_layer().mask.is_some() {
+                                        vp.brush.mask_edit = true;
+                                    }
                                 }
                                 ViewMode::Material | ViewMode::Normal => {}
                             }

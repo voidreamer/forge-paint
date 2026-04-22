@@ -6,7 +6,8 @@ use crate::accel::MeshAccel;
 use crate::camera::OrbitCamera;
 use crate::mesh::{CpuMesh, GpuMesh};
 use crate::paint::{
-    udim, BrushPipeline, BrushUniforms, Compositor, Layer, LayerStack, PaintChannel, PaintTarget,
+    target::MaterialUniforms, udim, BrushPipeline, BrushUniforms, Compositor, Layer, LayerStack,
+    PaintChannel, PaintTarget,
 };
 use crate::pick;
 use crate::render::{FrameUniforms, Renderer, ViewMode};
@@ -26,6 +27,10 @@ pub struct Viewport {
     /// The paint stack. Brushes stamp into `layers[active]`; the compositor
     /// flattens the stack into `paint_target` after each stamp batch.
     pub layer_stack: LayerStack,
+
+    /// Material uniform buffer (factors + tile table). Rebuilt on factor
+    /// changes via `queue.write_buffer`.
+    material_buf: wgpu::Buffer,
 
     pub camera: OrbitCamera,
 
@@ -106,6 +111,13 @@ impl Viewport {
         );
         compositor.run_and_submit(device, queue, &layer_stack, &paint_target);
 
+        let material_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("viewport.material_buf"),
+            size: std::mem::size_of::<MaterialUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let mut camera = OrbitCamera::default();
         camera.target = gpu.center;
         camera.distance = (gpu.radius * 2.5).max(1.5);
@@ -122,6 +134,7 @@ impl Viewport {
             accel,
             paint_target,
             layer_stack,
+            material_buf,
             camera,
             brush: BrushState::default(),
             base_color_factor: [1.0, 1.0, 1.0],
@@ -288,8 +301,7 @@ impl Viewport {
                     _pad: [0; 3],
                 },
             );
-            self.paint_target.update_material_factors(
-                &render_state.queue,
+            let material_uniforms = self.paint_target.material_uniforms(
                 [
                     self.base_color_factor[0],
                     self.base_color_factor[1],
@@ -300,6 +312,59 @@ impl Viewport {
                 self.roughness_factor,
                 self.normal_scale,
             );
+            render_state.queue.write_buffer(
+                &self.material_buf,
+                0,
+                bytemuck::bytes_of(&material_uniforms),
+            );
+
+            // Build the material bind group for THIS frame so the active layer's
+            // mask (or the dummy) goes into binding 4.
+            let active_mask_view = match &self.layer_stack.active_layer().mask {
+                Some(m) => &m.array_view,
+                None => &self.paint_target.dummy_mask_view,
+            };
+            let material_bg =
+                render_state
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("viewport.material_bg"),
+                        layout: &self.renderer.material_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.material_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.paint_target.base_color_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.paint_target.rough_metal_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.paint_target.normal_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: wgpu::BindingResource::TextureView(active_mask_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: wgpu::BindingResource::Sampler(
+                                    &self.paint_target.sampler,
+                                ),
+                            },
+                        ],
+                    });
 
             // Try to pick under the cursor (even if not painting — drives UI readout).
             let hover_pos = response
@@ -375,8 +440,16 @@ impl Viewport {
                         let lin = self.brush.color_linear();
                         [lin[0], lin[1], lin[2]]
                     }
-                    PaintChannel::Roughness | PaintChannel::Metallic | PaintChannel::Mask => {
+                    PaintChannel::Roughness | PaintChannel::Metallic => {
                         let v = self.brush.value;
+                        [v, v, v]
+                    }
+                    PaintChannel::Mask => {
+                        // Constrain to pure white (paint / reveal) or pure black
+                        // (erase / hide) — feathering comes from the brush's
+                        // hardness/opacity/falloff, not from intermediate mask
+                        // values.
+                        let v = if self.brush.value >= 0.5 { 1.0 } else { 0.0 };
                         [v, v, v]
                     }
                 };
@@ -450,7 +523,7 @@ impl Viewport {
 
                 pass.set_pipeline(&self.renderer.pipeline);
                 pass.set_bind_group(0, &self.renderer.frame_bg, &[]);
-                pass.set_bind_group(1, &self.paint_target.material_bg, &[]);
+                pass.set_bind_group(1, &material_bg, &[]);
                 pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.mesh.index_count, 0, 0..1);
