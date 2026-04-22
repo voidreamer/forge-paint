@@ -4,7 +4,9 @@ use glam::Vec2;
 
 use crate::accel::MeshAccel;
 use crate::camera::OrbitCamera;
-use crate::env::{BrdfLut, Environment, EnvUniforms, SkyboxPipeline};
+use crate::env::{
+    BrdfLut, Environment, EnvUniforms, IrradianceBaker, PrefilterBaker, SkyboxPipeline,
+};
 use crate::mesh::{CpuMesh, GpuMesh};
 use crate::paint::{
     target::MaterialUniforms, udim, BrushPipeline, BrushUniforms, Compositor, Layer, LayerStack,
@@ -39,6 +41,8 @@ pub struct Viewport {
     pub env_skybox_visible: bool,
     /// Baked once per device at startup; shared across all Environments.
     pub brdf_lut: BrdfLut,
+    pub irradiance_baker: IrradianceBaker,
+    pub prefilter_baker: PrefilterBaker,
     skybox: SkyboxPipeline,
 
     pub camera: OrbitCamera,
@@ -131,7 +135,15 @@ impl Viewport {
         });
 
         let brdf_lut = BrdfLut::new(device, queue);
-        let env = Environment::new_procedural(device, queue, &brdf_lut);
+        let irradiance_baker = IrradianceBaker::new(device);
+        let prefilter_baker = PrefilterBaker::new(device);
+        let env = Environment::new_procedural(
+            device,
+            queue,
+            &brdf_lut,
+            &irradiance_baker,
+            &prefilter_baker,
+        );
         let skybox = SkyboxPipeline::new(
             device,
             &renderer.frame_bgl,
@@ -163,6 +175,8 @@ impl Viewport {
             env_rotation_y: 0.0,
             env_skybox_visible: false,
             brdf_lut,
+            irradiance_baker,
+            prefilter_baker,
             skybox,
             camera,
             brush: BrushState::default(),

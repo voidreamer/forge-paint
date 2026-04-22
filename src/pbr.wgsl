@@ -39,9 +39,11 @@ struct Env {
 @group(1) @binding(5) var texset_sampler: sampler;
 @group(2) @binding(0) var<uniform> env: Env;
 @group(2) @binding(1) var env_tex: texture_2d<f32>;
-@group(2) @binding(2) var env_sampler: sampler;
-@group(2) @binding(3) var brdf_lut: texture_2d<f32>;
-@group(2) @binding(4) var brdf_sampler: sampler;
+@group(2) @binding(2) var irradiance_tex: texture_2d<f32>;
+@group(2) @binding(3) var prefilter_tex: texture_2d<f32>;
+@group(2) @binding(4) var env_sampler: sampler;
+@group(2) @binding(5) var brdf_lut: texture_2d<f32>;
+@group(2) @binding(6) var brdf_sampler: sampler;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -108,6 +110,18 @@ fn v_smith_ggx(n_dot_v: f32, n_dot_l: f32, roughness: f32) -> f32 {
 
 fn f_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+/// ACES filmic tonemap — Narkowicz 2015 fit. Drop-in replacement for Reinhard
+/// with a much softer highlight rolloff and preserved saturation at bright
+/// values. Input: linear scene-referred HDR. Output: [0, 1] display-referred.
+fn aces_narkowicz(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 // Equirectangular mapping: world-space direction → (u, v) in [0, 1].
@@ -195,29 +209,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let direct = (diffuse + specular) * frame.light_color.rgb * frame.light_color.w * n_dot_l;
 
-    // IBL — cheap direct-equirect sampling with a CPU-box-filtered mip chain.
-    // Diffuse uses a mid-high mip (not the very top 1×1, which collapses the
-    // whole env to a single colour — that's why previous builds looked
-    // "neutral" across HDRIs). Stepping back 4 mips keeps horizon / sky /
-    // ground separation so a normal pointing up genuinely sees sky colour.
-    // Proper irradiance convolution is Phase 3.2.3.
-    let diffuse_lod = clamp(env.mip_count - 4.0, 0.0, env.mip_count - 1.0);
-    let ibl_diffuse_raw = sample_env(n, diffuse_lod);
+    // Karis split-sum IBL with properly baked maps:
+    //   diffuse  = irradiance(N) * albedo * (1 - metallic)
+    //   specular = prefilter(R, roughness) * (F0 * lut.r + lut.g)
+    // Irradiance stores (1/N) · Σ L cos-weighted samples (no π factors);
+    // prefilter mip 0 is mirror, last mip is fully rough.
+    let irr_uv = dir_to_equirect_uv(n);
+    let ibl_diffuse_raw =
+        textureSampleLevel(irradiance_tex, env_sampler, irr_uv, 0.0).rgb * env.intensity;
     let ibl_diffuse = base_color * ibl_diffuse_raw * (1.0 - metallic);
 
     let r = reflect(-v, n);
+    let r_uv = dir_to_equirect_uv(r);
     let spec_lod = roughness * max(env.mip_count - 1.0, 0.0);
-    let ibl_spec_raw = sample_env(r, spec_lod);
-    // TODO(brdf_lut): restore Karis split-sum once the LUT readback is
-    // diagnosed. The baked Rg16Float LUT currently produces near-zero
-    // modulation in practice — skybox sees the env fine, but the LUT-gated
-    // IBL path stripped all reflections off metals. Fall back to pure
-    // Schlick IBL (known working from 3.2.1) to keep reflections visible.
+    let ibl_spec_raw =
+        textureSampleLevel(prefilter_tex, env_sampler, r_uv, spec_lod).rgb * env.intensity;
+    // TODO: re-enable Karis split-sum once we fully diagnose the LUT path
+    // (baked values appear to come back wrong — separate from the prefilter
+    // work here, which does light things correctly). Schlick + prefilter is
+    // known-good and visibly lights metals with HDRIs the way we want.
+    let _lut_unused = textureSample(brdf_lut, brdf_sampler, vec2<f32>(n_dot_v, roughness));
     let ibl_f = f_schlick(n_dot_v, f0);
     let ibl_specular = ibl_spec_raw * ibl_f;
 
     let lit = direct + ibl_diffuse + ibl_specular;
-    let tonemapped = lit / (lit + vec3<f32>(1.0));
+    let tonemapped = aces_narkowicz(lit);
 
     // View mode override — isolate a channel for debugging / inspection.
     // The render target is Bgra8UnormSrgb, so the hardware applies sRGB

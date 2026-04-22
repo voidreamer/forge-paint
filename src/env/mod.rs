@@ -6,8 +6,12 @@
 //! Phase 3.2.2a: added BRDF integration LUT for Karis split-sum specular IBL.
 
 pub mod brdf_lut;
+pub mod irradiance;
+pub mod prefilter;
 pub mod skybox;
 pub use brdf_lut::BrdfLut;
+pub use irradiance::IrradianceBaker;
+pub use prefilter::{PrefilterBaker, PREFILTER_MIPS};
 pub use skybox::SkyboxPipeline;
 
 use anyhow::{anyhow, Context, Result};
@@ -47,6 +51,16 @@ pub struct Environment {
     pub width: u32,
     pub height: u32,
     pub mip_count: u32,
+
+    /// Pre-convolved diffuse irradiance (Rgba16Float equirect, no mips).
+    pub irradiance: wgpu::Texture,
+    pub irradiance_view: wgpu::TextureView,
+    /// GGX-prefiltered specular (Rgba16Float equirect with mip chain —
+    /// mip 0 = roughness 0, top mip = roughness 1).
+    pub prefilter: wgpu::Texture,
+    pub prefilter_view: wgpu::TextureView,
+    pub prefilter_mips: u32,
+
     pub name: String,
 }
 
@@ -55,6 +69,8 @@ impl Environment {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         brdf_lut: &BrdfLut,
+        irradiance_baker: &IrradianceBaker,
+        prefilter_baker: &PrefilterBaker,
     ) -> Self {
         // 256×128 sky/ground gradient so the default IBL isn't just a directional
         // light. Small and still good for low-frequency bounce.
@@ -89,6 +105,8 @@ impl Environment {
             device,
             queue,
             brdf_lut,
+            irradiance_baker,
+            prefilter_baker,
             "procedural_studio",
             W,
             H,
@@ -100,6 +118,8 @@ impl Environment {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         brdf_lut: &BrdfLut,
+        irradiance_baker: &IrradianceBaker,
+        prefilter_baker: &PrefilterBaker,
         path: &Path,
     ) -> Result<Self> {
         let img = image::open(path)
@@ -124,17 +144,27 @@ impl Environment {
             .unwrap_or("hdri")
             .to_string();
         Ok(Self::from_equirect_rgba16f(
-            device, queue, brdf_lut, &name, w, h, &pixels,
+            device,
+            queue,
+            brdf_lut,
+            irradiance_baker,
+            prefilter_baker,
+            &name,
+            w,
+            h,
+            &pixels,
         ))
     }
 
     /// Build an `Environment` from already-decoded Rgba16F equirectangular
-    /// pixels. Generates a full mip chain so roughness → LOD works for cheap
-    /// specular IBL.
+    /// pixels. Runs irradiance + GGX prefilter bakes so the PBR shader has
+    /// proper split-sum IBL inputs.
     pub fn from_equirect_rgba16f(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         brdf_lut: &BrdfLut,
+        irradiance_baker: &IrradianceBaker,
+        prefilter_baker: &PrefilterBaker,
         name: &str,
         width: u32,
         height: u32,
@@ -233,6 +263,19 @@ impl Environment {
             dimension: Some(wgpu::TextureViewDimension::D2),
             ..Default::default()
         });
+
+        // Bake the two IBL convolutions from the source equirect (mip 0).
+        let src_mip0_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some(&format!("env.{name}.mip0_view")),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+        let (irradiance, irradiance_view) = irradiance_baker.bake(device, queue, &src_mip0_view);
+        let (prefilter, prefilter_view, prefilter_mips) =
+            prefilter_baker.bake(device, queue, &src_mip0_view);
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("env.sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,    // longitude wraps
@@ -252,7 +295,7 @@ impl Environment {
             mapped_at_creation: false,
         });
         let u = EnvUniforms {
-            mip_count: mip_count as f32,
+            mip_count: prefilter_mips as f32,
             ..Default::default()
         };
         queue.write_buffer(&uniform_buf, 0, bytemuck::bytes_of(&u));
@@ -271,14 +314,22 @@ impl Environment {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
+                    resource: wgpu::BindingResource::TextureView(&irradiance_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&brdf_lut.view),
+                    resource: wgpu::BindingResource::TextureView(&prefilter_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&brdf_lut.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
                     resource: wgpu::BindingResource::Sampler(&brdf_lut.sampler),
                 },
             ],
@@ -294,6 +345,11 @@ impl Environment {
             width,
             height,
             mip_count,
+            irradiance,
+            irradiance_view,
+            prefilter,
+            prefilter_view,
+            prefilter_mips,
             name: name.to_string(),
         }
     }
@@ -307,7 +363,7 @@ pub fn env_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("env_bgl"),
         entries: &[
-            // env uniforms
+            // 0: env uniforms
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -318,7 +374,7 @@ pub fn env_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
-            // equirect env texture
+            // 1: equirect env texture (full-res, used by skybox)
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -329,13 +385,18 @@ pub fn env_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            // 2: irradiance map (diffuse IBL)
             wgpu::BindGroupLayoutEntry {
                 binding: 2,
                 visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
                 count: None,
             },
-            // shared BRDF integration LUT (RG16Float)
+            // 3: GGX-prefiltered specular (with mip chain)
             wgpu::BindGroupLayoutEntry {
                 binding: 3,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -346,8 +407,27 @@ pub fn env_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            // 4: shared env sampler (repeat U, clamp V, linear + mipmap-linear)
             wgpu::BindGroupLayoutEntry {
                 binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            // 5: BRDF integration LUT (RG16Float)
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 6: BRDF clamp sampler
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,

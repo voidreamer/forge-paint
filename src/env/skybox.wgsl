@@ -24,7 +24,9 @@ struct Env {
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(2) @binding(0) var<uniform> env: Env;
 @group(2) @binding(1) var env_tex: texture_2d<f32>;
-@group(2) @binding(2) var env_sampler: sampler;
+// bindings 2 (irradiance) and 3 (prefilter) unused by the skybox
+@group(2) @binding(4) var env_sampler: sampler;
+// bindings 5 (brdf_lut) and 6 (brdf_sampler) unused too
 
 const PI: f32 = 3.14159265359;
 
@@ -60,12 +62,22 @@ fn dir_to_equirect_uv(dir: vec3<f32>) -> vec2<f32> {
     return vec2<f32>((phi + PI) / (2.0 * PI), 0.5 - theta / PI);
 }
 
+/// ACES filmic tonemap (Narkowicz 2015 fit) — kept in sync with the same
+/// function in pbr.wgsl so mesh and sky share the view transform.
+fn aces_narkowicz(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @fragment
 fn fs_sky(in: VsOut) -> @location(0) vec4<f32> {
     let dir = normalize(in.world_dir);
     let uv = dir_to_equirect_uv(dir);
     let rgb = textureSampleLevel(env_tex, env_sampler, uv, 0.0).rgb * env.intensity;
-    // Reinhard tonemap so the skybox matches the mesh's output encoding.
-    let tonemapped = rgb / (rgb + vec3<f32>(1.0));
+    let tonemapped = aces_narkowicz(rgb);
     return vec4<f32>(tonemapped, 1.0);
 }

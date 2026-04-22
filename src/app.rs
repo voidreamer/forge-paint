@@ -639,12 +639,16 @@ fn env_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
                 &render_state.device,
                 &render_state.queue,
                 &vp.brdf_lut,
+                &vp.irradiance_baker,
+                &vp.prefilter_baker,
             );
         } else if let Some(path) = load_path {
             match crate::env::Environment::load_hdr(
                 &render_state.device,
                 &render_state.queue,
                 &vp.brdf_lut,
+                &vp.irradiance_baker,
+                &vp.prefilter_baker,
                 &path,
             ) {
                 Ok(env) => {
