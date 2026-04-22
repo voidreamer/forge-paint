@@ -7,7 +7,7 @@ use crate::camera::OrbitCamera;
 use crate::mesh::{CpuMesh, GpuMesh};
 use crate::paint::{udim, BrushPipeline, BrushUniforms, PaintChannel, PaintTarget};
 use crate::pick;
-use crate::render::{FrameUniforms, Renderer};
+use crate::render::{FrameUniforms, Renderer, ViewMode};
 
 pub struct Viewport {
     renderer: Renderer,
@@ -33,6 +33,8 @@ pub struct Viewport {
     // Lighting
     pub light_intensity: f32,
     pub light_dir: [f32; 3],
+
+    pub view_mode: ViewMode,
 
     pub tile_resolution: u32,
 
@@ -108,6 +110,7 @@ impl Viewport {
             normal_scale: 1.0,
             light_intensity: 3.0,
             light_dir: [-0.4, -1.0, -0.3],
+            view_mode: ViewMode::Material,
             tile_resolution,
             last_hit_uv: None,
             last_hit_tile: None,
@@ -222,6 +225,8 @@ impl Viewport {
                     light_color: [1.0, 0.98, 0.95, self.light_intensity],
                     ambient_sky: [0.35, 0.45, 0.55, 1.0],
                     ambient_ground: [0.08, 0.07, 0.06, 1.0],
+                    view_mode: self.view_mode.as_u32(),
+                    _pad: [0; 3],
                 },
             );
             self.paint_target.update_material_factors(

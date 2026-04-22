@@ -12,6 +12,48 @@ pub struct FrameUniforms {
     pub light_color: [f32; 4],
     pub ambient_sky: [f32; 4],
     pub ambient_ground: [f32; 4],
+    /// Picks what the fragment shader visualises. See `ViewMode::as_u32`.
+    pub view_mode: u32,
+    pub _pad: [u32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Material,
+    BaseColor,
+    Roughness,
+    Metallic,
+    Normal,
+}
+
+impl ViewMode {
+    pub fn as_u32(self) -> u32 {
+        match self {
+            ViewMode::Material => 0,
+            ViewMode::BaseColor => 1,
+            ViewMode::Roughness => 2,
+            ViewMode::Metallic => 3,
+            ViewMode::Normal => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::Material => "Material",
+            ViewMode::BaseColor => "Base Color",
+            ViewMode::Roughness => "Roughness",
+            ViewMode::Metallic => "Metallic",
+            ViewMode::Normal => "Normal",
+        }
+    }
+
+    pub const ALL: &'static [ViewMode] = &[
+        ViewMode::Material,
+        ViewMode::BaseColor,
+        ViewMode::Roughness,
+        ViewMode::Metallic,
+        ViewMode::Normal,
+    ];
 }
 
 pub struct Renderer {

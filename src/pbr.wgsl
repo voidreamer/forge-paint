@@ -9,6 +9,9 @@ struct Frame {
     light_color: vec4<f32>,
     ambient_sky: vec4<f32>,
     ambient_ground: vec4<f32>,
+    view_mode: u32,        // 0 Material, 1 BaseColor, 2 Rough, 3 Metal, 4 Normal
+    // 12 bytes of implicit trailing padding — matches Rust's `_pad: [u32; 3]`
+    // and the struct's 16-byte alignment requirement.
 }
 
 struct Material {
@@ -163,5 +166,30 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let lit = direct + ambient;
     let tonemapped = lit / (lit + vec3<f32>(1.0));
-    return vec4<f32>(tonemapped, 1.0);
+
+    // View mode override — isolate a channel for debugging / inspection.
+    // The render target is Bgra8UnormSrgb, so the hardware applies sRGB
+    // encoding on store. We output linear values throughout.
+    var out_rgb: vec3<f32>;
+    switch frame.view_mode {
+        case 1u: {
+            // Base color — already linear (sampled from Rgba8UnormSrgb).
+            out_rgb = base_color;
+        }
+        case 2u: {
+            out_rgb = vec3<f32>(roughness);
+        }
+        case 3u: {
+            out_rgb = vec3<f32>(metallic);
+        }
+        case 4u: {
+            // Visualise the tangent-space normal as the typical (0.5,0.5,1.0)-
+            // biased RGB.
+            out_rgb = n_tangent_space * 0.5 + vec3<f32>(0.5);
+        }
+        default: {
+            out_rgb = tonemapped;
+        }
+    }
+    return vec4<f32>(out_rgb, 1.0);
 }

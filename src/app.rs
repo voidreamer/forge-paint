@@ -276,6 +276,35 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 22)))
             .show(ctx, |ui| {
                 if let Some(vp) = &mut self.viewport {
+                    ui.horizontal(|ui| {
+                        ui.label("View");
+                        let prev = vp.view_mode;
+                        egui::ComboBox::from_id_salt("viewport_view_mode")
+                            .selected_text(prev.label())
+                            .show_ui(ui, |ui| {
+                                for &mode in crate::render::ViewMode::ALL {
+                                    ui.selectable_value(&mut vp.view_mode, mode, mode.label());
+                                }
+                            });
+                        // When the view is set to a single paintable channel,
+                        // follow with the brush so strokes land on what's shown.
+                        if vp.view_mode != prev {
+                            use crate::paint::PaintChannel;
+                            use crate::render::ViewMode;
+                            match vp.view_mode {
+                                ViewMode::BaseColor => {
+                                    vp.brush.channel = PaintChannel::BaseColor;
+                                }
+                                ViewMode::Roughness => {
+                                    vp.brush.channel = PaintChannel::Roughness;
+                                }
+                                ViewMode::Metallic => {
+                                    vp.brush.channel = PaintChannel::Metallic;
+                                }
+                                ViewMode::Material | ViewMode::Normal => {}
+                            }
+                        }
+                    });
                     vp.show(ui, frame);
                 } else {
                     ui.centered_and_justified(|ui| ui.label("Initializing GPU…"));
