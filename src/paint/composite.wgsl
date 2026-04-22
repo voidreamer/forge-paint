@@ -11,7 +11,8 @@ struct LayerParams {
 @group(0) @binding(1) var base_color_tex: texture_2d<f32>;
 @group(0) @binding(2) var rough_metal_tex: texture_2d<f32>;
 @group(0) @binding(3) var normal_tex: texture_2d<f32>;
-@group(0) @binding(4) var src_sampler: sampler;
+@group(0) @binding(4) var mask_tex: texture_2d<f32>;      // R8, 1.0 = visible
+@group(0) @binding(5) var src_sampler: sampler;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -41,7 +42,8 @@ fn fs_composite(in: VsOut) -> FsOut {
     let bc = textureSample(base_color_tex, src_sampler, in.uv);
     let rm = textureSample(rough_metal_tex, src_sampler, in.uv);
     let nm = textureSample(normal_tex, src_sampler, in.uv);
-    let a = clamp(params.opacity, 0.0, 1.0);
+    let mk = textureSample(mask_tex, src_sampler, in.uv).r;
+    let a = clamp(params.opacity * mk, 0.0, 1.0);
     var out: FsOut;
     // Premultiplied-alpha over-blend is set as the pipeline's per-target
     // blend state; we emit (rgb*a, a) for each output.

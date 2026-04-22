@@ -6,5 +6,5 @@ pub mod udim;
 
 pub use brush::{BrushPipeline, BrushUniforms, PaintChannel};
 pub use composite::Compositor;
-pub use layer::{Layer, LayerStack};
+pub use layer::{Layer, LayerStack, Mask};
 pub use target::{PaintTarget, MAX_TILES};

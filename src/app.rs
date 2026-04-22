@@ -165,7 +165,9 @@ impl eframe::App for App {
                                 ui.color_edit_button_rgb(&mut vp.brush.color_srgb);
                             });
                         }
-                        PaintChannel::Roughness | PaintChannel::Metallic => {
+                        PaintChannel::Roughness
+                        | PaintChannel::Metallic
+                        | PaintChannel::Mask => {
                             ui.add(egui::Slider::new(&mut vp.brush.value, 0.0..=1.0).text("value"));
                         }
                     }
@@ -235,6 +237,7 @@ impl eframe::App for App {
                     ui.label(format!("tile count   {}", tiles.len()));
                     ui.label(format!("vram approx  {}", human_bytes(vram)));
                     egui::ScrollArea::vertical()
+                        .id_salt("tile_list_scroll")
                         .max_height(120.0)
                         .show(ui, |ui| {
                             egui::Grid::new("tile_grid").num_columns(4).show(ui, |ui| {
@@ -352,14 +355,32 @@ fn run_post_export_hook(dir: &std::path::Path) -> String {
 fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
     ui.heading("Layers");
 
+    // Global Paint target: Content vs Mask. Disabled if active layer has no mask.
+    ui.horizontal(|ui| {
+        ui.label("Paint:");
+        let mut edit = vp.brush.mask_edit;
+        ui.radio_value(&mut edit, false, "content");
+        let has_mask = vp.layer_stack.active_layer().mask.is_some();
+        ui.add_enabled_ui(has_mask, |ui| {
+            ui.radio_value(&mut edit, true, "mask");
+        });
+        if !has_mask && edit {
+            edit = false;
+        }
+        vp.brush.mask_edit = edit;
+    });
+
     let mut needs_recomposite = false;
     let mut delete_idx: Option<usize> = None;
     let mut add_requested = false;
+    let mut mask_add: Option<usize> = None;
+    let mut mask_remove: Option<usize> = None;
 
     // Top-down list — index 0 is bottom of stack, so iterate reversed so the
     // topmost (last to composite) is drawn first in the panel.
     let n = vp.layer_stack.layers.len();
     egui::ScrollArea::vertical()
+        .id_salt("layers_scroll")
         .max_height(280.0)
         .show(ui, |ui| {
             for i in (0..n).rev() {
@@ -400,6 +421,33 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
                             delete_idx = Some(i);
                         }
                     });
+
+                    ui.horizontal(|ui| {
+                        let has_mask = vp.layer_stack.layers[i].mask.is_some();
+                        if has_mask {
+                            let editing_this = is_active && vp.brush.mask_edit;
+                            let (content_label, mask_label) = if editing_this {
+                                ("edit content", "[editing mask]")
+                            } else if is_active {
+                                ("[editing content]", "edit mask")
+                            } else {
+                                ("content", "mask")
+                            };
+                            if ui.small_button(content_label).clicked() {
+                                vp.layer_stack.active = i;
+                                vp.brush.mask_edit = false;
+                            }
+                            if ui.small_button(mask_label).clicked() {
+                                vp.layer_stack.active = i;
+                                vp.brush.mask_edit = true;
+                            }
+                            if ui.small_button("×").clicked() {
+                                mask_remove = Some(i);
+                            }
+                        } else if ui.small_button("+ mask").clicked() {
+                            mask_add = Some(i);
+                        }
+                    });
                 });
             }
         });
@@ -419,6 +467,25 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
         }
         if let Some(idx) = delete_idx {
             vp.remove_layer(&render_state.device, &render_state.queue, idx);
+        }
+        if let Some(idx) = mask_add {
+            vp.layer_stack
+                .add_mask_to(idx, &render_state.device, &render_state.queue);
+            // Activate that layer and drop the brush straight into mask-edit —
+            // this is almost always what the user wants after clicking "+ mask".
+            vp.layer_stack.active = idx;
+            vp.brush.mask_edit = true;
+            vp.recomposite(&render_state.device, &render_state.queue);
+        }
+        if let Some(idx) = mask_remove {
+            vp.layer_stack.remove_mask_from(idx);
+            // If we just yanked the mask off the active layer while mask-edit
+            // was on, drop the toggle so paint doesn't try to hit a vanished
+            // texture next frame.
+            if idx == vp.layer_stack.active && vp.brush.mask_edit {
+                vp.brush.mask_edit = false;
+            }
+            vp.recomposite(&render_state.device, &render_state.queue);
         }
         if needs_recomposite {
             vp.recomposite(&render_state.device, &render_state.queue);

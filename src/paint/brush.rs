@@ -15,6 +15,7 @@ pub enum PaintChannel {
     BaseColor,
     Roughness,
     Metallic,
+    Mask,
 }
 
 pub struct BrushPipeline {
@@ -24,6 +25,8 @@ pub struct BrushPipeline {
     pub roughness: wgpu::RenderPipeline,
     /// Writes the B channel of rough_metal (Rgba8Unorm) only.
     pub metallic: wgpu::RenderPipeline,
+    /// Writes an R8Unorm layer mask.
+    pub mask: wgpu::RenderPipeline,
 
     pub bgl: wgpu::BindGroupLayout,
     pub uniform_buf: wgpu::Buffer,
@@ -97,11 +100,21 @@ impl BrushPipeline {
             wgpu::ColorWrites::BLUE,
             "brush_pipe_metallic",
         );
+        // Mask target is R8Unorm — only R exists, so ALL = R.
+        let mask = make_pipeline(
+            device,
+            &shader,
+            &pipeline_layout,
+            wgpu::TextureFormat::R8Unorm,
+            wgpu::ColorWrites::ALL,
+            "brush_pipe_mask",
+        );
 
         Self {
             base_color,
             roughness,
             metallic,
+            mask,
             bgl,
             uniform_buf,
             bind_group,
@@ -113,6 +126,7 @@ impl BrushPipeline {
             PaintChannel::BaseColor => &self.base_color,
             PaintChannel::Roughness => &self.roughness,
             PaintChannel::Metallic => &self.metallic,
+            PaintChannel::Mask => &self.mask,
         }
     }
 

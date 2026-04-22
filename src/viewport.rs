@@ -58,10 +58,12 @@ pub struct Viewport {
 pub struct BrushState {
     pub channel: PaintChannel,
     pub color_srgb: [f32; 3], // base_color
-    pub value: f32,           // 0..1, used for Roughness / Metallic
+    pub value: f32,           // 0..1, used for Roughness / Metallic / Mask
     pub radius: f32,          // in UV units (local to a tile)
     pub hardness: f32,        // 0 soft, 1 hard
     pub opacity: f32,         // 0..1
+    /// When true and the active layer has a mask, paint routes to the mask.
+    pub mask_edit: bool,
 }
 
 impl Default for BrushState {
@@ -73,6 +75,7 @@ impl Default for BrushState {
             radius: 0.04,
             hardness: 0.4,
             opacity: 1.0,
+            mask_edit: false,
         }
     }
 }
@@ -81,7 +84,7 @@ impl Viewport {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, cpu: &CpuMesh) -> Self {
         let renderer = Renderer::new(device, wgpu::TextureFormat::Bgra8UnormSrgb);
         let brush_pipeline = BrushPipeline::new(device);
-        let compositor = Compositor::new(device);
+        let compositor = Compositor::new(device, queue);
         let gpu = GpuMesh::from_cpu(device, cpu);
         let tile_resolution = std::env::var("FORGE_PAINT_RESOLUTION")
             .ok()
@@ -359,18 +362,24 @@ impl Viewport {
                 });
 
             if !strokes.is_empty() {
-                let channel = self.brush.channel;
+                let active = self.layer_stack.active_layer();
+                // If mask-edit is active AND the active layer has a mask, route
+                // to the mask pipeline; otherwise paint the user-selected channel.
+                let channel = if self.brush.mask_edit && active.mask.is_some() {
+                    PaintChannel::Mask
+                } else {
+                    self.brush.channel
+                };
                 let color_comp = match channel {
                     PaintChannel::BaseColor => {
                         let lin = self.brush.color_linear();
                         [lin[0], lin[1], lin[2]]
                     }
-                    PaintChannel::Roughness | PaintChannel::Metallic => {
+                    PaintChannel::Roughness | PaintChannel::Metallic | PaintChannel::Mask => {
                         let v = self.brush.value;
                         [v, v, v]
                     }
                 };
-                let active = self.layer_stack.active_layer();
                 for (layer, local_uv) in &strokes {
                     let uniforms = BrushUniforms {
                         color: [color_comp[0], color_comp[1], color_comp[2], self.brush.opacity],
@@ -384,6 +393,10 @@ impl Viewport {
                         PaintChannel::BaseColor => &active.base_color_layer_views[*layer as usize],
                         PaintChannel::Roughness | PaintChannel::Metallic => {
                             &active.rough_metal_layer_views[*layer as usize]
+                        }
+                        PaintChannel::Mask => {
+                            // Safe — we gated on mask.is_some() above.
+                            &active.mask.as_ref().unwrap().layer_views[*layer as usize]
                         }
                     };
                     self.brush_pipeline.stamp(

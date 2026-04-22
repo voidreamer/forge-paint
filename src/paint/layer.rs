@@ -20,6 +20,91 @@ pub struct Layer {
     pub normal: wgpu::Texture,
     pub normal_view: wgpu::TextureView,
     pub normal_layer_views: Vec<wgpu::TextureView>,
+
+    /// Optional R8 mask (0 = hidden, 1 = fully visible). Absent = fully visible.
+    pub mask: Option<Mask>,
+}
+
+pub struct Mask {
+    pub texture: wgpu::Texture,
+    pub array_view: wgpu::TextureView,
+    pub layer_views: Vec<wgpu::TextureView>,
+}
+
+impl Mask {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resolution: u32,
+        tile_count: u32,
+    ) -> Self {
+        let tile_count = tile_count.max(1);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("layer.mask"),
+            size: wgpu::Extent3d {
+                width: resolution,
+                height: resolution,
+                depth_or_array_layers: tile_count,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("layer.mask.array_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let layer_views: Vec<_> = (0..tile_count)
+            .map(|t| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("layer.mask.tile_view"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: t,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        // Seed to 1.0 everywhere — "fully visible" default.
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mask.init_fill"),
+        });
+        for t in 0..tile_count as usize {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("mask.init_fill_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &layer_views[t],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 1.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        }
+        queue.submit(Some(encoder.finish()));
+
+        Self {
+            texture,
+            array_view,
+            layer_views,
+        }
+    }
 }
 
 impl Layer {
@@ -118,7 +203,24 @@ impl Layer {
             normal,
             normal_view,
             normal_layer_views,
+            mask: None,
         }
+    }
+
+    pub fn add_mask(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resolution: u32,
+        tile_count: u32,
+    ) {
+        if self.mask.is_none() {
+            self.mask = Some(Mask::new(device, queue, resolution, tile_count));
+        }
+    }
+
+    pub fn remove_mask(&mut self) {
+        self.mask = None;
     }
 }
 
@@ -178,6 +280,18 @@ impl LayerStack {
     pub fn set_active(&mut self, idx: usize) {
         if idx < self.layers.len() {
             self.active = idx;
+        }
+    }
+
+    pub fn add_mask_to(&mut self, idx: usize, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if let Some(l) = self.layers.get_mut(idx) {
+            l.add_mask(device, queue, self.resolution, self.tile_count);
+        }
+    }
+
+    pub fn remove_mask_from(&mut self, idx: usize) {
+        if let Some(l) = self.layers.get_mut(idx) {
+            l.remove_mask();
         }
     }
 
