@@ -16,9 +16,10 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> VsOut {
     let y = f32(vid & 2u);
     var out: VsOut;
     out.pos = vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
-    // uv.x ∈ [0, 1] maps to NdotV, uv.y ∈ [0, 1] maps to roughness.
-    // No V-flip needed — texture is sampled directly.
-    out.uv = vec2<f32>(x, y);
+    // V-flip: wgpu's texel (0,0) is top-left, so clip y=+1 must carry uv.y=0.
+    // Without this the bake writes row 0 for roughness=1 and the PBR shader
+    // reads it as roughness=0, inverting every reflection lookup.
+    out.uv = vec2<f32>(x, 1.0 - y);
     return out;
 }
 

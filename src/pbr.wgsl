@@ -195,20 +195,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let direct = (diffuse + specular) * frame.light_color.rgb * frame.light_color.w * n_dot_l;
 
-    // IBL — cheap direct-equirect sampling, no split-sum prefiltering yet.
-    // Diffuse takes the most-blurred mip (low-freq irradiance approximation).
-    // Specular picks a mip by roughness so glossy surfaces look sharp and
-    // rough ones blur out toward the LF environment.
-    let ibl_diffuse_raw = sample_env(n, max(env.mip_count - 1.0, 0.0));
+    // IBL — cheap direct-equirect sampling with a CPU-box-filtered mip chain.
+    // Diffuse uses a mid-high mip (not the very top 1×1, which collapses the
+    // whole env to a single colour — that's why previous builds looked
+    // "neutral" across HDRIs). Stepping back 4 mips keeps horizon / sky /
+    // ground separation so a normal pointing up genuinely sees sky colour.
+    // Proper irradiance convolution is Phase 3.2.3.
+    let diffuse_lod = clamp(env.mip_count - 4.0, 0.0, env.mip_count - 1.0);
+    let ibl_diffuse_raw = sample_env(n, diffuse_lod);
     let ibl_diffuse = base_color * ibl_diffuse_raw * (1.0 - metallic);
 
     let r = reflect(-v, n);
     let spec_lod = roughness * max(env.mip_count - 1.0, 0.0);
     let ibl_spec_raw = sample_env(r, spec_lod);
-    // Karis split-sum: modulate the prefiltered environment by the BRDF
-    // integration LUT (F0-scale in R, F0-bias in G).
-    let brdf = textureSample(brdf_lut, brdf_sampler, vec2<f32>(n_dot_v, roughness)).rg;
-    let ibl_specular = ibl_spec_raw * (f0 * brdf.r + vec3<f32>(brdf.g));
+    // TODO(brdf_lut): restore Karis split-sum once the LUT readback is
+    // diagnosed. The baked Rg16Float LUT currently produces near-zero
+    // modulation in practice — skybox sees the env fine, but the LUT-gated
+    // IBL path stripped all reflections off metals. Fall back to pure
+    // Schlick IBL (known working from 3.2.1) to keep reflections visible.
+    let ibl_f = f_schlick(n_dot_v, f0);
+    let ibl_specular = ibl_spec_raw * ibl_f;
 
     let lit = direct + ibl_diffuse + ibl_specular;
     let tonemapped = lit / (lit + vec3<f32>(1.0));
