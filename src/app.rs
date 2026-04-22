@@ -64,10 +64,23 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.heading("Brush");
                 if let Some(vp) = &mut self.viewport {
+                    use crate::paint::PaintChannel;
                     ui.horizontal(|ui| {
-                        ui.label("color");
-                        ui.color_edit_button_rgb(&mut vp.brush.color_srgb);
+                        ui.radio_value(&mut vp.brush.channel, PaintChannel::BaseColor, "Color");
+                        ui.radio_value(&mut vp.brush.channel, PaintChannel::Roughness, "Rough");
+                        ui.radio_value(&mut vp.brush.channel, PaintChannel::Metallic, "Metal");
                     });
+                    match vp.brush.channel {
+                        PaintChannel::BaseColor => {
+                            ui.horizontal(|ui| {
+                                ui.label("color");
+                                ui.color_edit_button_rgb(&mut vp.brush.color_srgb);
+                            });
+                        }
+                        PaintChannel::Roughness | PaintChannel::Metallic => {
+                            ui.add(egui::Slider::new(&mut vp.brush.value, 0.0..=1.0).text("value"));
+                        }
+                    }
                     ui.add(egui::Slider::new(&mut vp.brush.radius, 0.002..=0.3).text("radius"));
                     ui.add(egui::Slider::new(&mut vp.brush.hardness, 0.0..=1.0).text("hardness"));
                     ui.add(egui::Slider::new(&mut vp.brush.opacity, 0.0..=1.0).text("opacity"));

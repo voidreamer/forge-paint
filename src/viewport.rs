@@ -5,7 +5,7 @@ use glam::Vec2;
 use crate::accel::MeshAccel;
 use crate::camera::OrbitCamera;
 use crate::mesh::{CpuMesh, GpuMesh};
-use crate::paint::{udim, BrushPipeline, BrushUniforms, PaintTarget};
+use crate::paint::{udim, BrushPipeline, BrushUniforms, PaintChannel, PaintTarget};
 use crate::pick;
 use crate::render::{FrameUniforms, Renderer};
 
@@ -40,19 +40,27 @@ pub struct Viewport {
     /// the cursor UV / tile.
     pub last_hit_uv: Option<[f32; 2]>,
     pub last_hit_tile: Option<u32>,
+
+    /// Screen position of the last successful paint stamp, used to interpolate
+    /// stamps between frames so fast drags don't leave gaps.
+    last_paint_pos: Option<egui::Pos2>,
 }
 
 pub struct BrushState {
-    pub color_srgb: [f32; 3],
-    pub radius: f32,   // in UV units (local to a tile)
-    pub hardness: f32, // 0 soft, 1 hard
-    pub opacity: f32,  // 0..1
+    pub channel: PaintChannel,
+    pub color_srgb: [f32; 3], // base_color
+    pub value: f32,           // 0..1, used for Roughness / Metallic
+    pub radius: f32,          // in UV units (local to a tile)
+    pub hardness: f32,        // 0 soft, 1 hard
+    pub opacity: f32,         // 0..1
 }
 
 impl Default for BrushState {
     fn default() -> Self {
         Self {
+            channel: PaintChannel::BaseColor,
             color_srgb: [0.95, 0.2, 0.2],
+            value: 0.5,
             radius: 0.04,
             hardness: 0.4,
             opacity: 1.0,
@@ -63,7 +71,7 @@ impl Default for BrushState {
 impl Viewport {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, cpu: &CpuMesh) -> Self {
         let renderer = Renderer::new(device, wgpu::TextureFormat::Bgra8UnormSrgb);
-        let brush_pipeline = BrushPipeline::new(device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let brush_pipeline = BrushPipeline::new(device);
         let gpu = GpuMesh::from_cpu(device, cpu);
         let tile_resolution = 2048;
         let paint_target = PaintTarget::new(
@@ -99,6 +107,7 @@ impl Viewport {
             tile_resolution,
             last_hit_uv: None,
             last_hit_tile: None,
+            last_paint_pos: None,
         }
     }
 
@@ -243,15 +252,40 @@ impl Viewport {
                 self.last_hit_tile = None;
             }
 
-            // Compute stroke if painting and we hit geometry.
-            let stroke = paint_pos.and_then(|p| {
-                let (orig, dir) = pick::screen_to_ray(p, rect, view_proj, eye);
-                let hit = pick::pick(&self.cpu_mesh, orig, dir)?;
-                let tile = udim::tile_id(hit.uv.to_array());
-                let layer = self.paint_target.layer_for_tile(tile)?;
-                let local_uv = Vec2::new(hit.uv.x - hit.uv.x.floor(), hit.uv.y - hit.uv.y.floor());
-                Some((layer, local_uv))
-            });
+            // Interpolate stamp positions in screen space between last frame's
+            // cursor and this frame's, at ~2 pixel spacing, so fast drags don't
+            // leave gaps. Cap step count as a runaway guard.
+            let stamp_positions: Vec<egui::Pos2> = match (paint_pos, self.last_paint_pos) {
+                (Some(cur), Some(prev)) => {
+                    const STEP_PX: f32 = 2.0;
+                    const MAX_STEPS: u32 = 128;
+                    let delta = cur - prev;
+                    let distance = delta.length();
+                    let steps = ((distance / STEP_PX).ceil() as u32).clamp(1, MAX_STEPS);
+                    (1..=steps)
+                        .map(|i| prev + delta * (i as f32 / steps as f32))
+                        .collect()
+                }
+                (Some(cur), None) => vec![cur],
+                (None, _) => Vec::new(),
+            };
+
+            let strokes: Vec<(u32, Vec2)> = stamp_positions
+                .iter()
+                .filter_map(|p| {
+                    let (orig, dir) = pick::screen_to_ray(*p, rect, view_proj, eye);
+                    let hit = pick::pick(&self.cpu_mesh, orig, dir)?;
+                    let tile = udim::tile_id(hit.uv.to_array());
+                    let layer = self.paint_target.layer_for_tile(tile)?;
+                    let local_uv =
+                        Vec2::new(hit.uv.x - hit.uv.x.floor(), hit.uv.y - hit.uv.y.floor());
+                    Some((layer, local_uv))
+                })
+                .collect();
+
+            // Reset when paint_pos becomes None (button released or modifier
+            // held) so the next stroke starts fresh instead of sweeping back.
+            self.last_paint_pos = paint_pos;
 
             let mut encoder = render_state
                 .device
@@ -259,22 +293,44 @@ impl Viewport {
                     label: Some("forge_paint_enc"),
                 });
 
-            if let Some((layer, local_uv)) = stroke {
-                let linear = self.brush.color_linear();
-                let uniforms = BrushUniforms {
-                    color: [linear[0], linear[1], linear[2], self.brush.opacity],
-                    center_uv: local_uv.to_array(),
-                    radius: self.brush.radius,
-                    hardness: self.brush.hardness,
+            if !strokes.is_empty() {
+                let channel = self.brush.channel;
+                // Brush color components: either linear-sRGB base color or a
+                // grayscale `value` triplet for roughness/metallic — the
+                // pipeline's write-mask selects which channels land.
+                let color_comp = match channel {
+                    PaintChannel::BaseColor => {
+                        let lin = self.brush.color_linear();
+                        [lin[0], lin[1], lin[2]]
+                    }
+                    PaintChannel::Roughness | PaintChannel::Metallic => {
+                        let v = self.brush.value;
+                        [v, v, v]
+                    }
                 };
-                let layer_view =
-                    &self.paint_target.base_color_layer_views[layer as usize];
-                self.brush_pipeline.stamp(
-                    &render_state.queue,
-                    &mut encoder,
-                    layer_view,
-                    &uniforms,
-                );
+                for (layer, local_uv) in &strokes {
+                    let uniforms = BrushUniforms {
+                        color: [color_comp[0], color_comp[1], color_comp[2], self.brush.opacity],
+                        center_uv: local_uv.to_array(),
+                        radius: self.brush.radius,
+                        hardness: self.brush.hardness,
+                    };
+                    let layer_view = match channel {
+                        PaintChannel::BaseColor => {
+                            &self.paint_target.base_color_layer_views[*layer as usize]
+                        }
+                        PaintChannel::Roughness | PaintChannel::Metallic => {
+                            &self.paint_target.rough_metal_layer_views[*layer as usize]
+                        }
+                    };
+                    self.brush_pipeline.stamp(
+                        &render_state.queue,
+                        &mut encoder,
+                        layer_view,
+                        channel,
+                        &uniforms,
+                    );
+                }
             }
 
             // PBR render pass

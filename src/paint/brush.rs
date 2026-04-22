@@ -4,21 +4,34 @@ use egui_wgpu::wgpu;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct BrushUniforms {
-    pub color: [f32; 4],      // linear rgb, opacity in a
-    pub center_uv: [f32; 2],  // local UV [0,1]
-    pub radius: f32,          // UV units
+    pub color: [f32; 4],
+    pub center_uv: [f32; 2],
+    pub radius: f32,
     pub hardness: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaintChannel {
+    BaseColor,
+    Roughness,
+    Metallic,
+}
+
 pub struct BrushPipeline {
-    pub pipeline: wgpu::RenderPipeline,
+    /// Writes to base_color (Rgba8UnormSrgb), ColorWrites::ALL.
+    pub base_color: wgpu::RenderPipeline,
+    /// Writes the G channel of rough_metal (Rgba8Unorm) only.
+    pub roughness: wgpu::RenderPipeline,
+    /// Writes the B channel of rough_metal (Rgba8Unorm) only.
+    pub metallic: wgpu::RenderPipeline,
+
     pub bgl: wgpu::BindGroupLayout,
     pub uniform_buf: wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
 }
 
 impl BrushPipeline {
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("brush.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("brush.wgsl").into()),
@@ -60,82 +73,125 @@ impl BrushPipeline {
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("brush_pipe"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_fullscreen"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_stamp"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState {
-                        // Premultiplied-alpha OVER compositing: src + dst*(1-src.a)
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
+        let base_color = make_pipeline(
+            device,
+            &shader,
+            &pipeline_layout,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::ColorWrites::ALL,
+            "brush_pipe_base_color",
+        );
+        let roughness = make_pipeline(
+            device,
+            &shader,
+            &pipeline_layout,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::ColorWrites::GREEN,
+            "brush_pipe_roughness",
+        );
+        let metallic = make_pipeline(
+            device,
+            &shader,
+            &pipeline_layout,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::ColorWrites::BLUE,
+            "brush_pipe_metallic",
+        );
 
         Self {
-            pipeline,
+            base_color,
+            roughness,
+            metallic,
             bgl,
             uniform_buf,
             bind_group,
         }
     }
 
-    /// Stamp a single brush dab onto `layer_view`, which must be a single-layer
-    /// view of the target texture (matches the pipeline's target format).
+    pub fn pipeline_for(&self, channel: PaintChannel) -> &wgpu::RenderPipeline {
+        match channel {
+            PaintChannel::BaseColor => &self.base_color,
+            PaintChannel::Roughness => &self.roughness,
+            PaintChannel::Metallic => &self.metallic,
+        }
+    }
+
+    /// Stamp a single brush dab onto `layer_view`. Caller is responsible for
+    /// passing a view whose format matches the channel's pipeline.
     pub fn stamp(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         layer_view: &wgpu::TextureView,
+        channel: PaintChannel,
         uniforms: &BrushUniforms,
     ) {
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(uniforms));
-
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("brush_stamp_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: layer_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load, // preserve existing pixels
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
             depth_stencil_attachment: None,
             ..Default::default()
         });
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(self.pipeline_for(channel));
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
+}
+
+fn make_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    pipeline_layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    write_mask: wgpu::ColorWrites,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_fullscreen"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_stamp"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
+                write_mask,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview: None,
+        cache: None,
+    })
 }

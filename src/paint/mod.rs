@@ -2,5 +2,5 @@ pub mod brush;
 pub mod target;
 pub mod udim;
 
-pub use brush::{BrushPipeline, BrushUniforms};
+pub use brush::{BrushPipeline, BrushUniforms, PaintChannel};
 pub use target::{PaintTarget, MAX_TILES};

@@ -45,6 +45,8 @@ pub struct PaintTarget {
 
     pub rough_metal: wgpu::Texture,
     pub rough_metal_view: wgpu::TextureView,
+    pub rough_metal_layer_views: Vec<wgpu::TextureView>,
+
     pub normal: wgpu::Texture,
     pub normal_view: wgpu::TextureView,
 
@@ -110,11 +112,22 @@ impl PaintTarget {
         let rough_metal_view = make_array_view(&rough_metal);
         let normal_view = make_array_view(&normal);
 
-        // Per-layer views for render-attachment stamping on base_color.
+        // Per-layer views for render-attachment stamping on base_color and rough_metal.
         let base_color_layer_views: Vec<wgpu::TextureView> = (0..layer_count)
             .map(|layer| {
                 base_color.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("paint.base_color.layer_view"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let rough_metal_layer_views: Vec<wgpu::TextureView> = (0..layer_count)
+            .map(|layer| {
+                rough_metal.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("paint.rough_metal.layer_view"),
                     dimension: Some(wgpu::TextureViewDimension::D2),
                     base_array_layer: layer,
                     array_layer_count: Some(1),
@@ -243,6 +256,7 @@ impl PaintTarget {
             base_color_layer_views,
             rough_metal,
             rough_metal_view,
+            rough_metal_layer_views,
             normal,
             normal_view,
             sampler,
