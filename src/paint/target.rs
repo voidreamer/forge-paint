@@ -123,15 +123,65 @@ impl PaintTarget {
             })
             .collect();
 
-        // Seed every layer with neutral content
+        // Seed every layer with neutral defaults via GPU clear-fill render passes —
+        // avoids allocating a full resolution²·4·3·N host buffer per asset load.
+        //
+        // Clear colours are authored so the stored pixel bytes match the intended
+        // neutrals. For sRGB targets the hardware linear→sRGB-encodes on store, so
+        // the clear value must be pre-linearized. For unorm targets it's stored
+        // as-is (clear value and byte value / 255 coincide).
+        let bc_clear = wgpu::Color {
+            // Target bytes (180,180,180,255) in sRGB → linear 0.4485
+            r: srgb_to_linear(180.0 / 255.0) as f64,
+            g: srgb_to_linear(180.0 / 255.0) as f64,
+            b: srgb_to_linear(180.0 / 255.0) as f64,
+            a: 1.0,
+        };
+        let rm_clear = wgpu::Color {
+            // glTF packing: R=AO(1), G=roughness(0.5), B=metallic(0)
+            r: 1.0,
+            g: 128.0 / 255.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let nm_clear = wgpu::Color {
+            // Flat tangent-space normal (0.5, 0.5, 1.0) stored as bytes (128,128,255)
+            r: 128.0 / 255.0,
+            g: 128.0 / 255.0,
+            b: 1.0,
+            a: 1.0,
+        };
+
+        // Pre-allocate per-layer views for each channel; keep them alive through
+        // encoder submission, then drop.
+        let mut fills: Vec<(wgpu::TextureView, wgpu::Color)> =
+            Vec::with_capacity((layer_count * 3) as usize);
         for layer in 0..layer_count {
-            // Base color: mid gray
-            upload_solid_layer(queue, &base_color, resolution, layer, [180, 180, 180, 255]);
-            // rough_metal glTF-style packing: R=AO(1), G=roughness(0.5), B=metallic(0)
-            upload_solid_layer(queue, &rough_metal, resolution, layer, [255, 128, 0, 255]);
-            // Normal: flat tangent-space (0.5, 0.5, 1.0) in unorm
-            upload_solid_layer(queue, &normal, resolution, layer, [128, 128, 255, 255]);
+            fills.push((make_layer_view(&base_color, layer), bc_clear));
+            fills.push((make_layer_view(&rough_metal, layer), rm_clear));
+            fills.push((make_layer_view(&normal, layer), nm_clear));
         }
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("paint.default_fill_enc"),
+        });
+        for (view, clear) in &fills {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("paint.default_fill_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(*clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        }
+        queue.submit(Some(encoder.finish()));
+        drop(fills);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("paint.sampler"),
@@ -240,9 +290,10 @@ fn create_array_texture(
         dimension: wgpu::TextureDimension::D2,
         format,
         // TEXTURE_BINDING for sampling; COPY_DST for queue.write_texture;
-        // RENDER_ATTACHMENT for the brush-stamp pass coming in Phase 1c.
+        // RENDER_ATTACHMENT for brush-stamp passes; COPY_SRC for export readback.
         usage: wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
             | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     })
@@ -256,45 +307,22 @@ fn make_array_view(tex: &wgpu::Texture) -> wgpu::TextureView {
     })
 }
 
-fn upload_solid_layer(
-    queue: &wgpu::Queue,
-    tex: &wgpu::Texture,
-    resolution: u32,
-    layer: u32,
-    rgba: [u8; 4],
-) {
-    // One solid-color row, then write it `resolution` times via a buffer we
-    // build on the fly. Cheap and simple; no staging buffer plumbing.
-    let row_bytes = (resolution * 4) as usize;
-    let mut row = Vec::with_capacity(row_bytes);
-    for _ in 0..resolution {
-        row.extend_from_slice(&rgba);
+fn make_layer_view(tex: &wgpu::Texture, layer: u32) -> wgpu::TextureView {
+    tex.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("paint.clear_layer_view"),
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        base_array_layer: layer,
+        array_layer_count: Some(1),
+        ..Default::default()
+    })
+}
+
+/// Inverse of the sRGB-encode used on store for Rgba8UnormSrgb render targets.
+/// Keeps clear colours in the space the hardware expects (linear).
+fn srgb_to_linear(s: f32) -> f32 {
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
     }
-    let mut layer_data = Vec::with_capacity(row_bytes * resolution as usize);
-    for _ in 0..resolution {
-        layer_data.extend_from_slice(&row);
-    }
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d {
-                x: 0,
-                y: 0,
-                z: layer,
-            },
-            aspect: wgpu::TextureAspect::All,
-        },
-        &layer_data,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(resolution * 4),
-            rows_per_image: Some(resolution),
-        },
-        wgpu::Extent3d {
-            width: resolution,
-            height: resolution,
-            depth_or_array_layers: 1,
-        },
-    );
 }

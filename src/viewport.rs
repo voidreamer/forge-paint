@@ -2,6 +2,7 @@ use eframe::egui;
 use egui_wgpu::wgpu;
 use glam::Vec2;
 
+use crate::accel::MeshAccel;
 use crate::camera::OrbitCamera;
 use crate::mesh::{CpuMesh, GpuMesh};
 use crate::paint::{udim, BrushPipeline, BrushUniforms, PaintTarget};
@@ -16,6 +17,7 @@ pub struct Viewport {
 
     mesh: GpuMesh,
     cpu_mesh: CpuMesh,
+    accel: MeshAccel,
     paint_target: PaintTarget,
 
     pub camera: OrbitCamera,
@@ -76,6 +78,7 @@ impl Viewport {
         camera.target = gpu.center;
         camera.distance = (gpu.radius * 2.5).max(1.5);
 
+        let accel = MeshAccel::build(cpu);
         Self {
             renderer,
             brush_pipeline,
@@ -83,6 +86,7 @@ impl Viewport {
             egui_tex_id: None,
             mesh: gpu,
             cpu_mesh: cpu.clone(),
+            accel,
             paint_target,
             camera,
             brush: BrushState::default(),
@@ -104,6 +108,7 @@ impl Viewport {
         self.camera.distance = (gpu.radius * 2.5).max(1.5);
         self.mesh = gpu;
         self.cpu_mesh = cpu.clone();
+        self.accel = MeshAccel::build(cpu);
         self.paint_target = PaintTarget::new(
             device,
             queue,
@@ -121,6 +126,36 @@ impl Viewport {
 
     pub fn tile_resolution(&self) -> u32 {
         self.paint_target.resolution
+    }
+
+    pub fn paint_target(&self) -> &PaintTarget {
+        &self.paint_target
+    }
+
+    /// Rebuild the paint target at a new per-tile resolution. Painted content
+    /// is discarded — callers should warn the user first.
+    pub fn set_tile_resolution(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resolution: u32,
+    ) {
+        self.tile_resolution = resolution;
+        self.paint_target = PaintTarget::new(
+            device,
+            queue,
+            &self.renderer.material_bgl,
+            &self.cpu_mesh,
+            resolution,
+        );
+    }
+
+    /// Approximate VRAM used by the paint target in bytes.
+    /// 3 channels × N tiles × res² × 4 bytes per texel.
+    pub fn paint_target_vram_bytes(&self) -> u64 {
+        let res = self.paint_target.resolution as u64;
+        let tiles = self.paint_target.tiles.len() as u64;
+        3 * tiles * res * res * 4
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {

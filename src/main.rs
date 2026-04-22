@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accel;
 mod app;
 mod camera;
+mod export;
 mod mesh;
 mod paint;
 mod pick;

@@ -31,6 +31,10 @@ impl eframe::App for App {
                         self.open_usd_dialog(frame);
                         ui.close_menu();
                     }
+                    if ui.button("Export Textures…").clicked() {
+                        self.export_textures_dialog(frame);
+                        ui.close_menu();
+                    }
                     ui.separator();
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -100,9 +104,30 @@ impl eframe::App for App {
                 ui.heading("Paint target");
                 if let Some(vp) = &mut self.viewport {
                     let tiles = vp.tiles().to_vec();
-                    let res = vp.tile_resolution();
-                    ui.label(format!("resolution   {res}×{res}"));
+                    let cur_res = vp.tile_resolution();
+                    let vram = vp.paint_target_vram_bytes();
+                    ui.horizontal(|ui| {
+                        ui.label("resolution");
+                        let mut new_res = cur_res;
+                        egui::ComboBox::from_id_salt("tile_res_combo")
+                            .selected_text(format!("{cur_res}×{cur_res}"))
+                            .show_ui(ui, |ui| {
+                                for &r in &[1024u32, 2048, 4096, 8192] {
+                                    ui.selectable_value(&mut new_res, r, format!("{r}×{r}"));
+                                }
+                            });
+                        if new_res != cur_res {
+                            if let Some(rs) = frame.wgpu_render_state() {
+                                vp.set_tile_resolution(&rs.device, &rs.queue, new_res);
+                                self.status = format!(
+                                    "Rebuilt paint target @ {new_res}×{new_res} (painted content discarded)"
+                                );
+                                log::info!("{}", self.status);
+                            }
+                        }
+                    });
                     ui.label(format!("tile count   {}", tiles.len()));
+                    ui.label(format!("vram approx  {}", human_bytes(vram)));
                     egui::ScrollArea::vertical()
                         .max_height(120.0)
                         .show(ui, |ui| {
@@ -158,7 +183,59 @@ impl eframe::App for App {
     }
 }
 
+fn human_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if n >= GB {
+        format!("{:.2} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
+    }
+}
+
 impl App {
+    fn export_textures_dialog(&mut self, frame: &eframe::Frame) {
+        let Some(render_state) = frame.wgpu_render_state() else {
+            self.status = "No GPU render state available.".to_string();
+            return;
+        };
+        let Some(vp) = &self.viewport else {
+            self.status = "Viewport not initialized yet.".to_string();
+            return;
+        };
+
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("Export textures to folder")
+            .pick_folder()
+        else {
+            return;
+        };
+
+        match crate::export::export_tiles(
+            &render_state.device,
+            &render_state.queue,
+            vp.paint_target(),
+            &dir,
+        ) {
+            Ok(exports) => {
+                self.status = format!("Exported {} files to {}", exports.len(), dir.display());
+                log::info!("{}", self.status);
+                for e in &exports {
+                    log::info!("  {} {} -> {}", e.channel, e.udim, e.path.display());
+                }
+            }
+            Err(e) => {
+                self.status = format!("Export failed: {e:#}");
+                log::error!("{}", self.status);
+            }
+        }
+    }
+
     fn open_usd_dialog(&mut self, frame: &eframe::Frame) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("USD", &["usd", "usda", "usdc", "usdz"])
