@@ -10,7 +10,9 @@ struct Frame {
     ambient_sky: vec4<f32>,
     ambient_ground: vec4<f32>,
     view_mode: u32,        // 0 Material, 1 BaseColor, 2 Rough, 3 Metal, 4 Normal, 5 Mask
-    // 12 bytes of implicit trailing padding — matches Rust's `_pad: [u32; 3]`.
+    tonemap_mode: u32,     // 0 None, 1 Reinhard, 2 ACES, 3 Filmic (UC2)
+    exposure: f32,         // pre-tonemap linear multiplier (= 2^stops)
+    _pad: u32,
     inv_view_proj: mat4x4<f32>,
 }
 
@@ -112,9 +114,7 @@ fn f_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
-/// ACES filmic tonemap — Narkowicz 2015 fit. Drop-in replacement for Reinhard
-/// with a much softer highlight rolloff and preserved saturation at bright
-/// values. Input: linear scene-referred HDR. Output: [0, 1] display-referred.
+/// ACES filmic tonemap — Narkowicz 2015 fit.
 fn aces_narkowicz(x: vec3<f32>) -> vec3<f32> {
     let a = 2.51;
     let b = 0.03;
@@ -122,6 +122,42 @@ fn aces_narkowicz(x: vec3<f32>) -> vec3<f32> {
     let d = 0.59;
     let e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+/// Filmic tonemap (Hable / Uncharted 2). Similar filmic feel to ACES but
+/// with a different shoulder/toe shape — many artists prefer this one for
+/// lookdev.
+fn filmic_uc2(x: vec3<f32>) -> vec3<f32> {
+    let A = 0.15;
+    let B = 0.50;
+    let C = 0.10;
+    let D = 0.20;
+    let E = 0.02;
+    let F = 0.30;
+    let W = 11.2;
+    let curr = ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+    let white = vec3<f32>(W);
+    let white_scale = ((white * (A * white + C * B) + D * E)
+        / (white * (A * white + B) + D * F))
+        - E / F;
+    return clamp(curr / white_scale, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn apply_tonemap(x: vec3<f32>, mode: u32) -> vec3<f32> {
+    switch mode {
+        case 1u: {
+            return x / (x + vec3<f32>(1.0));
+        }
+        case 2u: {
+            return aces_narkowicz(x);
+        }
+        case 3u: {
+            return filmic_uc2(x);
+        }
+        default: {
+            return clamp(x, vec3<f32>(0.0), vec3<f32>(1.0));
+        }
+    }
 }
 
 // Equirectangular mapping: world-space direction → (u, v) in [0, 1].
@@ -233,7 +269,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ibl_specular = ibl_spec_raw * ibl_f;
 
     let lit = direct + ibl_diffuse + ibl_specular;
-    let tonemapped = aces_narkowicz(lit);
+    let lit_exposed = lit * frame.exposure;
+    let tonemapped = apply_tonemap(lit_exposed, frame.tonemap_mode);
 
     // View mode override — isolate a channel for debugging / inspection.
     // The render target is Bgra8UnormSrgb, so the hardware applies sRGB

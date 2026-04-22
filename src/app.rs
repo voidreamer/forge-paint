@@ -497,6 +497,22 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
 
                     ui.horizontal(|ui| {
                         let layer = &mut vp.layer_stack.layers[i];
+                        use crate::paint::BlendMode;
+                        let before = layer.blend_mode;
+                        egui::ComboBox::from_id_salt(("blend_mode", i))
+                            .selected_text(layer.blend_mode.label())
+                            .show_ui(ui, |ui| {
+                                for &mode in BlendMode::ALL {
+                                    ui.selectable_value(
+                                        &mut layer.blend_mode,
+                                        mode,
+                                        mode.label(),
+                                    );
+                                }
+                            });
+                        if layer.blend_mode != before {
+                            needs_recomposite = true;
+                        }
                         let resp = ui.add(
                             egui::Slider::new(&mut layer.opacity, 0.0..=1.0)
                                 .show_value(true)
@@ -632,6 +648,23 @@ fn env_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
             .text("rotation"),
     );
     ui.checkbox(&mut vp.env_skybox_visible, "show sky");
+
+    ui.add_space(6.0);
+    ui.label("Tonemap");
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("tonemap_mode")
+            .selected_text(vp.tonemap_mode.label())
+            .show_ui(ui, |ui| {
+                for &mode in crate::render::TonemapMode::ALL {
+                    ui.selectable_value(&mut vp.tonemap_mode, mode, mode.label());
+                }
+            });
+    });
+    ui.add(
+        egui::Slider::new(&mut vp.exposure_stops, -4.0..=4.0)
+            .text("exposure (stops)")
+            .show_value(true),
+    );
 
     if let Some(render_state) = frame.wgpu_render_state() {
         if load_procedural {

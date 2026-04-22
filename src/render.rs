@@ -14,10 +14,47 @@ pub struct FrameUniforms {
     pub ambient_ground: [f32; 4],
     /// Picks what the fragment shader visualises. See `ViewMode::as_u32`.
     pub view_mode: u32,
-    pub _pad: [u32; 3],
+    /// Which tonemap curve to run after lighting. See `TonemapMode::as_u32`.
+    pub tonemap_mode: u32,
+    /// Pre-tonemap linear multiplier (= 2^exposure_stops).
+    pub exposure: f32,
+    pub _pad: u32,
     /// Inverse of `view_proj` — used by the skybox vertex shader to
     /// reconstruct a world-space ray direction from clip-space NDC.
     pub inv_view_proj: [[f32; 4]; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TonemapMode {
+    None,
+    Reinhard,
+    Aces,
+    Filmic,
+}
+
+impl TonemapMode {
+    pub fn as_u32(self) -> u32 {
+        match self {
+            TonemapMode::None => 0,
+            TonemapMode::Reinhard => 1,
+            TonemapMode::Aces => 2,
+            TonemapMode::Filmic => 3,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            TonemapMode::None => "None (clamp)",
+            TonemapMode::Reinhard => "Reinhard",
+            TonemapMode::Aces => "ACES filmic",
+            TonemapMode::Filmic => "Filmic (UC2)",
+        }
+    }
+    pub const ALL: &'static [TonemapMode] = &[
+        TonemapMode::None,
+        TonemapMode::Reinhard,
+        TonemapMode::Aces,
+        TonemapMode::Filmic,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

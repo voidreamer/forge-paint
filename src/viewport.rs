@@ -13,7 +13,7 @@ use crate::paint::{
     PaintChannel, PaintTarget,
 };
 use crate::pick;
-use crate::render::{FrameUniforms, Renderer, ViewMode};
+use crate::render::{FrameUniforms, Renderer, TonemapMode, ViewMode};
 
 pub struct Viewport {
     renderer: Renderer,
@@ -60,6 +60,11 @@ pub struct Viewport {
     pub light_dir: [f32; 3],
 
     pub view_mode: ViewMode,
+
+    pub tonemap_mode: TonemapMode,
+    /// Exposure compensation in stops (−∞..∞ in principle; UI caps at ±4).
+    /// Shader receives `2^stops` as a linear pre-tonemap multiplier.
+    pub exposure_stops: f32,
 
     pub tile_resolution: u32,
 
@@ -187,6 +192,8 @@ impl Viewport {
             light_intensity: 3.0,
             light_dir: [-0.4, -1.0, -0.3],
             view_mode: ViewMode::Material,
+            tonemap_mode: TonemapMode::Aces,
+            exposure_stops: 0.0,
             tile_resolution,
             last_hit_uv: None,
             last_hit_tile: None,
@@ -377,7 +384,9 @@ impl Viewport {
                     ambient_sky: [0.35, 0.45, 0.55, 1.0],
                     ambient_ground: [0.08, 0.07, 0.06, 1.0],
                     view_mode: self.view_mode.as_u32(),
-                    _pad: [0; 3],
+                    tonemap_mode: self.tonemap_mode.as_u32(),
+                    exposure: (2.0_f32).powf(self.exposure_stops),
+                    _pad: 0,
                     inv_view_proj: inv_view_proj.to_cols_array_2d(),
                 },
             );

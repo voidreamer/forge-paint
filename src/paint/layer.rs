@@ -4,10 +4,37 @@
 
 use egui_wgpu::wgpu;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Add,
+}
+
+impl BlendMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+            BlendMode::Add => "Add",
+        }
+    }
+
+    pub const ALL: &'static [BlendMode] = &[
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Add,
+    ];
+}
+
 pub struct Layer {
     pub name: String,
     pub opacity: f32,
     pub visible: bool,
+    pub blend_mode: BlendMode,
 
     pub base_color: wgpu::Texture,
     pub base_color_view: wgpu::TextureView,               // full array view
@@ -194,6 +221,7 @@ impl Layer {
             name: name.into(),
             opacity: 1.0,
             visible: true,
+            blend_mode: BlendMode::Normal,
             base_color,
             base_color_view,
             base_color_layer_views,

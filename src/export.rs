@@ -142,9 +142,14 @@ pub fn export_tiles(
         .par_iter()
         .zip(blocks.par_iter())
         .map(|(rb, rgba)| {
+            // V-flip: produce PNGs with the OpenGL-convention external tools
+            // (Maya / Houdini / Substance / glTF) expect. Mirrors the flip
+            // we apply on import, so round-trips through forge-paint are
+            // stable.
+            let flipped = crate::persist::flip_rows_rgba8(rgba, resolution, resolution);
             image::save_buffer_with_format(
                 &rb.path,
-                rgba,
+                &flipped,
                 resolution,
                 resolution,
                 image::ColorType::Rgba8,

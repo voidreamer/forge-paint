@@ -61,23 +61,26 @@ pub fn load_sidecars(
             match image::open(&path) {
                 Ok(img) => {
                     let rgba = img.to_rgba8();
-                    if rgba.width() != resolution || rgba.height() != resolution {
+                    let (w, h) = (rgba.width(), rgba.height());
+                    if w != resolution || h != resolution {
                         log::warn!(
-                            "sidecar {} is {}×{}, expected {}×{} — skipping",
-                            path.display(),
-                            rgba.width(),
-                            rgba.height(),
-                            resolution,
-                            resolution
+                            "sidecar {} is {w}×{h}, expected {resolution}×{resolution} — skipping",
+                            path.display()
                         );
                         continue;
                     }
+                    // External DCCs (Maya/Houdini/Substance/glTF) store PNGs
+                    // with row 0 as the visual top and sample with V=0 at the
+                    // visual bottom. wgpu samples with V=0 at row 0. Flip
+                    // rows on upload so content lands under the mesh UV the
+                    // external tools expect.
+                    let flipped = flip_rows_rgba8(rgba.as_raw(), w, h);
                     upload_layer(
                         queue,
                         tex_getter(layer),
                         resolution,
                         layer_idx as u32,
-                        rgba.as_raw(),
+                        &flipped,
                     );
                     loaded += 1;
                     log::info!(
@@ -105,6 +108,21 @@ pub fn save_sidecars(
     std::fs::create_dir_all(work_dir)
         .with_context(|| format!("create work dir {}", work_dir.display()))?;
     crate::export::export_tiles(device, queue, paint_target, work_dir)
+}
+
+/// Row-reverse a tightly-packed RGBA8 bitmap. Used at the PNG ↔ GPU boundary
+/// to bridge OpenGL-convention external tools (V=0 bottom, PNG row 0 top)
+/// and wgpu (V=0 top). Cheap: one allocation, linear copy.
+pub fn flip_rows_rgba8(src: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let row_bytes = (width as usize) * 4;
+    let h = height as usize;
+    debug_assert_eq!(src.len(), row_bytes * h);
+    let mut out = Vec::with_capacity(src.len());
+    for row in (0..h).rev() {
+        let start = row * row_bytes;
+        out.extend_from_slice(&src[start..start + row_bytes]);
+    }
+    out
 }
 
 fn upload_layer(

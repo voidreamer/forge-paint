@@ -7,7 +7,7 @@
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
 
-use crate::paint::layer::LayerStack;
+use crate::paint::layer::{BlendMode, LayerStack};
 use crate::paint::target::{defaults, PaintTarget};
 
 #[repr(C)]
@@ -18,7 +18,9 @@ pub struct CompositeUniforms {
 }
 
 pub struct Compositor {
-    pub pipeline: wgpu::RenderPipeline,
+    /// One pipeline per `BlendMode` — all share the same bind group layout;
+    /// only the per-target BlendState differs. Indexed by `BlendMode as usize`.
+    pub pipelines: [wgpu::RenderPipeline; 4],
     pub bgl: wgpu::BindGroupLayout,
     pub sampler: wgpu::Sampler,
     /// 1×1 R8 texture initialised to 1.0, bound for layers without a mask.
@@ -108,60 +110,120 @@ impl Compositor {
             push_constant_ranges: &[],
         });
 
-        let premultiplied_over = wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-        };
+        // Blend states — all assume the fragment outputs premultiplied alpha
+        // (rgb*a, a). Each mode derives from a different (src_factor, dst_factor)
+        // combo that wgpu's fixed-function blend can express without needing
+        // ping-pong textures.
+        //
+        //   Normal   (OVER)     dst' = src + dst*(1-src.a)
+        //   Multiply           dst' = dst*src.rgb + dst*(1-src.a)  (src is rgb*a)
+        //                       → src_factor=Dst, dst_factor=OneMinusSrcAlpha
+        //   Screen             dst' = src + dst*(1-src)
+        //                       → src_factor=One, dst_factor=OneMinusSrc
+        //   Add                 dst' = src + dst
+        //                       → src_factor=One, dst_factor=One
+        fn blend_state(mode: BlendMode) -> wgpu::BlendState {
+            use wgpu::{BlendComponent, BlendFactor, BlendOperation};
+            let (sf, df) = match mode {
+                BlendMode::Normal => (BlendFactor::One, BlendFactor::OneMinusSrcAlpha),
+                BlendMode::Multiply => (BlendFactor::Dst, BlendFactor::OneMinusSrcAlpha),
+                BlendMode::Screen => (BlendFactor::One, BlendFactor::OneMinusSrc),
+                BlendMode::Add => (BlendFactor::One, BlendFactor::One),
+            };
+            wgpu::BlendState {
+                color: BlendComponent {
+                    src_factor: sf,
+                    dst_factor: df,
+                    operation: BlendOperation::Add,
+                },
+                alpha: BlendComponent {
+                    src_factor: BlendFactor::One,
+                    dst_factor: BlendFactor::OneMinusSrcAlpha,
+                    operation: BlendOperation::Add,
+                },
+            }
+        }
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("composite_pipe"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_fullscreen"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_composite"),
-                targets: &[
-                    Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                        blend: Some(premultiplied_over),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: Some(premultiplied_over),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: Some(premultiplied_over),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                ],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
+        fn make_pipeline(
+            device: &wgpu::Device,
+            layout: &wgpu::PipelineLayout,
+            shader: &wgpu::ShaderModule,
+            blend: wgpu::BlendState,
+            label: &str,
+        ) -> wgpu::RenderPipeline {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_fullscreen"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_composite"),
+                    targets: &[
+                        Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                            blend: Some(blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            blend: Some(blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            blend: Some(blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                    ],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            })
+        }
+
+        let pipelines = [
+            make_pipeline(
+                device,
+                &pipeline_layout,
+                &shader,
+                blend_state(BlendMode::Normal),
+                "composite.pipe.normal",
+            ),
+            make_pipeline(
+                device,
+                &pipeline_layout,
+                &shader,
+                blend_state(BlendMode::Multiply),
+                "composite.pipe.multiply",
+            ),
+            make_pipeline(
+                device,
+                &pipeline_layout,
+                &shader,
+                blend_state(BlendMode::Screen),
+                "composite.pipe.screen",
+            ),
+            make_pipeline(
+                device,
+                &pipeline_layout,
+                &shader,
+                blend_state(BlendMode::Add),
+                "composite.pipe.add",
+            ),
+        ];
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("composite.sampler"),
@@ -222,12 +284,22 @@ impl Compositor {
         }
 
         Self {
-            pipeline,
+            pipelines,
             bgl,
             sampler,
             dummy_mask_view: dummy_view,
             _dummy_mask: dummy,
         }
+    }
+
+    fn pipeline_for(&self, mode: BlendMode) -> &wgpu::RenderPipeline {
+        let idx = match mode {
+            BlendMode::Normal => 0,
+            BlendMode::Multiply => 1,
+            BlendMode::Screen => 2,
+            BlendMode::Add => 3,
+        };
+        &self.pipelines[idx]
     }
 
     /// Composite `stack` into `target`. One render pass per tile; one draw per
@@ -307,8 +379,10 @@ impl Compositor {
                 ..Default::default()
             });
 
-            pass.set_pipeline(&self.pipeline);
+            // Layers can have different blend modes, so we (re)bind a
+            // pipeline per layer inside the same pass. Cheap.
             for (i, layer) in visible.iter().enumerate() {
+                pass.set_pipeline(self.pipeline_for(layer.blend_mode));
                 let mask_view = layer
                     .mask
                     .as_ref()
@@ -354,6 +428,8 @@ impl Compositor {
                 pass.draw(0..3, 0..1);
             }
         }
+
+        // (end of per-tile loop)
     }
 
     /// One-shot helper: builds its own encoder and submits. Use this when you

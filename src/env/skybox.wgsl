@@ -11,6 +11,9 @@ struct Frame {
     ambient_sky: vec4<f32>,
     ambient_ground: vec4<f32>,
     view_mode: u32,
+    tonemap_mode: u32,
+    exposure: f32,
+    _pad: u32,
     inv_view_proj: mat4x4<f32>,
 };
 
@@ -62,8 +65,8 @@ fn dir_to_equirect_uv(dir: vec3<f32>) -> vec2<f32> {
     return vec2<f32>((phi + PI) / (2.0 * PI), 0.5 - theta / PI);
 }
 
-/// ACES filmic tonemap (Narkowicz 2015 fit) — kept in sync with the same
-/// function in pbr.wgsl so mesh and sky share the view transform.
+// Tonemap implementations kept in sync with pbr.wgsl so the skybox matches
+// whatever the mesh rendered with.
 fn aces_narkowicz(x: vec3<f32>) -> vec3<f32> {
     let a = 2.51;
     let b = 0.03;
@@ -73,11 +76,44 @@ fn aces_narkowicz(x: vec3<f32>) -> vec3<f32> {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+fn filmic_uc2(x: vec3<f32>) -> vec3<f32> {
+    let A = 0.15;
+    let B = 0.50;
+    let C = 0.10;
+    let D = 0.20;
+    let E = 0.02;
+    let F = 0.30;
+    let W = 11.2;
+    let curr = ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+    let white = vec3<f32>(W);
+    let white_scale = ((white * (A * white + C * B) + D * E)
+        / (white * (A * white + B) + D * F))
+        - E / F;
+    return clamp(curr / white_scale, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn apply_tonemap(x: vec3<f32>, mode: u32) -> vec3<f32> {
+    switch mode {
+        case 1u: {
+            return x / (x + vec3<f32>(1.0));
+        }
+        case 2u: {
+            return aces_narkowicz(x);
+        }
+        case 3u: {
+            return filmic_uc2(x);
+        }
+        default: {
+            return clamp(x, vec3<f32>(0.0), vec3<f32>(1.0));
+        }
+    }
+}
+
 @fragment
 fn fs_sky(in: VsOut) -> @location(0) vec4<f32> {
     let dir = normalize(in.world_dir);
     let uv = dir_to_equirect_uv(dir);
     let rgb = textureSampleLevel(env_tex, env_sampler, uv, 0.0).rgb * env.intensity;
-    let tonemapped = aces_narkowicz(rgb);
+    let tonemapped = apply_tonemap(rgb * frame.exposure, frame.tonemap_mode);
     return vec4<f32>(tonemapped, 1.0);
 }
