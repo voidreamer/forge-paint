@@ -14,12 +14,12 @@ use anyhow::{Context, Result};
 use egui_wgpu::wgpu;
 use std::path::{Path, PathBuf};
 
-use crate::paint::PaintTarget;
+use crate::paint::{Layer, PaintTarget};
 
-const CHANNELS: &[(&str, fn(&PaintTarget) -> &wgpu::Texture)] = &[
-    ("basecolor", |p| &p.base_color),
-    ("roughmetal", |p| &p.rough_metal),
-    ("normal", |p| &p.normal),
+const LAYER_CHANNELS: &[(&str, fn(&Layer) -> &wgpu::Texture)] = &[
+    ("basecolor", |l| &l.base_color),
+    ("roughmetal", |l| &l.rough_metal),
+    ("normal", |l| &l.normal),
 ];
 
 /// Work directory for persistence, honoring `FORGE_PAINT_WORK_DIR`. If the
@@ -36,22 +36,24 @@ pub fn default_work_dir(usd_path: &Path) -> PathBuf {
     parent.join("forge-paint").join(stem)
 }
 
-/// Try to upload sidecar PNGs from `work_dir` into the matching layer of the
-/// paint target. Missing files are skipped silently; malformed ones log a warn.
-/// Returns the number of layers successfully uploaded.
+/// Upload sidecar PNGs into the given paint `layer`'s textures (one per
+/// (channel × UDIM tile)). `tiles` and `resolution` come from the display
+/// paint target so we can address layers correctly. Caller should recomposite
+/// the layer stack afterwards to make the uploads visible.
 pub fn load_sidecars(
     queue: &wgpu::Queue,
-    paint_target: &PaintTarget,
+    layer: &Layer,
+    tiles: &[u32],
+    resolution: u32,
     work_dir: &Path,
 ) -> usize {
     if !work_dir.is_dir() {
         return 0;
     }
-    let resolution = paint_target.resolution;
     let mut loaded = 0;
 
-    for (layer_idx, udim) in paint_target.tiles.iter().enumerate() {
-        for (channel, tex_getter) in CHANNELS {
+    for (layer_idx, udim) in tiles.iter().enumerate() {
+        for (channel, tex_getter) in LAYER_CHANNELS {
             let path = work_dir.join(format!("{channel}.{udim}.png"));
             if !path.exists() {
                 continue;
@@ -72,7 +74,7 @@ pub fn load_sidecars(
                     }
                     upload_layer(
                         queue,
-                        tex_getter(paint_target),
+                        tex_getter(layer),
                         resolution,
                         layer_idx as u32,
                         rgba.as_raw(),

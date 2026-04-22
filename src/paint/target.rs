@@ -49,6 +49,7 @@ pub struct PaintTarget {
 
     pub normal: wgpu::Texture,
     pub normal_view: wgpu::TextureView,
+    pub normal_layer_views: Vec<wgpu::TextureView>,
 
     pub sampler: wgpu::Sampler,
     pub material_buf: wgpu::Buffer,
@@ -128,6 +129,17 @@ impl PaintTarget {
             .map(|layer| {
                 rough_metal.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("paint.rough_metal.layer_view"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let normal_layer_views: Vec<wgpu::TextureView> = (0..layer_count)
+            .map(|layer| {
+                normal.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("paint.normal.layer_view"),
                     dimension: Some(wgpu::TextureViewDimension::D2),
                     base_array_layer: layer,
                     array_layer_count: Some(1),
@@ -259,6 +271,7 @@ impl PaintTarget {
             rough_metal_layer_views,
             normal,
             normal_view,
+            normal_layer_views,
             sampler,
             material_buf,
             material_bg,
@@ -338,5 +351,42 @@ fn srgb_to_linear(s: f32) -> f32 {
         s / 12.92
     } else {
         ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Neutral defaults — reused by `layer::Layer::new` to seed new paint layers
+/// so a single-layer stack looks identical to today's direct paint target.
+pub mod defaults {
+    use egui_wgpu::wgpu;
+
+    pub fn base_color_clear() -> wgpu::Color {
+        // Bytes (180,180,180,255) as sRGB → linear ≈ 0.4485 for the clear
+        let linear = super::srgb_to_linear(180.0 / 255.0) as f64;
+        wgpu::Color {
+            r: linear,
+            g: linear,
+            b: linear,
+            a: 1.0,
+        }
+    }
+
+    pub fn rough_metal_clear() -> wgpu::Color {
+        // glTF packing: R=AO(1), G=rough(0.5), B=metal(0)
+        wgpu::Color {
+            r: 1.0,
+            g: 128.0 / 255.0,
+            b: 0.0,
+            a: 1.0,
+        }
+    }
+
+    pub fn normal_clear() -> wgpu::Color {
+        // Flat tangent-space normal stored as bytes (128,128,255)
+        wgpu::Color {
+            r: 128.0 / 255.0,
+            g: 128.0 / 255.0,
+            b: 1.0,
+            a: 1.0,
+        }
     }
 }

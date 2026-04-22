@@ -200,8 +200,13 @@ impl eframe::App for App {
 
         egui::SidePanel::right("props")
             .resizable(true)
-            .default_width(280.0)
+            .default_width(300.0)
             .show(ctx, |ui| {
+                if let Some(vp) = &mut self.viewport {
+                    layer_panel(ui, vp, frame);
+                    ui.add_space(6.0);
+                    ui.separator();
+                }
                 ui.heading("Paint target");
                 if let Some(vp) = &mut self.viewport {
                     let tiles = vp.tiles().to_vec();
@@ -344,6 +349,83 @@ fn run_post_export_hook(dir: &std::path::Path) -> String {
     }
 }
 
+fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
+    ui.heading("Layers");
+
+    let mut needs_recomposite = false;
+    let mut delete_idx: Option<usize> = None;
+    let mut add_requested = false;
+
+    // Top-down list — index 0 is bottom of stack, so iterate reversed so the
+    // topmost (last to composite) is drawn first in the panel.
+    let n = vp.layer_stack.layers.len();
+    egui::ScrollArea::vertical()
+        .max_height(280.0)
+        .show(ui, |ui| {
+            for i in (0..n).rev() {
+                let is_active = vp.layer_stack.active == i;
+                let row_bg = if is_active {
+                    egui::Color32::from_rgb(46, 62, 96)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                egui::Frame::NONE.fill(row_bg).inner_margin(4.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let layer = &mut vp.layer_stack.layers[i];
+
+                        if ui.checkbox(&mut layer.visible, "").changed() {
+                            needs_recomposite = true;
+                        }
+
+                        // Clickable name → sets active
+                        let label = egui::Label::new(egui::RichText::new(&layer.name).strong())
+                            .sense(egui::Sense::click())
+                            .truncate();
+                        if ui.add(label).clicked() {
+                            vp.layer_stack.active = i;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        let layer = &mut vp.layer_stack.layers[i];
+                        let resp = ui.add(
+                            egui::Slider::new(&mut layer.opacity, 0.0..=1.0)
+                                .show_value(true)
+                                .text("opacity"),
+                        );
+                        if resp.changed() {
+                            needs_recomposite = true;
+                        }
+                        if n > 1 && ui.small_button("delete").clicked() {
+                            delete_idx = Some(i);
+                        }
+                    });
+                });
+            }
+        });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.button("+ Add Layer").clicked() {
+            add_requested = true;
+        }
+        ui.weak(format!("{n} layer{}", if n == 1 { "" } else { "s" }));
+    });
+
+    // Apply GPU-affecting actions after UI traversal.
+    if let Some(render_state) = frame.wgpu_render_state() {
+        if add_requested {
+            vp.add_layer(&render_state.device, &render_state.queue);
+        }
+        if let Some(idx) = delete_idx {
+            vp.remove_layer(&render_state.device, &render_state.queue, idx);
+        }
+        if needs_recomposite {
+            vp.recomposite(&render_state.device, &render_state.queue);
+        }
+    }
+}
+
 fn human_bytes(n: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -432,9 +514,14 @@ impl App {
                 let work_dir = crate::persist::default_work_dir(&path);
                 let loaded_n = crate::persist::load_sidecars(
                     &render_state.queue,
-                    vp.paint_target(),
+                    vp.active_layer(),
+                    vp.tiles(),
+                    vp.tile_resolution(),
                     &work_dir,
                 );
+                if loaded_n > 0 {
+                    vp.recomposite(&render_state.device, &render_state.queue);
+                }
 
                 self.current_usd_path = Some(path.clone());
                 let sidecar_msg = if loaded_n > 0 {
@@ -507,7 +594,16 @@ impl App {
             return;
         };
         let dir = crate::persist::default_work_dir(usd_path);
-        let n = crate::persist::load_sidecars(&render_state.queue, vp.paint_target(), &dir);
+        let n = crate::persist::load_sidecars(
+            &render_state.queue,
+            vp.active_layer(),
+            vp.tiles(),
+            vp.tile_resolution(),
+            &dir,
+        );
+        if n > 0 {
+            vp.recomposite(&render_state.device, &render_state.queue);
+        }
         self.status = if n > 0 {
             format!("Reloaded {n} sidecar(s) from {}", dir.display())
         } else {

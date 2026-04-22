@@ -5,20 +5,27 @@ use glam::Vec2;
 use crate::accel::MeshAccel;
 use crate::camera::OrbitCamera;
 use crate::mesh::{CpuMesh, GpuMesh};
-use crate::paint::{udim, BrushPipeline, BrushUniforms, PaintChannel, PaintTarget};
+use crate::paint::{
+    udim, BrushPipeline, BrushUniforms, Compositor, Layer, LayerStack, PaintChannel, PaintTarget,
+};
 use crate::pick;
 use crate::render::{FrameUniforms, Renderer, ViewMode};
 
 pub struct Viewport {
     renderer: Renderer,
     brush_pipeline: BrushPipeline,
+    compositor: Compositor,
     color: Option<(wgpu::Texture, wgpu::TextureView, [u32; 2])>,
     egui_tex_id: Option<egui::TextureId>,
 
     mesh: GpuMesh,
     cpu_mesh: CpuMesh,
     accel: MeshAccel,
+    /// Composited display textures — this is what the PBR shader samples.
     paint_target: PaintTarget,
+    /// The paint stack. Brushes stamp into `layers[active]`; the compositor
+    /// flattens the stack into `paint_target` after each stamp batch.
+    pub layer_stack: LayerStack,
 
     pub camera: OrbitCamera,
 
@@ -74,6 +81,7 @@ impl Viewport {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, cpu: &CpuMesh) -> Self {
         let renderer = Renderer::new(device, wgpu::TextureFormat::Bgra8UnormSrgb);
         let brush_pipeline = BrushPipeline::new(device);
+        let compositor = Compositor::new(device);
         let gpu = GpuMesh::from_cpu(device, cpu);
         let tile_resolution = std::env::var("FORGE_PAINT_RESOLUTION")
             .ok()
@@ -87,6 +95,13 @@ impl Viewport {
             cpu,
             tile_resolution,
         );
+        let layer_stack = LayerStack::new_with_initial_layer(
+            device,
+            queue,
+            tile_resolution,
+            paint_target.tiles.len() as u32,
+        );
+        compositor.run_and_submit(device, queue, &layer_stack, &paint_target);
 
         let mut camera = OrbitCamera::default();
         camera.target = gpu.center;
@@ -96,12 +111,14 @@ impl Viewport {
         Self {
             renderer,
             brush_pipeline,
+            compositor,
             color: None,
             egui_tex_id: None,
             mesh: gpu,
             cpu_mesh: cpu.clone(),
             accel,
             paint_target,
+            layer_stack,
             camera,
             brush: BrushState::default(),
             base_color_factor: [1.0, 1.0, 1.0],
@@ -132,8 +149,39 @@ impl Viewport {
             cpu,
             self.tile_resolution,
         );
+        self.layer_stack = LayerStack::new_with_initial_layer(
+            device,
+            queue,
+            self.tile_resolution,
+            self.paint_target.tiles.len() as u32,
+        );
+        self.compositor
+            .run_and_submit(device, queue, &self.layer_stack, &self.paint_target);
         self.last_hit_uv = None;
         self.last_hit_tile = None;
+    }
+
+    pub fn active_layer(&self) -> &Layer {
+        self.layer_stack.active_layer()
+    }
+
+    /// Request a recomposite — run after any external change that touched the
+    /// active layer's textures (e.g. loading sidecars).
+    pub fn recomposite(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.compositor
+            .run_and_submit(device, queue, &self.layer_stack, &self.paint_target);
+    }
+
+    /// Append a new empty layer on top and recomposite.
+    pub fn add_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.layer_stack.add_layer(device, queue);
+        self.recomposite(device, queue);
+    }
+
+    /// Delete a layer. Always keeps at least one.
+    pub fn remove_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, idx: usize) {
+        self.layer_stack.remove_at(idx);
+        self.recomposite(device, queue);
     }
 
     pub fn tiles(&self) -> &[u32] {
@@ -164,6 +212,14 @@ impl Viewport {
             &self.cpu_mesh,
             resolution,
         );
+        self.layer_stack = LayerStack::new_with_initial_layer(
+            device,
+            queue,
+            resolution,
+            self.paint_target.tiles.len() as u32,
+        );
+        self.compositor
+            .run_and_submit(device, queue, &self.layer_stack, &self.paint_target);
     }
 
     /// Approximate VRAM used by the paint target in bytes.
@@ -304,9 +360,6 @@ impl Viewport {
 
             if !strokes.is_empty() {
                 let channel = self.brush.channel;
-                // Brush color components: either linear-sRGB base color or a
-                // grayscale `value` triplet for roughness/metallic — the
-                // pipeline's write-mask selects which channels land.
                 let color_comp = match channel {
                     PaintChannel::BaseColor => {
                         let lin = self.brush.color_linear();
@@ -317,6 +370,7 @@ impl Viewport {
                         [v, v, v]
                     }
                 };
+                let active = self.layer_stack.active_layer();
                 for (layer, local_uv) in &strokes {
                     let uniforms = BrushUniforms {
                         color: [color_comp[0], color_comp[1], color_comp[2], self.brush.opacity],
@@ -324,12 +378,12 @@ impl Viewport {
                         radius: self.brush.radius,
                         hardness: self.brush.hardness,
                     };
+                    // Stamps land on the *active layer*, not the display target;
+                    // compositor then flattens the stack into the display below.
                     let layer_view = match channel {
-                        PaintChannel::BaseColor => {
-                            &self.paint_target.base_color_layer_views[*layer as usize]
-                        }
+                        PaintChannel::BaseColor => &active.base_color_layer_views[*layer as usize],
                         PaintChannel::Roughness | PaintChannel::Metallic => {
-                            &self.paint_target.rough_metal_layer_views[*layer as usize]
+                            &active.rough_metal_layer_views[*layer as usize]
                         }
                     };
                     self.brush_pipeline.stamp(
@@ -340,6 +394,14 @@ impl Viewport {
                         &uniforms,
                     );
                 }
+                // Flatten the stack into the display target before PBR samples it.
+                self.compositor.run(
+                    &render_state.device,
+                    &render_state.queue,
+                    &mut encoder,
+                    &self.layer_stack,
+                    &self.paint_target,
+                );
             }
 
             // PBR render pass
