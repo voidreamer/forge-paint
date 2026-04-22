@@ -10,8 +10,8 @@ struct Frame {
     ambient_sky: vec4<f32>,
     ambient_ground: vec4<f32>,
     view_mode: u32,        // 0 Material, 1 BaseColor, 2 Rough, 3 Metal, 4 Normal, 5 Mask
-    // 12 bytes of implicit trailing padding — matches Rust's `_pad: [u32; 3]`
-    // and the struct's 16-byte alignment requirement.
+    // 12 bytes of implicit trailing padding — matches Rust's `_pad: [u32; 3]`.
+    inv_view_proj: mat4x4<f32>,
 }
 
 struct Material {
@@ -40,6 +40,8 @@ struct Env {
 @group(2) @binding(0) var<uniform> env: Env;
 @group(2) @binding(1) var env_tex: texture_2d<f32>;
 @group(2) @binding(2) var env_sampler: sampler;
+@group(2) @binding(3) var brdf_lut: texture_2d<f32>;
+@group(2) @binding(4) var brdf_sampler: sampler;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -203,9 +205,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let r = reflect(-v, n);
     let spec_lod = roughness * max(env.mip_count - 1.0, 0.0);
     let ibl_spec_raw = sample_env(r, spec_lod);
-    // Re-use the `f0` computed above for the direct lobe — same surface.
-    let ibl_f = f_schlick(n_dot_v, f0);
-    let ibl_specular = ibl_spec_raw * ibl_f;
+    // Karis split-sum: modulate the prefiltered environment by the BRDF
+    // integration LUT (F0-scale in R, F0-bias in G).
+    let brdf = textureSample(brdf_lut, brdf_sampler, vec2<f32>(n_dot_v, roughness)).rg;
+    let ibl_specular = ibl_spec_raw * (f0 * brdf.r + vec3<f32>(brdf.g));
 
     let lit = direct + ibl_diffuse + ibl_specular;
     let tonemapped = lit / (lit + vec3<f32>(1.0));

@@ -15,6 +15,9 @@ pub struct FrameUniforms {
     /// Picks what the fragment shader visualises. See `ViewMode::as_u32`.
     pub view_mode: u32,
     pub _pad: [u32; 3],
+    /// Inverse of `view_proj` — used by the skybox vertex shader to
+    /// reconstruct a world-space ray direction from clip-space NDC.
+    pub inv_view_proj: [[f32; 4]; 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

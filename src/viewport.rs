@@ -4,7 +4,7 @@ use glam::Vec2;
 
 use crate::accel::MeshAccel;
 use crate::camera::OrbitCamera;
-use crate::env::{Environment, EnvUniforms};
+use crate::env::{BrdfLut, Environment, EnvUniforms, SkyboxPipeline};
 use crate::mesh::{CpuMesh, GpuMesh};
 use crate::paint::{
     target::MaterialUniforms, udim, BrushPipeline, BrushUniforms, Compositor, Layer, LayerStack,
@@ -37,6 +37,9 @@ pub struct Viewport {
     pub env_intensity: f32,
     pub env_rotation_y: f32,
     pub env_skybox_visible: bool,
+    /// Baked once per device at startup; shared across all Environments.
+    pub brdf_lut: BrdfLut,
+    skybox: SkyboxPipeline,
 
     pub camera: OrbitCamera,
 
@@ -124,7 +127,16 @@ impl Viewport {
             mapped_at_creation: false,
         });
 
-        let env = Environment::new_procedural(device, queue);
+        let brdf_lut = BrdfLut::new(device, queue);
+        let env = Environment::new_procedural(device, queue, &brdf_lut);
+        let skybox = SkyboxPipeline::new(
+            device,
+            &renderer.frame_bgl,
+            &renderer.material_bgl,
+            &renderer.env_bgl,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Depth32Float,
+        );
 
         let mut camera = OrbitCamera::default();
         camera.target = gpu.center;
@@ -147,6 +159,8 @@ impl Viewport {
             env_intensity: 1.0,
             env_rotation_y: 0.0,
             env_skybox_visible: false,
+            brdf_lut,
+            skybox,
             camera,
             brush: BrushState::default(),
             base_color_factor: [1.0, 1.0, 1.0],
@@ -298,6 +312,7 @@ impl Viewport {
 
             let aspect = w as f32 / h as f32;
             let view_proj = self.camera.view_proj(aspect);
+            let inv_view_proj = view_proj.inverse();
             let eye = self.camera.eye();
 
             self.renderer.write_frame(
@@ -311,6 +326,7 @@ impl Viewport {
                     ambient_ground: [0.08, 0.07, 0.06, 1.0],
                     view_mode: self.view_mode.as_u32(),
                     _pad: [0; 3],
+                    inv_view_proj: inv_view_proj.to_cols_array_2d(),
                 },
             );
             let material_uniforms = self.paint_target.material_uniforms(
@@ -545,10 +561,19 @@ impl Viewport {
                     ..Default::default()
                 });
 
-                pass.set_pipeline(&self.renderer.pipeline);
                 pass.set_bind_group(0, &self.renderer.frame_bg, &[]);
                 pass.set_bind_group(1, &material_bg, &[]);
                 pass.set_bind_group(2, &self.env.bind_group, &[]);
+
+                // Skybox background (optional) — draws at the far plane with
+                // LessEqual depth so the mesh renders over it. Skipped in
+                // channel-isolation view modes so they're easier to read.
+                if self.env_skybox_visible && matches!(self.view_mode, ViewMode::Material) {
+                    pass.set_pipeline(&self.skybox.pipeline);
+                    pass.draw(0..3, 0..1);
+                }
+
+                pass.set_pipeline(&self.renderer.pipeline);
                 pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.mesh.index_count, 0, 0..1);

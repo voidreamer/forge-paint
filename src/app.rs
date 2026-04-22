@@ -589,17 +589,20 @@ fn env_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
         egui::Slider::new(&mut vp.env_rotation_y, -std::f32::consts::PI..=std::f32::consts::PI)
             .text("rotation"),
     );
+    ui.checkbox(&mut vp.env_skybox_visible, "show sky");
 
     if let Some(render_state) = frame.wgpu_render_state() {
         if load_procedural {
             vp.env = crate::env::Environment::new_procedural(
                 &render_state.device,
                 &render_state.queue,
+                &vp.brdf_lut,
             );
         } else if let Some(path) = load_path {
             match crate::env::Environment::load_hdr(
                 &render_state.device,
                 &render_state.queue,
+                &vp.brdf_lut,
                 &path,
             ) {
                 Ok(env) => {
