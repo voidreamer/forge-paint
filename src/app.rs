@@ -50,6 +50,27 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.strong("forge-paint");
                 ui.separator();
+                ui.menu_button("Edit", |ui| {
+                    let can_undo = self.viewport.as_ref().is_some_and(|vp| vp.can_undo());
+                    let can_redo = self.viewport.as_ref().is_some_and(|vp| vp.can_redo());
+                    if ui
+                        .add_enabled(can_undo, egui::Button::new("Undo   ⌘Z / Ctrl+Z"))
+                        .clicked()
+                    {
+                        self.do_undo(frame);
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            can_redo,
+                            egui::Button::new("Redo   ⇧⌘Z / Ctrl+Shift+Z"),
+                        )
+                        .clicked()
+                    {
+                        self.do_redo(frame);
+                        ui.close_menu();
+                    }
+                });
                 ui.menu_button("File", |ui| {
                     if ui.button("Open USD…").clicked() {
                         self.open_usd_dialog(frame);
@@ -374,6 +395,27 @@ impl eframe::App for App {
         });
         if save_shortcut {
             self.save_to_work_dir(frame);
+        }
+
+        // Cmd/Ctrl+Z: undo. Cmd/Ctrl+Shift+Z: redo. Check shift variant first so
+        // the shift+Z form doesn't trigger the plain undo binding too.
+        let redo_shortcut = ctx.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Z,
+            ))
+        });
+        if redo_shortcut {
+            self.do_redo(frame);
+        }
+        let undo_shortcut = ctx.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::Z,
+            ))
+        });
+        if undo_shortcut {
+            self.do_undo(frame);
         }
     }
 }
@@ -774,6 +816,30 @@ impl App {
                 self.status = format!("Save failed: {e:#}");
                 log::error!("{}", self.status);
             }
+        }
+    }
+
+    fn do_undo(&mut self, frame: &eframe::Frame) {
+        let Some(render_state) = frame.wgpu_render_state() else {
+            return;
+        };
+        let Some(vp) = &mut self.viewport else {
+            return;
+        };
+        if vp.undo(&render_state.device, &render_state.queue) {
+            self.status = "Undo".to_string();
+        }
+    }
+
+    fn do_redo(&mut self, frame: &eframe::Frame) {
+        let Some(render_state) = frame.wgpu_render_state() else {
+            return;
+        };
+        let Some(vp) = &mut self.viewport else {
+            return;
+        };
+        if vp.redo(&render_state.device, &render_state.queue) {
+            self.status = "Redo".to_string();
         }
     }
 

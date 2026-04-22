@@ -11,6 +11,7 @@ mod persist;
 mod pick;
 mod render;
 mod tangents;
+mod undo;
 mod usd;
 mod viewport;
 

@@ -67,6 +67,9 @@ pub struct Viewport {
     /// Screen position of the last successful paint stamp, used to interpolate
     /// stamps between frames so fast drags don't leave gaps.
     last_paint_pos: Option<egui::Pos2>,
+
+    /// Stroke-level undo / redo.
+    undo_stack: crate::undo::UndoStack,
 }
 
 pub struct BrushState {
@@ -174,6 +177,7 @@ impl Viewport {
             last_hit_uv: None,
             last_hit_tile: None,
             last_paint_pos: None,
+            undo_stack: crate::undo::UndoStack::default(),
         }
     }
 
@@ -201,6 +205,9 @@ impl Viewport {
             .run_and_submit(device, queue, &self.layer_stack, &self.paint_target);
         self.last_hit_uv = None;
         self.last_hit_tile = None;
+        // Prior undo history references textures from the old layer stack —
+        // those are invalid now that we rebuilt it. Drop them.
+        self.undo_stack.clear();
     }
 
     pub fn active_layer(&self) -> &Layer {
@@ -212,6 +219,37 @@ impl Viewport {
     pub fn recomposite(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.compositor
             .run_and_submit(device, queue, &self.layer_stack, &self.paint_target);
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.undo_stack.can_undo()
+    }
+    pub fn can_redo(&self) -> bool {
+        self.undo_stack.can_redo()
+    }
+
+    pub fn undo(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("viewport.undo"),
+        });
+        let did = self.undo_stack.undo(device, &mut encoder, &mut self.layer_stack);
+        queue.submit(Some(encoder.finish()));
+        if did {
+            self.recomposite(device, queue);
+        }
+        did
+    }
+
+    pub fn redo(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("viewport.redo"),
+        });
+        let did = self.undo_stack.redo(device, &mut encoder, &mut self.layer_stack);
+        queue.submit(Some(encoder.finish()));
+        if did {
+            self.recomposite(device, queue);
+        }
+        did
     }
 
     /// Append a new empty layer on top and recomposite.
@@ -456,6 +494,11 @@ impl Viewport {
                 })
                 .collect();
 
+            // Detect stroke start BEFORE we overwrite last_paint_pos: a stroke
+            // begins when this frame has a paint_pos but the previous one did
+            // not.
+            let stroke_starting = paint_pos.is_some() && self.last_paint_pos.is_none();
+
             // Reset when paint_pos becomes None (button released or modifier
             // held) so the next stroke starts fresh instead of sweeping back.
             self.last_paint_pos = paint_pos;
@@ -467,6 +510,7 @@ impl Viewport {
                 });
 
             if !strokes.is_empty() {
+                let active_idx = self.layer_stack.active;
                 let active = self.layer_stack.active_layer();
                 // If mask-edit is active AND the active layer has a mask, route
                 // to the mask pipeline; otherwise paint the user-selected channel.
@@ -475,6 +519,23 @@ impl Viewport {
                 } else {
                     self.brush.channel
                 };
+
+                // Snapshot the targeted texture BEFORE the stamp lands, so
+                // Cmd+Z can roll this stroke back. Only at stroke start.
+                if stroke_starting {
+                    let kind = crate::undo::snapshot_kind_for_stamp(
+                        channel,
+                        self.brush.mask_edit,
+                        active.mask.is_some(),
+                    );
+                    self.undo_stack.push_pre_stroke(
+                        &render_state.device,
+                        &mut encoder,
+                        &self.layer_stack,
+                        active_idx,
+                        kind,
+                    );
+                }
                 let color_comp = match channel {
                     PaintChannel::BaseColor => {
                         let lin = self.brush.color_linear();
@@ -589,6 +650,37 @@ impl Viewport {
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
+
+        // Brush cursor — ring over the native cursor when the pointer is
+        // hovering the viewport in paint mode (plain LMB, no modifiers).
+        // Size is an approximation of brush.radius in UV → screen space.
+        if response.hovered() && no_mods {
+            if let Some(pos) = response.hover_pos() {
+                let on_mesh = self.last_hit_uv.is_some();
+                let screen_radius = (self.brush.radius * rect.height() * 0.5)
+                    .clamp(4.0, rect.height() * 0.3);
+                let (color, stroke_width) = if on_mesh {
+                    if self.brush.mask_edit {
+                        (egui::Color32::from_rgb(120, 200, 255), 1.5)
+                    } else {
+                        (egui::Color32::from_rgb(255, 140, 120), 1.5)
+                    }
+                } else {
+                    (egui::Color32::from_gray(120), 1.0)
+                };
+                let painter = ui.painter();
+                painter.circle_stroke(pos, screen_radius, egui::Stroke::new(stroke_width, color));
+                // Inner ring hints at brush hardness (softer → smaller core).
+                let inner = screen_radius * self.brush.hardness.clamp(0.05, 0.95);
+                if inner > 2.0 {
+                    painter.circle_stroke(
+                        pos,
+                        inner,
+                        egui::Stroke::new(1.0, color.linear_multiply(0.5)),
+                    );
+                }
+            }
+        }
 
         // Camera nav
         let scroll_dy = if response.hovered() {
