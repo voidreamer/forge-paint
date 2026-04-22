@@ -1,0 +1,16 @@
+name: forge-paint
+version: "0.1.0"
+description: "USD-centric Rust painter — prototype Substance Painter replacement for the forge/anvil pipeline. Runs standalone; picks up pipeline state from env vars when present."
+
+# Pulls in USD + the ForgeResolver so `usdcat --flatten` can resolve
+# forge:// URIs transparently when forge-paint is launched through `pipe`.
+requires:
+  - usd
+  - resolver-0.26.5
+
+environment:
+  # Point at the locally-built binary. Adjust if the project lives elsewhere.
+  PATH: ~/projects/forge-paint/target/release:${PATH}
+
+commands:
+  forge-paint: forge-paint

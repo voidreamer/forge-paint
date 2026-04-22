@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::path::PathBuf;
 
 use crate::{mesh, viewport::Viewport};
 
@@ -6,6 +7,22 @@ use crate::{mesh, viewport::Viewport};
 pub struct App {
     viewport: Option<Viewport>,
     status: String,
+    current_usd_path: Option<PathBuf>,
+    /// USD path passed on the CLI — consumed once the viewport is ready.
+    pending_open: Option<PathBuf>,
+
+    // Open URI dialog state
+    show_uri_dialog: bool,
+    uri_buffer: String,
+}
+
+impl App {
+    pub fn new(initial_usd: Option<PathBuf>) -> Self {
+        Self {
+            pending_open: initial_usd,
+            ..Default::default()
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -22,6 +39,13 @@ impl eframe::App for App {
             }
         }
 
+        // If a path was passed on the CLI, open it now that the viewport exists.
+        if self.viewport.is_some() {
+            if let Some(path) = self.pending_open.take() {
+                self.load_usd(frame, path);
+            }
+        }
+
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.strong("forge-paint");
@@ -31,7 +55,32 @@ impl eframe::App for App {
                         self.open_usd_dialog(frame);
                         ui.close_menu();
                     }
-                    if ui.button("Export Textures…").clicked() {
+                    if ui.button("Open URI…").clicked() {
+                        self.show_uri_dialog = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    let save_enabled = self.current_usd_path.is_some();
+                    if ui
+                        .add_enabled(save_enabled, egui::Button::new("Save   ⌘S / Ctrl+S"))
+                        .clicked()
+                    {
+                        self.save_to_work_dir(frame);
+                        ui.close_menu();
+                    }
+                    if ui.button("Save As…").clicked() {
+                        self.export_textures_dialog(frame);
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(save_enabled, egui::Button::new("Reload Sidecars"))
+                        .clicked()
+                    {
+                        self.reload_sidecars(frame);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Export To Folder…").clicked() {
                         self.export_textures_dialog(frame);
                         ui.close_menu();
                     }
@@ -41,9 +90,48 @@ impl eframe::App for App {
                     }
                 });
                 ui.separator();
-                ui.weak("Phase 1c · paint");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match std::env::var("FORGE_PROJECT") {
+                        Ok(proj) if !proj.is_empty() => {
+                            ui.weak(format!("forge:{proj}"));
+                        }
+                        _ => {
+                            ui.weak("standalone");
+                        }
+                    }
+                });
             });
         });
+
+        // Open URI modal — string entry for forge:// or any path usdcat accepts.
+        if self.show_uri_dialog {
+            let mut open = true;
+            let mut load_requested: Option<String> = None;
+            egui::Window::new("Open URI")
+                .open(&mut open)
+                .resizable(false)
+                .default_width(460.0)
+                .show(ctx, |ui| {
+                    ui.label("USD URI or path (forge://…, file path, or anything usdcat can resolve):");
+                    ui.add(egui::TextEdit::singleline(&mut self.uri_buffer).desired_width(f32::INFINITY));
+                    ui.horizontal(|ui| {
+                        let ok = ui.button("Load").clicked();
+                        if ui.button("Cancel").clicked() {
+                            self.show_uri_dialog = false;
+                        }
+                        if ok && !self.uri_buffer.trim().is_empty() {
+                            load_requested = Some(self.uri_buffer.trim().to_string());
+                        }
+                    });
+                });
+            if !open {
+                self.show_uri_dialog = false;
+            }
+            if let Some(uri) = load_requested {
+                self.show_uri_dialog = false;
+                self.load_usd(frame, PathBuf::from(uri));
+            }
+        }
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -193,6 +281,37 @@ impl eframe::App for App {
                     ui.centered_and_justified(|ui| ui.label("Initializing GPU…"));
                 }
             });
+
+        // Cmd/Ctrl+S: save to default work dir.
+        let save_shortcut = ctx.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::S,
+            ))
+        });
+        if save_shortcut {
+            self.save_to_work_dir(frame);
+        }
+    }
+}
+
+/// Run the command template in `FORGE_PAINT_POST_EXPORT` (if set), substituting
+/// `{dir}` with the export directory. Returns a status suffix to tack onto the
+/// main status message; empty if the hook isn't configured.
+fn run_post_export_hook(dir: &std::path::Path) -> String {
+    let Some(tmpl) = std::env::var_os("FORGE_PAINT_POST_EXPORT") else {
+        return String::new();
+    };
+    let tmpl_str = tmpl.to_string_lossy();
+    if tmpl_str.trim().is_empty() {
+        return String::new();
+    }
+    let cmd_str = tmpl_str.replace("{dir}", &dir.to_string_lossy());
+    log::info!("post-export hook: sh -c {cmd_str:?}");
+    match std::process::Command::new("sh").arg("-c").arg(&cmd_str).status() {
+        Ok(s) if s.success() => " · post-export hook ok".to_string(),
+        Ok(s) => format!(" · post-export hook failed ({s})"),
+        Err(e) => format!(" · post-export hook error: {e}"),
     }
 }
 
@@ -236,7 +355,12 @@ impl App {
             &dir,
         ) {
             Ok(exports) => {
-                self.status = format!("Exported {} files to {}", exports.len(), dir.display());
+                let hook_msg = run_post_export_hook(&dir);
+                self.status = format!(
+                    "Exported {} files to {}{hook_msg}",
+                    exports.len(),
+                    dir.display()
+                );
                 log::info!("{}", self.status);
                 for e in &exports {
                     log::info!("  {} {} -> {}", e.channel, e.udim, e.path.display());
@@ -257,7 +381,10 @@ impl App {
         else {
             return;
         };
+        self.load_usd(frame, path);
+    }
 
+    fn load_usd(&mut self, frame: &eframe::Frame, path: PathBuf) {
         let Some(render_state) = frame.wgpu_render_state() else {
             self.status = "No GPU render state available.".to_string();
             return;
@@ -272,8 +399,22 @@ impl App {
                 let tris = cpu.indices.len();
                 let verts = cpu.positions.len();
                 vp.set_mesh(&render_state.device, &render_state.queue, &cpu);
+
+                let work_dir = crate::persist::default_work_dir(&path);
+                let loaded_n = crate::persist::load_sidecars(
+                    &render_state.queue,
+                    vp.paint_target(),
+                    &work_dir,
+                );
+
+                self.current_usd_path = Some(path.clone());
+                let sidecar_msg = if loaded_n > 0 {
+                    format!(" — loaded {loaded_n} sidecar(s) from {}", work_dir.display())
+                } else {
+                    String::new()
+                };
                 self.status = format!(
-                    "Loaded {} — {verts} verts, {tris} tris, {} UDIM tiles",
+                    "Loaded {} — {verts} verts, {tris} tris, {} UDIM tiles{sidecar_msg}",
                     path.display(),
                     vp.tiles().len()
                 );
@@ -284,5 +425,65 @@ impl App {
                 log::error!("{}", self.status);
             }
         }
+    }
+
+    fn save_to_work_dir(&mut self, frame: &eframe::Frame) {
+        let Some(render_state) = frame.wgpu_render_state() else {
+            self.status = "No GPU render state available.".to_string();
+            return;
+        };
+        let Some(vp) = &self.viewport else {
+            self.status = "Viewport not initialized yet.".to_string();
+            return;
+        };
+        let Some(usd_path) = &self.current_usd_path else {
+            self.status = "No USD loaded — use Save As… to pick a folder.".to_string();
+            return;
+        };
+
+        let dir = crate::persist::default_work_dir(usd_path);
+        match crate::persist::save_sidecars(
+            &render_state.device,
+            &render_state.queue,
+            vp.paint_target(),
+            &dir,
+        ) {
+            Ok(exports) => {
+                let hook_msg = run_post_export_hook(&dir);
+                self.status = format!(
+                    "Saved {} files to {}{hook_msg}",
+                    exports.len(),
+                    dir.display()
+                );
+                log::info!("{}", self.status);
+            }
+            Err(e) => {
+                self.status = format!("Save failed: {e:#}");
+                log::error!("{}", self.status);
+            }
+        }
+    }
+
+    fn reload_sidecars(&mut self, frame: &eframe::Frame) {
+        let Some(render_state) = frame.wgpu_render_state() else {
+            self.status = "No GPU render state available.".to_string();
+            return;
+        };
+        let Some(vp) = &self.viewport else {
+            self.status = "Viewport not initialized yet.".to_string();
+            return;
+        };
+        let Some(usd_path) = &self.current_usd_path else {
+            self.status = "No USD loaded.".to_string();
+            return;
+        };
+        let dir = crate::persist::default_work_dir(usd_path);
+        let n = crate::persist::load_sidecars(&render_state.queue, vp.paint_target(), &dir);
+        self.status = if n > 0 {
+            format!("Reloaded {n} sidecar(s) from {}", dir.display())
+        } else {
+            format!("No sidecars at {}", dir.display())
+        };
+        log::info!("{}", self.status);
     }
 }

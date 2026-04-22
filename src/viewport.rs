@@ -73,7 +73,11 @@ impl Viewport {
         let renderer = Renderer::new(device, wgpu::TextureFormat::Bgra8UnormSrgb);
         let brush_pipeline = BrushPipeline::new(device);
         let gpu = GpuMesh::from_cpu(device, cpu);
-        let tile_resolution = 2048;
+        let tile_resolution = std::env::var("FORGE_PAINT_RESOLUTION")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|r| [1024u32, 2048, 4096, 8192].contains(r))
+            .unwrap_or(2048);
         let paint_target = PaintTarget::new(
             device,
             queue,
