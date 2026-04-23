@@ -1,7 +1,10 @@
 use eframe::egui;
 use std::path::PathBuf;
 
-use crate::{mesh, viewport::Viewport};
+use crate::{
+    mesh,
+    viewport::{Tool, Viewport},
+};
 
 #[derive(Default)]
 pub struct App {
@@ -171,6 +174,10 @@ impl eframe::App for App {
             .resizable(true)
             .default_width(260.0)
             .show(ctx, |ui| {
+                if let Some(vp) = &mut self.viewport {
+                    tool_strip(ui, vp);
+                    ui.separator();
+                }
                 egui::ScrollArea::vertical()
                     .id_salt("left_panel_scroll")
                     .show(ui, |ui| {
@@ -303,7 +310,56 @@ impl eframe::App for App {
         if undo_shortcut {
             self.do_undo(frame);
         }
+
+        // Tool hotkeys (single key, no modifiers). consume_key respects
+        // focus — text fields intercept before these fire.
+        let tool_change = ctx.input_mut(|i| {
+            use egui::{Key, Modifiers};
+            if i.consume_key(Modifiers::NONE, Key::B) {
+                Some(Tool::Paint)
+            } else if i.consume_key(Modifiers::NONE, Key::E) {
+                Some(Tool::Erase)
+            } else if i.consume_key(Modifiers::NONE, Key::G) {
+                Some(Tool::Fill)
+            } else if i.consume_key(Modifiers::NONE, Key::I) {
+                Some(Tool::Eyedropper)
+            } else {
+                None
+            }
+        });
+        if let Some(tool) = tool_change {
+            if let Some(vp) = &mut self.viewport {
+                vp.tool = tool;
+            }
+        }
     }
+}
+
+fn tool_strip(ui: &mut egui::Ui, vp: &mut Viewport) {
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        let entries = [
+            (Tool::Paint, egui_phosphor::regular::PAINT_BRUSH),
+            (Tool::Erase, egui_phosphor::regular::ERASER),
+            (Tool::Fill, egui_phosphor::regular::PAINT_BUCKET),
+            (Tool::Eyedropper, egui_phosphor::regular::EYEDROPPER),
+        ];
+        for (tool, glyph) in entries {
+            let selected = vp.tool == tool;
+            let fill = if selected {
+                egui::Color32::from_rgb(46, 92, 148)
+            } else {
+                ui.style().visuals.widgets.inactive.bg_fill
+            };
+            let btn = egui::Button::new(egui::RichText::new(glyph).size(22.0))
+                .min_size(egui::vec2(36.0, 36.0))
+                .fill(fill);
+            let tooltip = format!("{} [{}]", tool.label(), tool.shortcut());
+            if ui.add(btn).on_hover_text(tooltip).clicked() {
+                vp.tool = tool;
+            }
+        }
+    });
 }
 
 /// Run the command template in `FORGE_PAINT_POST_EXPORT` (if set), substituting

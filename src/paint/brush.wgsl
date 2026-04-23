@@ -6,6 +6,7 @@ struct Brush {
     center_uv: vec2<f32>,    // local UV [0,1] within the tile
     radius: f32,             // in local UV units
     hardness: f32,           // 0 = soft, 1 = hard
+    uniform_fill: u32,       // 1 = bypass radius/falloff (Fill tool)
 }
 
 @group(0) @binding(0) var<uniform> brush: Brush;
@@ -29,6 +30,11 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> VsOut {
 
 @fragment
 fn fs_stamp(in: VsOut) -> @location(0) vec4<f32> {
+    if brush.uniform_fill == 1u {
+        // Full-tile flood fill — ignore radius/hardness, use opacity directly.
+        let a = brush.color.a;
+        return vec4<f32>(brush.color.rgb * a, a);
+    }
     let d = distance(in.uv, brush.center_uv);
     if d > brush.radius { discard; }
     let t = d / max(brush.radius, 1e-6);

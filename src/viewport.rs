@@ -16,6 +16,33 @@ use crate::paint::{
 use crate::pick;
 use crate::render::{FrameUniforms, Renderer, TonemapMode, ViewMode};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    Paint,
+    Erase,
+    Fill,
+    Eyedropper,
+}
+
+impl Tool {
+    pub fn label(self) -> &'static str {
+        match self {
+            Tool::Paint => "Paint",
+            Tool::Erase => "Erase",
+            Tool::Fill => "Fill",
+            Tool::Eyedropper => "Eyedropper",
+        }
+    }
+    pub fn shortcut(self) -> &'static str {
+        match self {
+            Tool::Paint => "B",
+            Tool::Erase => "E",
+            Tool::Fill => "G",
+            Tool::Eyedropper => "I",
+        }
+    }
+}
+
 pub struct Viewport {
     renderer: Renderer,
     brush_pipeline: BrushPipeline,
@@ -51,6 +78,7 @@ pub struct Viewport {
     pub camera: OrbitCamera,
 
     pub brush: BrushState,
+    pub tool: Tool,
 
     // Material factor tweakers (multiply sampled texture values)
     pub base_color_factor: [f32; 3],
@@ -193,6 +221,7 @@ impl Viewport {
             baker,
             camera,
             brush: BrushState::default(),
+            tool: Tool::Paint,
             base_color_factor: [1.0, 1.0, 1.0],
             metallic_factor: 1.0,
             roughness_factor: 1.0,
@@ -566,88 +595,164 @@ impl Viewport {
                     label: Some("forge_paint_enc"),
                 });
 
-            // Fill layers are parameter-only — nothing to stamp into.
-            let active_is_fill = self.layer_stack.active_layer().is_fill();
-            if !strokes.is_empty() && !active_is_fill {
-                let active_idx = self.layer_stack.active;
-                let active = self.layer_stack.active_layer();
-                // If mask-edit is active AND the active layer has a mask, route
-                // to the mask pipeline; otherwise paint the user-selected channel.
-                let channel = if self.brush.mask_edit && active.mask.is_some() {
-                    PaintChannel::Mask
-                } else {
-                    self.brush.channel
-                };
-
-                // Snapshot the targeted texture BEFORE the stamp lands, so
-                // Cmd+Z can roll this stroke back. Only at stroke start.
-                if stroke_starting {
-                    let kind = crate::undo::snapshot_kind_for_stamp(
-                        channel,
-                        self.brush.mask_edit,
-                        active.mask.is_some(),
-                    );
-                    self.undo_stack.push_pre_stroke(
-                        &render_state.device,
-                        &mut encoder,
-                        &self.layer_stack,
-                        active_idx,
-                        kind,
-                    );
-                }
-                let color_comp = match channel {
-                    PaintChannel::BaseColor => {
-                        let lin = self.brush.color_linear();
-                        [lin[0], lin[1], lin[2]]
-                    }
-                    PaintChannel::Roughness | PaintChannel::Metallic => {
-                        let v = self.brush.value;
-                        [v, v, v]
-                    }
-                    PaintChannel::Mask => {
-                        // Constrain to pure white (paint / reveal) or pure black
-                        // (erase / hide) — feathering comes from the brush's
-                        // hardness/opacity/falloff, not from intermediate mask
-                        // values.
-                        let v = if self.brush.value >= 0.5 { 1.0 } else { 0.0 };
-                        [v, v, v]
-                    }
-                };
-                for (layer, local_uv) in &strokes {
-                    let uniforms = BrushUniforms {
-                        color: [color_comp[0], color_comp[1], color_comp[2], self.brush.opacity],
-                        center_uv: local_uv.to_array(),
-                        radius: self.brush.radius,
-                        hardness: self.brush.hardness,
-                    };
-                    // Stamps land on the *active layer*, not the display target;
-                    // compositor then flattens the stack into the display below.
-                    let layer_view = match channel {
-                        PaintChannel::BaseColor => &active.base_color_layer_views[*layer as usize],
-                        PaintChannel::Roughness | PaintChannel::Metallic => {
-                            &active.rough_metal_layer_views[*layer as usize]
-                        }
-                        PaintChannel::Mask => {
-                            // Safe — we gated on mask.is_some() above.
-                            &active.mask.as_ref().unwrap().layer_views[*layer as usize]
-                        }
-                    };
-                    self.brush_pipeline.stamp(
-                        &render_state.queue,
-                        &mut encoder,
-                        layer_view,
-                        channel,
-                        &uniforms,
-                    );
-                }
-                // Flatten the stack into the display target before PBR samples it.
-                self.compositor.run(
+            // Eyedropper: sample the composited base_color at the hit UV and
+            // write it into the brush color. Uses a synchronous readback —
+            // acceptable for a one-shot click action.
+            if self.tool == Tool::Eyedropper && stroke_starting && !strokes.is_empty() {
+                let (layer, local_uv) = strokes[0];
+                let res = self.paint_target.resolution;
+                let px = ((local_uv.x * res as f32) as u32).min(res.saturating_sub(1));
+                let py = ((local_uv.y * res as f32) as u32).min(res.saturating_sub(1));
+                let rgba = sample_srgb_u8(
                     &render_state.device,
                     &render_state.queue,
-                    &mut encoder,
-                    &self.layer_stack,
-                    &self.paint_target,
+                    &self.paint_target.base_color,
+                    layer,
+                    px,
+                    py,
                 );
+                self.brush.color_srgb = [
+                    rgba[0] as f32 / 255.0,
+                    rgba[1] as f32 / 255.0,
+                    rgba[2] as f32 / 255.0,
+                ];
+            }
+
+            // Erase auto-provisions a mask on the active layer so there is
+            // somewhere to paint black. The fresh mask view lands in next
+            // frame's material_bg; this frame still stamps into it correctly.
+            if self.tool == Tool::Erase
+                && stroke_starting
+                && !strokes.is_empty()
+                && self.layer_stack.active_layer().mask.is_none()
+            {
+                let active_idx = self.layer_stack.active;
+                self.layer_stack
+                    .add_mask_to(active_idx, &render_state.device, &render_state.queue);
+            }
+
+            // Stamping tools. Fill layers are parameter-only, so we skip them.
+            let active_is_fill = self.layer_stack.active_layer().is_fill();
+            let is_stamping = matches!(self.tool, Tool::Paint | Tool::Erase | Tool::Fill);
+            if is_stamping && !strokes.is_empty() && !active_is_fill {
+                let active_idx = self.layer_stack.active;
+                let active = self.layer_stack.active_layer();
+                let has_mask = active.mask.is_some();
+
+                // Erase always routes to the mask. Paint / Fill honor mask_edit.
+                let channel = match self.tool {
+                    Tool::Erase => PaintChannel::Mask,
+                    _ => {
+                        if self.brush.mask_edit && has_mask {
+                            PaintChannel::Mask
+                        } else {
+                            self.brush.channel
+                        }
+                    }
+                };
+
+                // Skip if the channel is Mask but the layer still has no mask
+                // (e.g. add_mask_to failed silently — defensive).
+                let can_stamp = channel != PaintChannel::Mask || has_mask;
+
+                if can_stamp {
+                    // Fill is one-shot per stroke; Paint/Erase stamp every
+                    // interpolated position along the drag.
+                    let fill_stamp;
+                    let stamps: &[(u32, Vec2)] = if self.tool == Tool::Fill {
+                        if stroke_starting {
+                            fill_stamp = [strokes[0]];
+                            &fill_stamp
+                        } else {
+                            &[]
+                        }
+                    } else {
+                        &strokes
+                    };
+
+                    if !stamps.is_empty() {
+                        // Snapshot BEFORE the stamp lands so Cmd+Z rolls back.
+                        // Only at stroke start.
+                        if stroke_starting {
+                            let kind = crate::undo::snapshot_kind_for_stamp(
+                                channel,
+                                matches!(channel, PaintChannel::Mask),
+                                has_mask,
+                            );
+                            self.undo_stack.push_pre_stroke(
+                                &render_state.device,
+                                &mut encoder,
+                                &self.layer_stack,
+                                active_idx,
+                                kind,
+                            );
+                        }
+
+                        let value = if self.tool == Tool::Erase {
+                            0.0
+                        } else {
+                            self.brush.value
+                        };
+                        let color_comp = match channel {
+                            PaintChannel::BaseColor => {
+                                let lin = self.brush.color_linear();
+                                [lin[0], lin[1], lin[2]]
+                            }
+                            PaintChannel::Roughness | PaintChannel::Metallic => {
+                                [value, value, value]
+                            }
+                            PaintChannel::Mask => {
+                                // Pure white (reveal) or pure black (hide) —
+                                // feathering comes from the brush's falloff.
+                                let v = if value >= 0.5 { 1.0 } else { 0.0 };
+                                [v, v, v]
+                            }
+                        };
+                        let uniform_fill = if self.tool == Tool::Fill { 1u32 } else { 0u32 };
+
+                        for (layer, local_uv) in stamps {
+                            let uniforms = BrushUniforms {
+                                color: [
+                                    color_comp[0],
+                                    color_comp[1],
+                                    color_comp[2],
+                                    self.brush.opacity,
+                                ],
+                                center_uv: local_uv.to_array(),
+                                radius: self.brush.radius,
+                                hardness: self.brush.hardness,
+                                uniform_fill,
+                                _pad: [0; 3],
+                            };
+                            let layer_view = match channel {
+                                PaintChannel::BaseColor => {
+                                    &active.base_color_layer_views[*layer as usize]
+                                }
+                                PaintChannel::Roughness | PaintChannel::Metallic => {
+                                    &active.rough_metal_layer_views[*layer as usize]
+                                }
+                                PaintChannel::Mask => {
+                                    &active.mask.as_ref().unwrap().layer_views[*layer as usize]
+                                }
+                            };
+                            self.brush_pipeline.stamp(
+                                &render_state.queue,
+                                &mut encoder,
+                                layer_view,
+                                channel,
+                                &uniforms,
+                            );
+                        }
+                        // Flatten the stack into the display target before PBR samples it.
+                        self.compositor.run(
+                            &render_state.device,
+                            &render_state.queue,
+                            &mut encoder,
+                            &self.layer_stack,
+                            &self.paint_target,
+                        );
+                    }
+                }
             }
 
             // PBR render pass
@@ -811,4 +916,64 @@ fn srgb_to_linear(c: f32) -> f32 {
     } else {
         ((c + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// Synchronous 1-pixel readback of an Rgba8UnormSrgb D2Array texture.
+/// Returns the raw sRGB-encoded bytes — they match the on-wire color_srgb
+/// representation directly (divide by 255 to get f32 in [0,1]).
+fn sample_srgb_u8(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    layer: u32,
+    px: u32,
+    py: u32,
+) -> [u8; 4] {
+    // COPY_BYTES_PER_ROW_ALIGNMENT is 256; a 1-pixel copy still needs a full row.
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("eyedropper_readback"),
+        size: 256,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("eyedropper_enc"),
+    });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: px, y: py, z: layer },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(1),
+            },
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(enc.finish()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    buf.slice(..)
+        .map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+    let _ = device.poll(wgpu::Maintain::Wait);
+    match rx.recv() {
+        Ok(Ok(())) => {}
+        _ => return [0, 0, 0, 0xFF],
+    }
+    let view = buf.slice(..).get_mapped_range();
+    let out = [view[0], view[1], view[2], view[3]];
+    drop(view);
+    buf.unmap();
+    out
 }

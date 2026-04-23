@@ -51,6 +51,11 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "forge-paint",
         options,
-        Box::new(move |_cc| Ok(Box::new(app::App::new(args.path)))),
+        Box::new(move |cc| {
+            let mut fonts = eframe::egui::FontDefinitions::default();
+            egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+            cc.egui_ctx.set_fonts(fonts);
+            Ok(Box::new(app::App::new(args.path)))
+        }),
     )
 }

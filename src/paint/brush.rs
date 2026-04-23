@@ -8,6 +8,10 @@ pub struct BrushUniforms {
     pub center_uv: [f32; 2],
     pub radius: f32,
     pub hardness: f32,
+    /// When 1, the fragment shader skips the distance check — the stamp
+    /// covers the whole UV tile at full opacity. Used by the Fill tool.
+    pub uniform_fill: u32,
+    pub _pad: [u32; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

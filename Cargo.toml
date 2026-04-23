@@ -7,6 +7,7 @@ edition = "2024"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu"] }
 egui = "0.31"
 egui-wgpu = "0.31"
+egui-phosphor = "0.9"
 # wgpu is reached through `egui_wgpu::wgpu` (pulls wgpu 24 to match egui-wgpu 0.31);
 # no need to declare it directly.
 pollster = "0.4"
