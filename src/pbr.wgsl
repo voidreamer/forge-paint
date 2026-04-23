@@ -115,6 +115,19 @@ fn f_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
+// Karis' closed-form approximation of the split-sum BRDF LUT.
+// Returns vec2(scale, bias) such that `F0 * scale + bias` equals the baked
+// LUT's `(F0 * r + g)` term. Avoids the BRDF LUT texture path entirely —
+// important while that path is still blocked on task #45.
+// Reference: Unreal Engine 4 presentation, Karis 2013 ("Real Shading in UE4").
+fn env_brdf_approx(roughness: f32, n_dot_v: f32) -> vec2<f32> {
+    let c0 = vec4<f32>(-1.0, -0.0275, -0.572, 0.022);
+    let c1 = vec4<f32>( 1.0,  0.0425,  1.040, -0.040);
+    let r = roughness * c0 + c1;
+    let a004 = min(r.x * r.x, exp2(-9.28 * n_dot_v)) * r.x + r.y;
+    return vec2<f32>(-1.04, 1.04) * a004 + r.zw;
+}
+
 /// ACES filmic tonemap — Narkowicz 2015 fit.
 fn aces_narkowicz(x: vec3<f32>) -> vec3<f32> {
     let a = 2.51;
@@ -246,28 +259,36 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let direct = (diffuse + specular) * frame.light_color.rgb * frame.light_color.w * n_dot_l;
 
-    // Karis split-sum IBL with properly baked maps:
+    // Karis split-sum IBL with the closed-form LUT approximation (task #45
+    // blocks the baked LUT path). `env_brdf_approx` returns (scale, bias)
+    // equivalent to the baked (F0 * r + g) term. Plus Fdez-Agüera
+    // multi-scattering compensation so metals brighten correctly at grazing
+    // angles.
     //   diffuse  = irradiance(N) * albedo * (1 - metallic)
-    //   specular = prefilter(R, roughness) * (F0 * lut.r + lut.g)
+    //   specular = prefilter(R, roughness) * (F0 * scale + bias) * ms_comp
     // Irradiance stores (1/N) · Σ L cos-weighted samples (no π factors);
     // prefilter mip 0 is mirror, last mip is fully rough.
     let irr_uv = dir_to_equirect_uv(n);
     let ibl_diffuse_raw =
         textureSampleLevel(irradiance_tex, env_sampler, irr_uv, 0.0).rgb * env.intensity;
-    let ibl_diffuse = base_color * ibl_diffuse_raw * (1.0 - metallic);
 
     let r = reflect(-v, n);
     let r_uv = dir_to_equirect_uv(r);
     let spec_lod = roughness * max(env.mip_count - 1.0, 0.0);
     let ibl_spec_raw =
         textureSampleLevel(prefilter_tex, env_sampler, r_uv, spec_lod).rgb * env.intensity;
-    // TODO: re-enable Karis split-sum once we fully diagnose the LUT path
-    // (baked values appear to come back wrong — separate from the prefilter
-    // work here, which does light things correctly). Schlick + prefilter is
-    // known-good and visibly lights metals with HDRIs the way we want.
-    let _lut_unused = textureSample(brdf_lut, brdf_sampler, vec2<f32>(n_dot_v, roughness));
-    let ibl_f = f_schlick(n_dot_v, f0);
-    let ibl_specular = ibl_spec_raw * ibl_f;
+
+    let env_ab = env_brdf_approx(roughness, n_dot_v);
+    let f_ss = f0 * env_ab.x + vec3<f32>(env_ab.y);
+    // Multi-scatter energy compensation (Fdez-Agüera 2019). `fms` is the
+    // fraction of light that bounced multiple times in the microfacet
+    // distribution and would otherwise be lost.
+    let f_avg = f0 + (vec3<f32>(1.0) - f0) / 21.0;
+    let e_ss = env_ab.x + env_ab.y;
+    let fms = f_avg * e_ss / (vec3<f32>(1.0) - f_avg * (1.0 - e_ss));
+    let kd_ibl = (vec3<f32>(1.0) - f_ss - fms) * (1.0 - metallic);
+    let ibl_diffuse = (kd_ibl * base_color) * ibl_diffuse_raw;
+    let ibl_specular = ibl_spec_raw * (f_ss + fms);
 
     let lit = direct + ibl_diffuse + ibl_specular;
     let lit_exposed = lit * frame.exposure;

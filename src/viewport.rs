@@ -233,7 +233,9 @@ impl Viewport {
             light_intensity: 3.0,
             light_dir: [-0.4, -1.0, -0.3],
             view_mode: ViewMode::Material,
-            tonemap_mode: TonemapMode::Aces,
+            // ArmorPaint defaults to Filmic (Hable UC2) — reads as less crushed
+            // than ACES and matches the reference painter's look.
+            tonemap_mode: TonemapMode::Filmic,
             exposure_stops: 0.0,
             tile_resolution,
             last_hit_uv: None,
