@@ -169,171 +169,55 @@ impl eframe::App for App {
 
         egui::SidePanel::left("tools")
             .resizable(true)
-            .default_width(240.0)
+            .default_width(260.0)
             .show(ctx, |ui| {
-                ui.heading("Brush");
-                if let Some(vp) = &mut self.viewport {
-                    use crate::paint::PaintChannel;
-                    if vp.brush.mask_edit {
-                        ui.weak("painting mask — black/white only");
-                        ui.horizontal(|ui| {
-                            let mut white = vp.brush.value >= 0.5;
-                            if ui.radio_value(&mut white, true, "paint (white)").changed()
-                                && white
-                            {
-                                vp.brush.value = 1.0;
-                            }
-                            if ui.radio_value(&mut white, false, "erase (black)").changed()
-                                && !white
-                            {
-                                vp.brush.value = 0.0;
-                            }
-                        });
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.radio_value(
-                                &mut vp.brush.channel,
-                                PaintChannel::BaseColor,
-                                "Color",
-                            );
-                            ui.radio_value(
-                                &mut vp.brush.channel,
-                                PaintChannel::Roughness,
-                                "Rough",
-                            );
-                            ui.radio_value(
-                                &mut vp.brush.channel,
-                                PaintChannel::Metallic,
-                                "Metal",
-                            );
-                        });
-                        match vp.brush.channel {
-                            PaintChannel::BaseColor => {
-                                ui.horizontal(|ui| {
-                                    ui.label("color");
-                                    ui.color_edit_button_rgb(&mut vp.brush.color_srgb);
-                                });
-                            }
-                            PaintChannel::Roughness
-                            | PaintChannel::Metallic
-                            | PaintChannel::Mask => {
-                                ui.add(
-                                    egui::Slider::new(&mut vp.brush.value, 0.0..=1.0)
-                                        .text("value"),
-                                );
-                            }
+                egui::ScrollArea::vertical()
+                    .id_salt("left_panel_scroll")
+                    .show(ui, |ui| {
+                        if let Some(vp) = &mut self.viewport {
+                            egui::CollapsingHeader::new("Brush")
+                                .default_open(true)
+                                .show(ui, |ui| brush_section(ui, vp));
+                            egui::CollapsingHeader::new("Cursor")
+                                .default_open(false)
+                                .show(ui, |ui| cursor_section(ui, vp));
+                            egui::CollapsingHeader::new("View")
+                                .default_open(false)
+                                .show(ui, |ui| view_section(ui, vp));
                         }
-                    }
-                    ui.add(egui::Slider::new(&mut vp.brush.radius, 0.002..=0.3).text("radius"));
-                    ui.add(egui::Slider::new(&mut vp.brush.hardness, 0.0..=1.0).text("hardness"));
-                    ui.add(egui::Slider::new(&mut vp.brush.opacity, 0.0..=1.0).text("opacity"));
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.heading("Cursor");
-                    match (vp.last_hit_uv, vp.last_hit_tile) {
-                        (Some(uv), Some(tile)) => {
-                            ui.label(format!("uv    {:.3}, {:.3}", uv[0], uv[1]));
-                            ui.label(format!("tile  {tile}"));
-                        }
-                        _ => {
-                            ui.weak("(point at mesh)");
-                        }
-                    }
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.heading("View");
-                    ui.label(format!("yaw   {:>6.2}", vp.camera.yaw));
-                    ui.label(format!("pitch {:>6.2}", vp.camera.pitch));
-                    ui.label(format!("dist  {:>6.2}", vp.camera.distance));
-                    if ui.button("Reset camera").clicked() {
-                        let t = vp.camera.target;
-                        vp.camera = crate::camera::OrbitCamera::default();
-                        vp.camera.target = t;
-                    }
-                }
+                    });
             });
 
         egui::SidePanel::right("props")
             .resizable(true)
-            .default_width(300.0)
+            .default_width(320.0)
             .show(ctx, |ui| {
-                if let Some(vp) = &mut self.viewport {
-                    layer_panel(ui, vp, frame);
-                    ui.add_space(6.0);
-                    ui.separator();
-                    env_panel(ui, vp, frame);
-                    ui.add_space(6.0);
-                    ui.separator();
-                }
-                ui.heading("Paint target");
-                if let Some(vp) = &mut self.viewport {
-                    let tiles = vp.tiles().to_vec();
-                    let cur_res = vp.tile_resolution();
-                    let vram = vp.paint_target_vram_bytes();
-                    ui.horizontal(|ui| {
-                        ui.label("resolution");
-                        let mut new_res = cur_res;
-                        egui::ComboBox::from_id_salt("tile_res_combo")
-                            .selected_text(format!("{cur_res}×{cur_res}"))
-                            .show_ui(ui, |ui| {
-                                for &r in &[1024u32, 2048, 4096, 8192] {
-                                    ui.selectable_value(&mut new_res, r, format!("{r}×{r}"));
-                                }
-                            });
-                        if new_res != cur_res {
-                            if let Some(rs) = frame.wgpu_render_state() {
-                                vp.set_tile_resolution(&rs.device, &rs.queue, new_res);
-                                self.status = format!(
-                                    "Rebuilt paint target @ {new_res}×{new_res} (painted content discarded)"
-                                );
-                                log::info!("{}", self.status);
-                            }
+                egui::ScrollArea::vertical()
+                    .id_salt("right_panel_scroll")
+                    .show(ui, |ui| {
+                        if let Some(vp) = &mut self.viewport {
+                            egui::CollapsingHeader::new("Layers")
+                                .default_open(true)
+                                .show(ui, |ui| layer_panel(ui, vp, frame));
+                            egui::CollapsingHeader::new("Environment")
+                                .default_open(true)
+                                .show(ui, |ui| env_panel(ui, vp, frame));
+                            egui::CollapsingHeader::new("Mesh maps")
+                                .default_open(false)
+                                .show(ui, |ui| mesh_maps_panel(ui, vp, frame));
+                            egui::CollapsingHeader::new("Paint target")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    paint_target_section(ui, vp, frame, &mut self.status)
+                                });
+                            egui::CollapsingHeader::new("Material factors")
+                                .default_open(false)
+                                .show(ui, |ui| material_factors_section(ui, vp));
+                            egui::CollapsingHeader::new("Light")
+                                .default_open(false)
+                                .show(ui, |ui| light_section(ui, vp));
                         }
                     });
-                    ui.label(format!("tile count   {}", tiles.len()));
-                    ui.label(format!("vram approx  {}", human_bytes(vram)));
-                    egui::ScrollArea::vertical()
-                        .id_salt("tile_list_scroll")
-                        .max_height(120.0)
-                        .show(ui, |ui| {
-                            egui::Grid::new("tile_grid").num_columns(4).show(ui, |ui| {
-                                for (i, tid) in tiles.iter().enumerate() {
-                                    ui.label(format!("{tid}"));
-                                    if (i + 1) % 4 == 0 {
-                                        ui.end_row();
-                                    }
-                                }
-                            });
-                        });
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.heading("Material factors");
-                    ui.horizontal(|ui| {
-                        ui.label("base color ×");
-                        ui.color_edit_button_rgb(&mut vp.base_color_factor);
-                    });
-                    ui.add(
-                        egui::Slider::new(&mut vp.metallic_factor, 0.0..=2.0).text("metallic ×"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut vp.roughness_factor, 0.0..=2.0).text("roughness ×"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut vp.normal_scale, 0.0..=2.0).text("normal scale"),
-                    );
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.heading("Light");
-                    ui.add(
-                        egui::Slider::new(&mut vp.light_intensity, 0.0..=10.0).text("intensity"),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label("dir");
-                        ui.add(egui::DragValue::new(&mut vp.light_dir[0]).speed(0.02).prefix("x:"));
-                        ui.add(egui::DragValue::new(&mut vp.light_dir[1]).speed(0.02).prefix("y:"));
-                        ui.add(egui::DragValue::new(&mut vp.light_dir[2]).speed(0.02).prefix("z:"));
-                    });
-                }
             });
 
         egui::CentralPanel::default()
@@ -376,7 +260,9 @@ impl eframe::App for App {
                                         vp.brush.mask_edit = true;
                                     }
                                 }
-                                ViewMode::Material | ViewMode::Normal => {}
+                                ViewMode::Material
+                                | ViewMode::Normal
+                                | ViewMode::WorldNormalBaked => {}
                             }
                         }
                     });
@@ -441,8 +327,6 @@ fn run_post_export_hook(dir: &std::path::Path) -> String {
 }
 
 fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
-    ui.heading("Layers");
-
     // Global Paint target: Content vs Mask. Disabled if active layer has no mask.
     ui.horizontal(|ui| {
         ui.label("Paint:");
@@ -627,8 +511,6 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
 }
 
 fn env_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
-    ui.heading("Environment");
-
     // Dropdown of anything in assets/hdri/ + "Procedural default".
     let bundled = crate::env::discover_bundled_hdris(
         &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -729,6 +611,148 @@ fn env_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
             }
         }
     }
+}
+
+fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
+    ui.horizontal(|ui| {
+        let baked = vp.mesh_maps.baked;
+        ui.weak(if baked {
+            "status: baked"
+        } else {
+            "status: not baked"
+        });
+        if ui.button("Bake").clicked() {
+            if let Some(rs) = frame.wgpu_render_state() {
+                vp.bake_mesh_maps(&rs.device, &rs.queue);
+            }
+        }
+    });
+    ui.weak("Currently: world normal. Position / curvature / AO land in D.3+.");
+}
+
+fn brush_section(ui: &mut egui::Ui, vp: &mut Viewport) {
+    use crate::paint::PaintChannel;
+    if vp.brush.mask_edit {
+        ui.weak("painting mask — black/white only");
+        ui.horizontal(|ui| {
+            let mut white = vp.brush.value >= 0.5;
+            if ui.radio_value(&mut white, true, "paint (white)").changed() && white {
+                vp.brush.value = 1.0;
+            }
+            if ui.radio_value(&mut white, false, "erase (black)").changed() && !white {
+                vp.brush.value = 0.0;
+            }
+        });
+    } else {
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut vp.brush.channel, PaintChannel::BaseColor, "Color");
+            ui.radio_value(&mut vp.brush.channel, PaintChannel::Roughness, "Rough");
+            ui.radio_value(&mut vp.brush.channel, PaintChannel::Metallic, "Metal");
+        });
+        match vp.brush.channel {
+            PaintChannel::BaseColor => {
+                ui.horizontal(|ui| {
+                    ui.label("color");
+                    ui.color_edit_button_rgb(&mut vp.brush.color_srgb);
+                });
+            }
+            PaintChannel::Roughness | PaintChannel::Metallic | PaintChannel::Mask => {
+                ui.add(egui::Slider::new(&mut vp.brush.value, 0.0..=1.0).text("value"));
+            }
+        }
+    }
+    ui.add(egui::Slider::new(&mut vp.brush.radius, 0.002..=0.3).text("radius"));
+    ui.add(egui::Slider::new(&mut vp.brush.hardness, 0.0..=1.0).text("hardness"));
+    ui.add(egui::Slider::new(&mut vp.brush.opacity, 0.0..=1.0).text("opacity"));
+}
+
+fn cursor_section(ui: &mut egui::Ui, vp: &Viewport) {
+    match (vp.last_hit_uv, vp.last_hit_tile) {
+        (Some(uv), Some(tile)) => {
+            ui.label(format!("uv    {:.3}, {:.3}", uv[0], uv[1]));
+            ui.label(format!("tile  {tile}"));
+        }
+        _ => {
+            ui.weak("(point at mesh)");
+        }
+    }
+}
+
+fn view_section(ui: &mut egui::Ui, vp: &mut Viewport) {
+    ui.label(format!("yaw   {:>6.2}", vp.camera.yaw));
+    ui.label(format!("pitch {:>6.2}", vp.camera.pitch));
+    ui.label(format!("dist  {:>6.2}", vp.camera.distance));
+    if ui.button("Reset camera").clicked() {
+        let t = vp.camera.target;
+        vp.camera = crate::camera::OrbitCamera::default();
+        vp.camera.target = t;
+    }
+}
+
+fn paint_target_section(
+    ui: &mut egui::Ui,
+    vp: &mut Viewport,
+    frame: &eframe::Frame,
+    status: &mut String,
+) {
+    let tiles = vp.tiles().to_vec();
+    let cur_res = vp.tile_resolution();
+    let vram = vp.paint_target_vram_bytes();
+    ui.horizontal(|ui| {
+        ui.label("resolution");
+        let mut new_res = cur_res;
+        egui::ComboBox::from_id_salt("tile_res_combo")
+            .selected_text(format!("{cur_res}×{cur_res}"))
+            .show_ui(ui, |ui| {
+                for &r in &[1024u32, 2048, 4096, 8192] {
+                    ui.selectable_value(&mut new_res, r, format!("{r}×{r}"));
+                }
+            });
+        if new_res != cur_res {
+            if let Some(rs) = frame.wgpu_render_state() {
+                vp.set_tile_resolution(&rs.device, &rs.queue, new_res);
+                *status = format!(
+                    "Rebuilt paint target @ {new_res}×{new_res} (painted content discarded)"
+                );
+                log::info!("{}", *status);
+            }
+        }
+    });
+    ui.label(format!("tile count   {}", tiles.len()));
+    ui.label(format!("vram approx  {}", human_bytes(vram)));
+    egui::ScrollArea::vertical()
+        .id_salt("tile_list_scroll")
+        .max_height(120.0)
+        .show(ui, |ui| {
+            egui::Grid::new("tile_grid").num_columns(4).show(ui, |ui| {
+                for (i, tid) in tiles.iter().enumerate() {
+                    ui.label(format!("{tid}"));
+                    if (i + 1) % 4 == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+        });
+}
+
+fn material_factors_section(ui: &mut egui::Ui, vp: &mut Viewport) {
+    ui.horizontal(|ui| {
+        ui.label("base color ×");
+        ui.color_edit_button_rgb(&mut vp.base_color_factor);
+    });
+    ui.add(egui::Slider::new(&mut vp.metallic_factor, 0.0..=2.0).text("metallic ×"));
+    ui.add(egui::Slider::new(&mut vp.roughness_factor, 0.0..=2.0).text("roughness ×"));
+    ui.add(egui::Slider::new(&mut vp.normal_scale, 0.0..=2.0).text("normal scale"));
+}
+
+fn light_section(ui: &mut egui::Ui, vp: &mut Viewport) {
+    ui.add(egui::Slider::new(&mut vp.light_intensity, 0.0..=10.0).text("intensity"));
+    ui.horizontal(|ui| {
+        ui.label("dir");
+        ui.add(egui::DragValue::new(&mut vp.light_dir[0]).speed(0.02).prefix("x:"));
+        ui.add(egui::DragValue::new(&mut vp.light_dir[1]).speed(0.02).prefix("y:"));
+        ui.add(egui::DragValue::new(&mut vp.light_dir[2]).speed(0.02).prefix("z:"));
+    });
 }
 
 fn human_bytes(n: u64) -> String {

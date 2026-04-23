@@ -39,6 +39,7 @@ struct Env {
 @group(1) @binding(3) var normal_tex: texture_2d_array<f32>;
 @group(1) @binding(4) var active_mask_tex: texture_2d_array<f32>;
 @group(1) @binding(5) var texset_sampler: sampler;
+@group(1) @binding(6) var world_normal_map: texture_2d_array<f32>;
 @group(2) @binding(0) var<uniform> env: Env;
 @group(2) @binding(1) var env_tex: texture_2d<f32>;
 @group(2) @binding(2) var irradiance_tex: texture_2d<f32>;
@@ -300,6 +301,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 let local_uv = fract(in.uv);
                 let m = textureSample(active_mask_tex, texset_sampler, local_uv, layer).r;
                 out_rgb = vec3<f32>(m);
+            }
+        }
+        case 6u: {
+            // World-normal bake preview — stored 0..1 biased, display as RGB.
+            if layer < 0 {
+                out_rgb = vec3<f32>(0.5, 0.5, 1.0);
+            } else {
+                let local_uv = fract(in.uv);
+                out_rgb =
+                    textureSample(world_normal_map, texset_sampler, local_uv, layer).rgb;
             }
         }
         default: {

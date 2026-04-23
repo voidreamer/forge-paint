@@ -65,6 +65,7 @@ pub enum ViewMode {
     Metallic,
     Normal,
     Mask,
+    WorldNormalBaked,
 }
 
 impl ViewMode {
@@ -76,6 +77,7 @@ impl ViewMode {
             ViewMode::Metallic => 3,
             ViewMode::Normal => 4,
             ViewMode::Mask => 5,
+            ViewMode::WorldNormalBaked => 6,
         }
     }
 
@@ -85,8 +87,9 @@ impl ViewMode {
             ViewMode::BaseColor => "Base Color",
             ViewMode::Roughness => "Roughness",
             ViewMode::Metallic => "Metallic",
-            ViewMode::Normal => "Normal",
+            ViewMode::Normal => "Normal (tangent)",
             ViewMode::Mask => "Mask",
+            ViewMode::WorldNormalBaked => "World Normal (baked)",
         }
     }
 
@@ -97,6 +100,7 @@ impl ViewMode {
         ViewMode::Metallic,
         ViewMode::Normal,
         ViewMode::Mask,
+        ViewMode::WorldNormalBaked,
     ];
 }
 
@@ -192,6 +196,19 @@ impl Renderer {
                     binding: 5,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // World-normal mesh map (Rgba16Float D2Array). Shown in the
+                // WorldNormalBaked view mode and later consumed by smart-mask
+                // generators.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],

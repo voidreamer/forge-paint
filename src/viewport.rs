@@ -3,6 +3,7 @@ use egui_wgpu::wgpu;
 use glam::Vec2;
 
 use crate::accel::MeshAccel;
+use crate::bake::{Baker, MeshMaps};
 use crate::camera::OrbitCamera;
 use crate::env::{
     BrdfLut, Environment, EnvUniforms, IrradianceBaker, PrefilterBaker, SkyboxPipeline,
@@ -44,6 +45,8 @@ pub struct Viewport {
     pub irradiance_baker: IrradianceBaker,
     pub prefilter_baker: PrefilterBaker,
     skybox: SkyboxPipeline,
+    pub mesh_maps: MeshMaps,
+    baker: Baker,
 
     pub camera: OrbitCamera,
 
@@ -158,6 +161,9 @@ impl Viewport {
             wgpu::TextureFormat::Depth32Float,
         );
 
+        let mesh_maps = MeshMaps::new_empty(device, queue, paint_target.tiles.len() as u32);
+        let baker = Baker::new(device);
+
         let mut camera = OrbitCamera::default();
         camera.target = gpu.center;
         camera.distance = (gpu.radius * 2.5).max(1.5);
@@ -183,6 +189,8 @@ impl Viewport {
             irradiance_baker,
             prefilter_baker,
             skybox,
+            mesh_maps,
+            baker,
             camera,
             brush: BrushState::default(),
             base_color_factor: [1.0, 1.0, 1.0],
@@ -229,6 +237,21 @@ impl Viewport {
         // Prior undo history references textures from the old layer stack —
         // those are invalid now that we rebuilt it. Drop them.
         self.undo_stack.clear();
+        // Reset mesh maps to a neutral placeholder for the new mesh/tile set.
+        self.mesh_maps =
+            MeshMaps::new_empty(device, queue, self.paint_target.tiles.len() as u32);
+    }
+
+    /// Bake mesh maps (currently: world normal) for the loaded mesh.
+    pub fn bake_mesh_maps(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.mesh_maps.bake(
+            device,
+            queue,
+            &self.baker,
+            &self.mesh,
+            &self.paint_target.tiles,
+            self.tile_resolution,
+        );
     }
 
     pub fn active_layer(&self) -> &Layer {
@@ -467,6 +490,12 @@ impl Viewport {
                                 binding: 5,
                                 resource: wgpu::BindingResource::Sampler(
                                     &self.paint_target.sampler,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.mesh_maps.world_normal_view,
                                 ),
                             },
                         ],
