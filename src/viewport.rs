@@ -273,9 +273,14 @@ impl Viewport {
         did
     }
 
-    /// Append a new empty layer on top and recomposite.
+    /// Append a new empty paint layer on top and recomposite.
     pub fn add_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.layer_stack.add_layer(device, queue);
+        self.recomposite(device, queue);
+    }
+
+    pub fn add_fill_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.layer_stack.add_fill_layer(device, queue);
         self.recomposite(device, queue);
     }
 
@@ -532,7 +537,9 @@ impl Viewport {
                     label: Some("forge_paint_enc"),
                 });
 
-            if !strokes.is_empty() {
+            // Fill layers are parameter-only — nothing to stamp into.
+            let active_is_fill = self.layer_stack.active_layer().is_fill();
+            if !strokes.is_empty() && !active_is_fill {
                 let active_idx = self.layer_stack.active;
                 let active = self.layer_stack.active_layer();
                 // If mask-edit is active AND the active layer has a mask, route

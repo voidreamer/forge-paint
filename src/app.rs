@@ -526,6 +526,28 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
                         }
                     });
 
+                    // Fill-layer controls replace the content/mask buttons —
+                    // Fill can't be painted directly; the sliders drive it.
+                    if let Some(mut params) = vp.layer_stack.layers[i].fill_params() {
+                        let before = params;
+                        ui.horizontal(|ui| {
+                            ui.label("fill color");
+                            ui.color_edit_button_rgb(&mut params.base_color_srgb);
+                        });
+                        ui.add(
+                            egui::Slider::new(&mut params.roughness, 0.0..=1.0)
+                                .text("roughness"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut params.metallic, 0.0..=1.0).text("metallic"),
+                        );
+                        if params != before {
+                            if let Some(rs) = frame.wgpu_render_state() {
+                                vp.layer_stack.layers[i].set_fill_params(&rs.queue, params);
+                                needs_recomposite = true;
+                            }
+                        }
+                    }
                     ui.horizontal(|ui| {
                         let has_mask = vp.layer_stack.layers[i].mask.is_some();
                         if has_mask {
@@ -557,9 +579,13 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
         });
 
     ui.add_space(4.0);
+    let mut add_fill_requested = false;
     ui.horizontal(|ui| {
-        if ui.button("+ Add Layer").clicked() {
+        if ui.button("+ Paint").clicked() {
             add_requested = true;
+        }
+        if ui.button("+ Fill").clicked() {
+            add_fill_requested = true;
         }
         ui.weak(format!("{n} layer{}", if n == 1 { "" } else { "s" }));
     });
@@ -568,6 +594,9 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
     if let Some(render_state) = frame.wgpu_render_state() {
         if add_requested {
             vp.add_layer(&render_state.device, &render_state.queue);
+        }
+        if add_fill_requested {
+            vp.add_fill_layer(&render_state.device, &render_state.queue);
         }
         if let Some(idx) = delete_idx {
             vp.remove_layer(&render_state.device, &render_state.queue, idx);

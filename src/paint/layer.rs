@@ -4,6 +4,35 @@
 
 use egui_wgpu::wgpu;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FillParams {
+    /// sRGB-authored color. Written to the sRGB texture as-is (byte = sRGB
+    /// value × 255); the sampler decodes it back to linear at read time.
+    pub base_color_srgb: [f32; 3],
+    pub roughness: f32,
+    pub metallic: f32,
+}
+
+impl Default for FillParams {
+    fn default() -> Self {
+        Self {
+            base_color_srgb: [0.5, 0.5, 0.5],
+            roughness: 0.5,
+            metallic: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LayerKind {
+    /// Artist paints into full-resolution textures — the current behavior.
+    Paint,
+    /// Layer is a uniform material fill; no brush strokes. Textures are 1×1
+    /// placeholders that the compositor samples the same way as Paint layers;
+    /// `FillParams` is the source of truth.
+    Fill(FillParams),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlendMode {
     Normal,
@@ -35,6 +64,7 @@ pub struct Layer {
     pub opacity: f32,
     pub visible: bool,
     pub blend_mode: BlendMode,
+    pub kind: LayerKind,
 
     pub base_color: wgpu::Texture,
     pub base_color_view: wgpu::TextureView,               // full array view
@@ -222,6 +252,7 @@ impl Layer {
             opacity: 1.0,
             visible: true,
             blend_mode: BlendMode::Normal,
+            kind: LayerKind::Paint,
             base_color,
             base_color_view,
             base_color_layer_views,
@@ -249,6 +280,157 @@ impl Layer {
 
     pub fn remove_mask(&mut self) {
         self.mask = None;
+    }
+
+    pub fn is_fill(&self) -> bool {
+        matches!(self.kind, LayerKind::Fill(_))
+    }
+
+    pub fn fill_params(&self) -> Option<FillParams> {
+        if let LayerKind::Fill(p) = self.kind {
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    /// Construct a Fill layer. Its channel textures are 1×1 per tile —
+    /// effectively free — and hold bytes derived from `FillParams::default()`.
+    /// Use `set_fill_params` to update the stored values (and re-upload the
+    /// 1×1 tiles) when the user drags sliders.
+    pub fn new_fill(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        name: impl Into<String>,
+        tile_count: u32,
+    ) -> Self {
+        let tile_count = tile_count.max(1);
+
+        let base_color = make_array(
+            device,
+            "layer.fill.base_color",
+            1,
+            tile_count,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let rough_metal = make_array(
+            device,
+            "layer.fill.rough_metal",
+            1,
+            tile_count,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let normal = make_array(
+            device,
+            "layer.fill.normal",
+            1,
+            tile_count,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+
+        let base_color_view = array_view(&base_color, "layer.fill.base_color.array_view");
+        let rough_metal_view = array_view(&rough_metal, "layer.fill.rough_metal.array_view");
+        let normal_view = array_view(&normal, "layer.fill.normal.array_view");
+
+        let base_color_layer_views: Vec<_> = (0..tile_count)
+            .map(|t| tile_view(&base_color, t, "layer.fill.base_color.tile_view"))
+            .collect();
+        let rough_metal_layer_views: Vec<_> = (0..tile_count)
+            .map(|t| tile_view(&rough_metal, t, "layer.fill.rough_metal.tile_view"))
+            .collect();
+        let normal_layer_views: Vec<_> = (0..tile_count)
+            .map(|t| tile_view(&normal, t, "layer.fill.normal.tile_view"))
+            .collect();
+
+        let mut layer = Self {
+            name: name.into(),
+            opacity: 1.0,
+            visible: true,
+            blend_mode: BlendMode::Normal,
+            kind: LayerKind::Fill(FillParams::default()),
+            base_color,
+            base_color_view,
+            base_color_layer_views,
+            rough_metal,
+            rough_metal_view,
+            rough_metal_layer_views,
+            normal,
+            normal_view,
+            normal_layer_views,
+            mask: None,
+        };
+        layer.upload_fill_bytes(queue);
+        layer
+    }
+
+    /// Replace the fill parameters and re-upload the 1×1 tiles. No-op for
+    /// Paint layers.
+    pub fn set_fill_params(&mut self, queue: &wgpu::Queue, params: FillParams) {
+        match &mut self.kind {
+            LayerKind::Fill(stored) => {
+                if *stored == params {
+                    return;
+                }
+                *stored = params;
+            }
+            LayerKind::Paint => return,
+        }
+        self.upload_fill_bytes(queue);
+    }
+
+    fn upload_fill_bytes(&self, queue: &wgpu::Queue) {
+        let LayerKind::Fill(params) = self.kind else {
+            return;
+        };
+        // sRGB: write byte = srgb × 255. Sampler decodes on read.
+        let bc = [
+            (params.base_color_srgb[0].clamp(0.0, 1.0) * 255.0) as u8,
+            (params.base_color_srgb[1].clamp(0.0, 1.0) * 255.0) as u8,
+            (params.base_color_srgb[2].clamp(0.0, 1.0) * 255.0) as u8,
+            255,
+        ];
+        // glTF rough_metal packing: R=AO(1), G=roughness, B=metallic.
+        let rm = [
+            255,
+            (params.roughness.clamp(0.0, 1.0) * 255.0) as u8,
+            (params.metallic.clamp(0.0, 1.0) * 255.0) as u8,
+            255,
+        ];
+        // Flat tangent-space normal — fill layers don't perturb normals.
+        let nm = [128u8, 128, 255, 255];
+
+        let tiles = self.base_color_layer_views.len() as u32;
+        for tile in 0..tiles {
+            for (tex, bytes) in [
+                (&self.base_color, &bc),
+                (&self.rough_metal, &rm),
+                (&self.normal, &nm),
+            ] {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: tile,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    bytes,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4),
+                        rows_per_image: Some(1),
+                    },
+                    wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -285,10 +467,18 @@ impl LayerStack {
         &mut self.layers[self.active]
     }
 
-    /// Append a fresh layer on top of the stack and make it active.
+    /// Append a fresh Paint layer on top of the stack and make it active.
     pub fn add_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let name = self.unique_name("Layer");
         let layer = Layer::new(device, queue, name, self.resolution, self.tile_count);
+        self.layers.push(layer);
+        self.active = self.layers.len() - 1;
+    }
+
+    /// Append a fresh Fill layer on top of the stack and make it active.
+    pub fn add_fill_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let name = self.unique_name("Fill");
+        let layer = Layer::new_fill(device, queue, name, self.tile_count);
         self.layers.push(layer);
         self.active = self.layers.len() - 1;
     }
