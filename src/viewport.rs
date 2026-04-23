@@ -110,6 +110,10 @@ pub struct Viewport {
 
     /// Stroke-level undo / redo.
     undo_stack: crate::undo::UndoStack,
+
+    /// egui TextureIds for each layer's tile-0 base_color view, used as the
+    /// layer-row thumbnail. Parallel to `layer_stack.layers`.
+    pub layer_thumb_cache: Vec<Option<egui::TextureId>>,
 }
 
 pub struct BrushState {
@@ -236,6 +240,7 @@ impl Viewport {
             last_hit_tile: None,
             last_paint_pos: None,
             undo_stack: crate::undo::UndoStack::default(),
+            layer_thumb_cache: Vec::new(),
         }
     }
 
@@ -269,6 +274,9 @@ impl Viewport {
         // Reset mesh maps to a neutral placeholder for the new mesh/tile set.
         self.mesh_maps =
             MeshMaps::new_empty(device, queue, self.paint_target.tiles.len() as u32);
+        // Thumbnail TextureIds from the old stack point to textures that have
+        // been dropped — we leak the egui slots here (rare enough to ignore).
+        self.layer_thumb_cache.clear();
     }
 
     /// Bake mesh maps (currently: world normal) for the loaded mesh.
@@ -328,17 +336,22 @@ impl Viewport {
     /// Append a new empty paint layer on top and recomposite.
     pub fn add_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.layer_stack.add_layer(device, queue);
+        self.layer_thumb_cache.push(None);
         self.recomposite(device, queue);
     }
 
     pub fn add_fill_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.layer_stack.add_fill_layer(device, queue);
+        self.layer_thumb_cache.push(None);
         self.recomposite(device, queue);
     }
 
     /// Delete a layer. Always keeps at least one.
     pub fn remove_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, idx: usize) {
         self.layer_stack.remove_at(idx);
+        if idx < self.layer_thumb_cache.len() {
+            self.layer_thumb_cache.remove(idx);
+        }
         self.recomposite(device, queue);
     }
 
@@ -352,6 +365,35 @@ impl Viewport {
 
     pub fn paint_target(&self) -> &PaintTarget {
         &self.paint_target
+    }
+
+    /// Register (or reuse) an egui TextureId pointing at `idx`'s tile-0
+    /// base_color view, for use as a layer thumbnail. Writes through to the
+    /// live texture, so stamps update the thumbnail automatically.
+    pub fn ensure_layer_thumb(
+        &mut self,
+        device: &wgpu::Device,
+        renderer: &mut egui_wgpu::Renderer,
+        idx: usize,
+    ) -> Option<egui::TextureId> {
+        if idx >= self.layer_stack.layers.len() {
+            return None;
+        }
+        if self.layer_thumb_cache.len() != self.layer_stack.layers.len() {
+            self.layer_thumb_cache
+                .resize(self.layer_stack.layers.len(), None);
+        }
+        if self.layer_thumb_cache[idx].is_none() {
+            if let Some(view) = self.layer_stack.layers[idx]
+                .base_color_layer_views
+                .first()
+            {
+                let id =
+                    renderer.register_native_texture(device, view, wgpu::FilterMode::Linear);
+                self.layer_thumb_cache[idx] = Some(id);
+            }
+        }
+        self.layer_thumb_cache[idx]
     }
 
     /// Rebuild the paint target at a new per-tile resolution. Painted content

@@ -2,6 +2,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 use crate::{
+    assets::{self, AssetBrowser},
     mesh,
     viewport::{Tool, Viewport},
 };
@@ -17,6 +18,8 @@ pub struct App {
     // Open URI dialog state
     show_uri_dialog: bool,
     uri_buffer: String,
+
+    browser: AssetBrowser,
 }
 
 impl App {
@@ -169,6 +172,14 @@ impl eframe::App for App {
                 });
             });
         });
+
+        egui::TopBottomPanel::bottom("assets")
+            .resizable(true)
+            .default_height(160.0)
+            .min_height(80.0)
+            .show(ctx, |ui| {
+                self.asset_browser_panel(ui, frame);
+            });
 
         egui::SidePanel::left("tools")
             .resizable(true)
@@ -418,6 +429,13 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
                 } else {
                     egui::Color32::TRANSPARENT
                 };
+                // Thumbnail registration happens before the row mutates the
+                // layer so we don't fight the borrow checker inside the row.
+                let thumb = frame.wgpu_render_state().and_then(|rs| {
+                    let mut renderer = rs.renderer.write();
+                    vp.ensure_layer_thumb(&rs.device, &mut renderer, i)
+                });
+                let mut activate = false;
                 egui::Frame::NONE.fill(row_bg).inner_margin(4.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let layer = &mut vp.layer_stack.layers[i];
@@ -426,12 +444,22 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
                             needs_recomposite = true;
                         }
 
+                        if let Some(id) = thumb {
+                            // Click the thumbnail → activate the layer.
+                            let img = egui::Image::new((id, egui::vec2(32.0, 32.0)))
+                                .fit_to_exact_size(egui::vec2(32.0, 32.0))
+                                .sense(egui::Sense::click());
+                            if ui.add(img).clicked() {
+                                activate = true;
+                            }
+                        }
+
                         // Clickable name → sets active
                         let label = egui::Label::new(egui::RichText::new(&layer.name).strong())
                             .sense(egui::Sense::click())
                             .truncate();
                         if ui.add(label).clicked() {
-                            vp.layer_stack.active = i;
+                            activate = true;
                         }
                     });
 
@@ -515,6 +543,9 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
                         }
                     });
                 });
+                if activate {
+                    vp.layer_stack.active = i;
+                }
             }
         });
 
@@ -1020,4 +1051,186 @@ impl App {
         };
         log::info!("{}", self.status);
     }
+
+    fn asset_browser_panel(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let mut want_import = false;
+        ui.horizontal(|ui| {
+            for &tab in assets::Tab::ALL {
+                ui.selectable_value(&mut self.browser.active_tab, tab, tab.label());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if matches!(self.browser.active_tab, assets::Tab::Textures)
+                    && ui.button("+ Import").clicked()
+                {
+                    want_import = true;
+                }
+            });
+        });
+        ui.separator();
+
+        match self.browser.active_tab {
+            assets::Tab::Textures => {
+                self.texture_strip(ui, frame);
+            }
+            _ => {
+                ui.weak("(this tab is not implemented yet)");
+            }
+        }
+
+        if want_import {
+            self.import_texture_dialog(frame);
+        }
+    }
+
+    fn texture_strip(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        if self.browser.textures.is_empty() {
+            ui.weak("Nothing imported. Click + Import to add a texture.");
+            return;
+        }
+        let mut action: Option<(usize, AssetAction)> = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("asset_texture_strip")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, asset) in self.browser.textures.iter().enumerate() {
+                        ui.vertical(|ui| {
+                            let img = egui::Image::new((
+                                asset.thumb_id,
+                                egui::vec2(80.0, 80.0),
+                            ))
+                            .fit_to_exact_size(egui::vec2(80.0, 80.0))
+                            .sense(egui::Sense::click());
+                            let response = ui.add(img);
+                            response.context_menu(|ui| {
+                                if ui.button("New paint layer from texture").clicked() {
+                                    action = Some((i, AssetAction::NewLayer));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Apply as base color to active layer").clicked() {
+                                    action = Some((i, AssetAction::ApplyBaseColor));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Apply as mask to active layer").clicked() {
+                                    action = Some((i, AssetAction::ApplyMask));
+                                    ui.close_menu();
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(&asset.name).small().color(
+                                    ui.style().visuals.weak_text_color(),
+                                ),
+                            );
+                        });
+                    }
+                });
+            });
+        if let Some((idx, act)) = action {
+            self.apply_asset_action(idx, act, frame);
+        }
+    }
+
+    fn import_texture_dialog(&mut self, frame: &eframe::Frame) {
+        // Only PNG is enabled in the image crate's features today; adding
+        // JPEG/TGA/BMP means enabling more features in Cargo.toml.
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Image", &["png"])
+            .set_title("Import texture")
+            .pick_file()
+        else {
+            return;
+        };
+        let Some(rs) = frame.wgpu_render_state() else {
+            self.status = "No GPU available.".to_string();
+            return;
+        };
+        let mut renderer = rs.renderer.write();
+        match self
+            .browser
+            .import_texture(&path, &rs.device, &rs.queue, &mut renderer)
+        {
+            Ok(_) => {
+                self.status = format!("Imported {}", path.display());
+                log::info!("{}", self.status);
+            }
+            Err(e) => {
+                self.status = format!("Import failed: {e}");
+                log::warn!("{}", self.status);
+            }
+        }
+    }
+
+    fn apply_asset_action(
+        &mut self,
+        idx: usize,
+        action: AssetAction,
+        frame: &eframe::Frame,
+    ) {
+        let Some(vp) = &mut self.viewport else {
+            return;
+        };
+        let Some(rs) = frame.wgpu_render_state() else {
+            self.status = "No GPU available.".to_string();
+            return;
+        };
+        let Some(asset) = self.browser.textures.get(idx) else {
+            return;
+        };
+
+        match action {
+            AssetAction::NewLayer => {
+                vp.add_layer(&rs.device, &rs.queue);
+                let last = vp.layer_stack.layers.len() - 1;
+                vp.layer_stack.active = last;
+                let tile_count = vp.paint_target().tiles.len() as u32;
+                let res = vp.tile_resolution();
+                let layer = &vp.layer_stack.layers[last];
+                if let Err(e) =
+                    assets::apply_as_base_color(&rs.queue, asset, layer, tile_count, res)
+                {
+                    self.status = format!("Apply failed: {e}");
+                    return;
+                }
+                vp.recomposite(&rs.device, &rs.queue);
+                self.status = format!("Created layer from '{}'", asset.name);
+            }
+            AssetAction::ApplyBaseColor => {
+                let tile_count = vp.paint_target().tiles.len() as u32;
+                let res = vp.tile_resolution();
+                let active = vp.layer_stack.active;
+                let layer = &vp.layer_stack.layers[active];
+                if let Err(e) =
+                    assets::apply_as_base_color(&rs.queue, asset, layer, tile_count, res)
+                {
+                    self.status = format!("Apply failed: {e}");
+                    return;
+                }
+                vp.recomposite(&rs.device, &rs.queue);
+                self.status = format!("Applied '{}' as base color", asset.name);
+            }
+            AssetAction::ApplyMask => {
+                let active = vp.layer_stack.active;
+                if vp.layer_stack.layers[active].mask.is_none() {
+                    vp.layer_stack
+                        .add_mask_to(active, &rs.device, &rs.queue);
+                }
+                let tile_count = vp.paint_target().tiles.len() as u32;
+                let res = vp.tile_resolution();
+                let layer = &vp.layer_stack.layers[active];
+                if let Err(e) = assets::apply_as_mask(&rs.queue, asset, layer, tile_count, res) {
+                    self.status = format!("Apply failed: {e}");
+                    return;
+                }
+                vp.recomposite(&rs.device, &rs.queue);
+                self.status = format!("Applied '{}' as mask", asset.name);
+            }
+        }
+        log::info!("{}", self.status);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AssetAction {
+    NewLayer,
+    ApplyBaseColor,
+    ApplyMask,
 }

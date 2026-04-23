@@ -2,6 +2,7 @@
 
 mod accel;
 mod app;
+mod assets;
 mod bake;
 mod camera;
 mod env;
