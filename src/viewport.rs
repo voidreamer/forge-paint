@@ -393,6 +393,88 @@ impl Viewport {
             .run_and_submit(device, queue, &self.layer_stack, &self.paint_target);
     }
 
+    /// Stamp the current brush at a tile's local UV — the UV-view
+    /// entry point. Unlike the 3D-viewport path, there's no picker
+    /// involved (the caller already knows which tile and where) so we
+    /// bypass all the ray-cast plumbing and go straight to the brush
+    /// pipeline. Recomposites just the touched tile afterward.
+    pub fn stamp_at_uv(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tile_idx: u32,
+        local_uv: [f32; 2],
+    ) {
+        let active_is_fill = self.layer_stack.active_layer().is_fill();
+        if active_is_fill {
+            return;
+        }
+        let active = self.layer_stack.active_layer();
+        let has_mask = active.mask.is_some();
+        let channel = if self.brush.mask_edit && has_mask {
+            PaintChannel::Mask
+        } else {
+            self.brush.channel
+        };
+        let uv_radius = self.brush.radius / 400.0;
+        let color_comp = match channel {
+            PaintChannel::BaseColor => {
+                let lin = self.brush.color_linear();
+                [lin[0], lin[1], lin[2]]
+            }
+            PaintChannel::Roughness | PaintChannel::Metallic => {
+                [self.brush.value, self.brush.value, self.brush.value]
+            }
+            PaintChannel::Mask => {
+                let v = if self.brush.value >= 0.5 { 1.0 } else { 0.0 };
+                [v, v, v]
+            }
+            PaintChannel::Displacement => [self.brush.value, 1.0, 0.0],
+        };
+        let uniforms = BrushUniforms {
+            color: [color_comp[0], color_comp[1], color_comp[2], self.brush.opacity],
+            center_uv: local_uv,
+            radius: uv_radius,
+            hardness: self.brush.hardness,
+            uniform_fill: 0,
+            _pad: [0; 3],
+        };
+        let layer_view = match channel {
+            PaintChannel::BaseColor => &active.base_color_layer_views[tile_idx as usize],
+            PaintChannel::Roughness => &active.roughness_layer_views[tile_idx as usize],
+            PaintChannel::Metallic => &active.metallic_layer_views[tile_idx as usize],
+            PaintChannel::Mask => match &active.mask {
+                Some(m) => &m.layer_views[tile_idx as usize],
+                None => return,
+            },
+            PaintChannel::Displacement => {
+                &self.paint_target.displacement_layer_views[tile_idx as usize]
+            }
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("uv_view_stamp"),
+        });
+        self.brush_pipeline.stamp(
+            queue,
+            &mut encoder,
+            layer_view,
+            channel,
+            &uniforms,
+            self.paint_target.resolution,
+        );
+        if channel != PaintChannel::Displacement {
+            self.compositor.run_sparse(
+                device,
+                queue,
+                &mut encoder,
+                &self.layer_stack,
+                &self.paint_target,
+                &[tile_idx as usize],
+            );
+        }
+        queue.submit(Some(encoder.finish()));
+    }
+
     pub fn can_undo(&self) -> bool {
         self.undo_stack.can_undo()
     }

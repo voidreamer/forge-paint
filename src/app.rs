@@ -35,6 +35,16 @@ pub struct App {
     /// When `Some`, the material slot picker modal is open. The value
     /// tracks which channel the picked texture should be assigned to.
     show_slot_picker: Option<MaterialSlot>,
+
+    /// Docked 2D UV painting view. Splits the central area when on.
+    show_uv_view: bool,
+    /// Pixels-per-UV-unit for the UV atlas. Modified by scroll.
+    uv_zoom: f32,
+    /// Screen-pixel offset applied to the atlas (drag to pan).
+    uv_pan: egui::Vec2,
+    /// Cached egui TextureIds for the composited paint_target.base_color
+    /// tiles, rebuilt when the tile count changes.
+    uv_thumb_ids: Vec<Option<egui::TextureId>>,
 }
 
 /// Which channel a material-slot assignment should target on the
@@ -86,6 +96,9 @@ impl App {
         });
         Self {
             pending_open,
+            // Sane non-zero defaults for the UV view. bool/Vec2/Vec
+            // defaults (false, (0,0), empty) are already what we want.
+            uv_zoom: 400.0,
             ..Default::default()
         }
     }
@@ -183,6 +196,14 @@ impl eframe::App for App {
                     ui.separator();
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    if ui
+                        .checkbox(&mut self.show_uv_view, "UV view")
+                        .clicked()
+                    {
+                        ui.close_menu();
                     }
                 });
                 ui.separator();
@@ -531,6 +552,24 @@ impl eframe::App for App {
                             }
                         }
                     });
+                    // UV view — a bottom strip inside the central area,
+                    // resizable, visible only when the View menu toggle
+                    // is on. Splits screen with the 3D viewport above.
+                    if self.show_uv_view {
+                        egui::TopBottomPanel::bottom("uv_view_panel")
+                            .default_height(280.0)
+                            .resizable(true)
+                            .show_inside(ui, |ui| {
+                                uv_view_body(
+                                    ui,
+                                    vp,
+                                    frame,
+                                    &mut self.uv_zoom,
+                                    &mut self.uv_pan,
+                                    &mut self.uv_thumb_ids,
+                                );
+                            });
+                    }
                     vp.show(ui, frame, stencil_view, stencil_aspect, stencil_tex_id);
                 } else {
                     ui.centered_and_justified(|ui| ui.label("Initializing GPU…"));
@@ -1108,6 +1147,160 @@ fn paint_target_section(
                 }
             });
         });
+}
+
+/// Render the 2D UV atlas painting view. Shows `paint_target.base_color`
+/// composited tiles at their UDIM positions, supports pan (drag) + zoom
+/// (scroll), paints via `Viewport::stamp_at_uv` on left-click drag.
+fn uv_view_body(
+    ui: &mut egui::Ui,
+    vp: &mut Viewport,
+    frame: &eframe::Frame,
+    zoom: &mut f32,
+    pan: &mut egui::Vec2,
+    thumb_ids: &mut Vec<Option<egui::TextureId>>,
+) {
+    // Ensure our cache matches the current tile count.
+    let tiles = vp.paint_target().tiles.to_vec();
+    if thumb_ids.len() != tiles.len() {
+        thumb_ids.clear();
+        thumb_ids.resize(tiles.len(), None);
+    }
+
+    // Lazily register each tile's base_color layer view as an egui
+    // texture — re-uses the live GPU view, so paints update the atlas
+    // immediately.
+    if let Some(rs) = frame.wgpu_render_state() {
+        let mut renderer = rs.renderer.write();
+        for (i, slot) in thumb_ids.iter_mut().enumerate() {
+            if slot.is_none() {
+                let view = &vp.paint_target().base_color_layer_views[i];
+                *slot = Some(renderer.register_native_texture(
+                    &rs.device,
+                    view,
+                    eframe::wgpu::FilterMode::Linear,
+                ));
+            }
+        }
+    }
+
+    let (rect, response) = ui.allocate_exact_size(
+        ui.available_size(),
+        egui::Sense::click_and_drag(),
+    );
+
+    // Pan (right-mouse drag or middle-mouse drag — leave LMB for paint).
+    if response.dragged_by(egui::PointerButton::Secondary)
+        || response.dragged_by(egui::PointerButton::Middle)
+    {
+        *pan += response.drag_delta();
+    }
+
+    // Zoom (scroll anywhere in the panel, cursor anchor).
+    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+    if response.hovered() && scroll.abs() > 0.0 {
+        let factor = (1.0 + scroll * 0.0015).clamp(0.1, 10.0);
+        let cursor = response
+            .hover_pos()
+            .unwrap_or_else(|| rect.center());
+        let before = cursor - rect.min - *pan;
+        *zoom = (*zoom * factor).clamp(16.0, 8000.0);
+        let after = before * factor;
+        *pan += before - after;
+    }
+
+    // Transforms: atlas UV → screen pixel.
+    let to_screen = |uv: egui::Vec2| rect.min + *pan + uv * *zoom;
+
+    // Draw tiles.
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(30, 30, 35));
+    for (i, &tile_id) in tiles.iter().enumerate() {
+        let Some(id) = thumb_ids[i] else { continue };
+        // Inline UDIM offset: tile 1001 = (0,0), 1002 = (1,0), 1011 = (0,1) …
+        let n = tile_id.saturating_sub(1001);
+        let tu = (n % 10) as f32;
+        let tv = (n / 10) as f32;
+        // Tile UV range is [(tu, tv), (tu+1, tv+1)]. UV.y=0 lives at
+        // the top of the tile texture (matches persist/export), so map
+        // (tu, tv+1) → bottom-left of screen.
+        let tl = to_screen(egui::vec2(tu, tv));
+        let br = to_screen(egui::vec2(tu + 1.0, tv + 1.0));
+        let tile_rect = egui::Rect::from_two_pos(tl, br);
+        if tile_rect.intersects(rect) {
+            painter.image(
+                id,
+                tile_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            // UDIM label at top-left of the tile.
+            painter.text(
+                tile_rect.left_top() + egui::vec2(4.0, 2.0),
+                egui::Align2::LEFT_TOP,
+                format!("{tile_id}"),
+                egui::FontId::monospace(10.0),
+                egui::Color32::from_rgb(255, 220, 100),
+            );
+        }
+    }
+
+    // UDIM grid — 1-unit squares covering the visible extent.
+    let grid_stroke = egui::Stroke::new(
+        1.0,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+    );
+    let uv_min = (egui::vec2(rect.min.x, rect.min.y) - egui::vec2(rect.min.x, rect.min.y)
+        - *pan)
+        / *zoom;
+    let _ = uv_min;
+    // Approximate visible UV range from rect.
+    let uv_tl = (rect.min - rect.min - *pan) / *zoom;
+    let uv_br = (rect.max - rect.min - *pan) / *zoom;
+    let ix_min = uv_tl.x.floor() as i32;
+    let ix_max = uv_br.x.ceil() as i32;
+    let iy_min = uv_tl.y.floor() as i32;
+    let iy_max = uv_br.y.ceil() as i32;
+    for x in ix_min..=ix_max {
+        let a = to_screen(egui::vec2(x as f32, iy_min as f32));
+        let b = to_screen(egui::vec2(x as f32, iy_max as f32));
+        painter.line_segment([a, b], grid_stroke);
+    }
+    for y in iy_min..=iy_max {
+        let a = to_screen(egui::vec2(ix_min as f32, y as f32));
+        let b = to_screen(egui::vec2(ix_max as f32, y as f32));
+        painter.line_segment([a, b], grid_stroke);
+    }
+
+    // Paint: map LMB position → atlas UV → tile + local_uv; stamp.
+    let primary_active = response.dragged_by(egui::PointerButton::Primary)
+        || response.clicked_by(egui::PointerButton::Primary);
+    if primary_active {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let atlas_uv = (pos - rect.min - *pan) / *zoom;
+            let tile_u = atlas_uv.x.floor() as i32;
+            let tile_v = atlas_uv.y.floor() as i32;
+            if tile_u >= 0 && tile_v >= 0 && tile_u < 10 {
+                let tile_id = 1001 + tile_u as u32 + 10 * tile_v as u32;
+                if let Some(tile_idx) = vp.paint_target().layer_for_tile(tile_id) {
+                    let local_uv = [atlas_uv.x.fract(), atlas_uv.y.fract()];
+                    if let Some(rs) = frame.wgpu_render_state() {
+                        vp.stamp_at_uv(&rs.device, &rs.queue, tile_idx, local_uv);
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+        }
+    }
+
+    // Simple footer — channel name + zoom readout.
+    painter.text(
+        rect.left_bottom() + egui::vec2(6.0, -6.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!("UV atlas · {:.0} px/UV · RMB or MMB drag to pan · scroll to zoom", *zoom),
+        egui::FontId::monospace(11.0),
+        egui::Color32::from_rgb(160, 170, 180),
+    );
 }
 
 fn material_slots_section(ui: &mut egui::Ui, vp: &Viewport) -> Option<MaterialSlot> {
