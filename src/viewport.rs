@@ -172,8 +172,10 @@ pub struct Viewport {
 
 pub struct BrushState {
     pub channel: PaintChannel,
-    pub color_srgb: [f32; 3], // base_color
-    pub value: f32,           // 0..1, used for Roughness / Metallic / Mask
+    /// Single-source color for the brush. Drives base color directly, and
+    /// drives scalar channels (roughness / metallic / displacement / mask)
+    /// via `luminance()` — one swatch picks every channel's write value.
+    pub color_srgb: [f32; 3],
     /// Brush radius in **screen pixels**. Converted to UV at stamp time
     /// via the UV gradient at the hit — this way the ring size is
     /// consistent regardless of how the mesh is UV-unwrapped.
@@ -189,7 +191,6 @@ impl Default for BrushState {
         Self {
             channel: PaintChannel::BaseColor,
             color_srgb: [0.95, 0.2, 0.2],
-            value: 0.5,
             radius: 40.0,
             hardness: 0.4,
             opacity: 1.0,
@@ -416,21 +417,12 @@ impl Viewport {
         } else {
             self.brush.channel
         };
-        let uv_radius = self.brush.radius / 400.0;
-        let color_comp = match channel {
-            PaintChannel::BaseColor => {
-                let lin = self.brush.color_linear();
-                [lin[0], lin[1], lin[2]]
-            }
-            PaintChannel::Roughness | PaintChannel::Metallic => {
-                [self.brush.value, self.brush.value, self.brush.value]
-            }
-            PaintChannel::Mask => {
-                let v = if self.brush.value >= 0.5 { 1.0 } else { 0.0 };
-                [v, v, v]
-            }
-            PaintChannel::Displacement => [self.brush.value, 1.0, 0.0],
-        };
+        // 400 px per UV is a reasonable default mapping for a square-ish
+        // model view — matches how the main paint path picks
+        // pixels-per-UV when the Jacobian probe fails. Clamp to half a
+        // tile so extreme brush radii (500 px) don't overshoot.
+        let uv_radius = (self.brush.radius / 400.0).min(0.5);
+        let color_comp = brush_color_components(&self.brush, channel);
         let uniforms = BrushUniforms {
             color: [color_comp[0], color_comp[1], color_comp[2], self.brush.opacity],
             center_uv: local_uv,
@@ -958,13 +950,16 @@ impl Viewport {
                 // Paint / Fill honor mask_edit.
                 let channel = match self.tool {
                     Tool::Erase => PaintChannel::Mask,
-                    Tool::Stencil => {
-                        if self.brush.channel == PaintChannel::Displacement {
-                            PaintChannel::Displacement
-                        } else {
-                            PaintChannel::BaseColor
-                        }
-                    }
+                    // Stencil projects into whatever channel the brush is
+                    // pointed at — base color, displacement, roughness, or
+                    // metallic. Mask falls back to base color (projection
+                    // onto a per-layer mask isn't implemented yet).
+                    Tool::Stencil => match self.brush.channel {
+                        PaintChannel::Displacement => PaintChannel::Displacement,
+                        PaintChannel::Roughness => PaintChannel::Roughness,
+                        PaintChannel::Metallic => PaintChannel::Metallic,
+                        _ => PaintChannel::BaseColor,
+                    },
                     _ => {
                         if self.brush.mask_edit && has_mask {
                             PaintChannel::Mask
@@ -1013,31 +1008,17 @@ impl Viewport {
                             );
                         }
 
-                        let value = if self.tool == Tool::Erase {
-                            0.0
+                        // Erase zeroes the channel; every other tool takes its
+                        // write value from the brush color (directly for base
+                        // color, luminance-derived for scalar channels).
+                        let color_comp = if self.tool == Tool::Erase {
+                            match channel {
+                                PaintChannel::BaseColor => [0.0, 0.0, 0.0],
+                                PaintChannel::Displacement => [0.0, 1.0, 0.0],
+                                _ => [0.0, 0.0, 0.0],
+                            }
                         } else {
-                            self.brush.value
-                        };
-                        let color_comp = match channel {
-                            PaintChannel::BaseColor => {
-                                let lin = self.brush.color_linear();
-                                [lin[0], lin[1], lin[2]]
-                            }
-                            PaintChannel::Roughness | PaintChannel::Metallic => {
-                                [value, value, value]
-                            }
-                            PaintChannel::Mask => {
-                                // Pure white (reveal) or pure black (hide) —
-                                // feathering comes from the brush's falloff.
-                                let v = if value >= 0.5 { 1.0 } else { 0.0 };
-                                [v, v, v]
-                            }
-                            PaintChannel::Displacement => {
-                                // Shader writes (r*a, g*a, b*a, a). We want
-                                // (value*a, 1*a, 0, a) on the Rg16Float
-                                // target → R=height*coverage, G=coverage.
-                                [value, 1.0, 0.0]
-                            }
+                            brush_color_components(&self.brush, channel)
                         };
                         let uniform_fill = if self.tool == Tool::Fill { 1u32 } else { 0u32 };
 
@@ -1068,8 +1049,23 @@ impl Viewport {
                             });
                         // Convert pixels → UV. Fallback uses a sane default
                         // so a rare Jacobian miss doesn't skip the stamp.
-                        let uv_radius = self.brush.radius
-                            / pixels_per_uv.unwrap_or(rect.height() * 0.5).max(1.0);
+                        //
+                        // Reject implausibly tiny pixels_per_uv values (near-
+                        // singular UV gradients on silhouettes or degenerate
+                        // triangles). Without this guard a ratio of e.g. 0.5
+                        // flips a 40-px brush into a 40-UV brush → whole tile
+                        // gets painted every stamp, "fills the object" bug
+                        // when the user drags across mesh edges. 16 px per UV
+                        // is already an extremely zoomed-out view; anything
+                        // below that almost certainly came from a bad pick.
+                        let sane_ppu = pixels_per_uv
+                            .filter(|&p| p >= 16.0)
+                            .unwrap_or(rect.height() * 0.5)
+                            .max(16.0);
+                        // Hard cap at half a tile regardless — the shader and
+                        // scissor would otherwise cover every texel, and no
+                        // single stamp should ever exceed that footprint.
+                        let uv_radius = (self.brush.radius / sane_ppu).min(0.5);
 
                         // Projection painting: when a stencil is selected
                         // and we're brushing into base color on a paint
@@ -1083,7 +1079,10 @@ impl Viewport {
                         let projection_active = stencil_view.is_some()
                             && matches!(
                                 channel,
-                                PaintChannel::BaseColor | PaintChannel::Displacement,
+                                PaintChannel::BaseColor
+                                    | PaintChannel::Displacement
+                                    | PaintChannel::Roughness
+                                    | PaintChannel::Metallic,
                             )
                             && self.tool == Tool::Stencil
                             && self.mesh_maps.baked;
@@ -1133,14 +1132,15 @@ impl Viewport {
                                     stencil_cos_rot: self.stencil_transform.rotation.cos(),
                                     stencil_sin_rot: self.stencil_transform.rotation.sin(),
                                     stencil_aspect,
-                                    // mode=1 when projecting into the
-                                    // Rg16Float displacement buffer so
-                                    // the shader packs (h·a, a) instead
-                                    // of premultiplied color.
-                                    mode: if channel == PaintChannel::Displacement {
-                                        1
-                                    } else {
-                                        0
+                                    // mode tells the shader how to pack its
+                                    // output so it matches the target format:
+                                    // 0 = Rgba8UnormSrgb (premultiplied RGB),
+                                    // 1 = Rg16Float (h·a, a),
+                                    // 2 = R8Unorm (luminance·a in R).
+                                    mode: match channel {
+                                        PaintChannel::Displacement => 1,
+                                        PaintChannel::Roughness | PaintChannel::Metallic => 2,
+                                        _ => 0,
                                     },
                                     _pad: [0.0; 3],
                                 };
@@ -1441,6 +1441,22 @@ impl Viewport {
             }
         }
 
+        // Default brush-shortcut hint — shown at the bottom of the
+        // viewport whenever the stencil-transform hint isn't taking the
+        // slot. Mirrors the stencil hint's style so the bottom line is
+        // always a predictable "where are the shortcuts?" cheat-sheet.
+        let stencil_hint_visible = self.tool == Tool::Stencil && self.active_stencil.is_some();
+        if !stencil_hint_visible {
+            let hint = "S/D/F + drag: radius · hardness · opacity  ·  B/E/G/I/T: tools  ·  Home: reset view  ·  ⌘Z / ⌘⇧Z: undo/redo";
+            ui.painter().text(
+                egui::pos2(rect.center().x, rect.bottom() - 10.0),
+                egui::Align2::CENTER_BOTTOM,
+                hint,
+                egui::FontId::monospace(11.0),
+                egui::Color32::from_rgba_unmultiplied(200, 200, 210, 160),
+            );
+        }
+
         // Brush cursor — ring over the cursor in paint mode, or locked
         // to the adjust anchor while scrubbing brush parameters.
         if response.hovered() && (no_mods || adjust_mode) {
@@ -1555,6 +1571,36 @@ impl Viewport {
     }
 }
 
+/// Shared brush-color → stamp-RGB mapping used by both the 3D viewport
+/// paint path and `stamp_at_uv`. One color picker drives every channel:
+/// BaseColor gets linear RGB directly, scalar channels use Rec.709
+/// luminance, Displacement remaps luminance to signed height so a gray
+/// brush is neutral and a white/black brush pushes/carves.
+fn brush_color_components(brush: &BrushState, channel: PaintChannel) -> [f32; 3] {
+    match channel {
+        PaintChannel::BaseColor => {
+            let lin = brush.color_linear();
+            [lin[0], lin[1], lin[2]]
+        }
+        PaintChannel::Roughness | PaintChannel::Metallic => {
+            let v = brush.luminance();
+            [v, v, v]
+        }
+        PaintChannel::Mask => {
+            let v = if brush.luminance() >= 0.5 { 1.0 } else { 0.0 };
+            [v, v, v]
+        }
+        PaintChannel::Displacement => {
+            // Luminance 0..1 → signed [-1, 1]. Gray (0.5) is a no-op so
+            // tapering a stroke with a neutral swatch cleanly feathers
+            // out without tearing a crater. Shader packs (h·a, 1·a, 0)
+            // into the Rg16Float accumulator.
+            let h = 2.0 * brush.luminance() - 1.0;
+            [h, 1.0, 0.0]
+        }
+    }
+}
+
 impl BrushState {
     pub fn color_linear(&self) -> [f32; 3] {
         [
@@ -1562,6 +1608,15 @@ impl BrushState {
             srgb_to_linear(self.color_srgb[1]),
             srgb_to_linear(self.color_srgb[2]),
         ]
+    }
+
+    /// Rec.709 luminance of the linear brush color. Maps the single
+    /// color picker onto scalar paint channels: roughness/metallic use
+    /// this directly (0..1), mask thresholds it, displacement remaps
+    /// to a signed height (0.5 → 0, <0.5 carves, >0.5 pushes).
+    pub fn luminance(&self) -> f32 {
+        let l = self.color_linear();
+        0.2126 * l[0] + 0.7152 * l[1] + 0.0722 * l[2]
     }
 }
 

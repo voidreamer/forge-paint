@@ -14,8 +14,9 @@ pub struct BrushUniforms {
     pub _pad: [u32; 3],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaintChannel {
+    #[default]
     BaseColor,
     Roughness,
     Metallic,

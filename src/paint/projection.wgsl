@@ -16,8 +16,12 @@ struct ProjBrush {
     stencil_cos_rot: f32,
     stencil_sin_rot: f32,
     stencil_aspect: f32,
-    /// 0 = paint base color. 1 = paint displacement (output packed as
-    /// (height × coverage, coverage) into Rg16Float).
+    /// 0 = paint base color (Rgba8UnormSrgb).
+    /// 1 = paint displacement (Rg16Float, packed as (height × coverage,
+    ///     coverage)).
+    /// 2 = paint a single-channel R8Unorm (roughness / metallic). Same
+    ///     premultiplied-alpha layout as the base-color path — the value
+    ///     is the stencil's Rec-709 luminance.
     mode: u32,
 };
 
@@ -100,6 +104,14 @@ fn fs_project(in: VsOut) -> @location(0) vec4<f32> {
         // regular displacement brush.
         let height = dot(stencil.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
         return vec4<f32>(height * a, a, 0.0, a);
+    }
+    if brush.mode == 2u {
+        // Single-channel (roughness / metallic) — Rec-709 luminance of
+        // the stencil becomes the channel value. Premultiplied so
+        // OneMinusSrcAlpha blending onto the R8Unorm target works the
+        // same way as the base-color path.
+        let v = dot(stencil.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        return vec4<f32>(v * a, 0.0, 0.0, a);
     }
     return vec4<f32>(stencil.rgb * a, a);
 }

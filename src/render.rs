@@ -57,8 +57,9 @@ impl TonemapMode {
     ];
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
+    #[default]
     Material,
     BaseColor,
     Roughness,

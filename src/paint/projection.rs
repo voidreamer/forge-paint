@@ -42,6 +42,8 @@ pub struct ProjectionBrushPipeline {
     pub pipeline: wgpu::RenderPipeline,
     /// Targets Rg16Float — projected displacement (R=h·cov, G=cov).
     pub displacement_pipeline: wgpu::RenderPipeline,
+    /// Targets R8Unorm — projected single channel (roughness / metallic).
+    pub single_channel_pipeline: wgpu::RenderPipeline,
     pub bgl: wgpu::BindGroupLayout,
     pub uniform_buf: wgpu::Buffer,
     pub sampler: wgpu::Sampler,
@@ -172,10 +174,13 @@ impl ProjectionBrushPipeline {
         let pipeline = make_pipe(wgpu::TextureFormat::Rgba8UnormSrgb, "projection.pipe");
         let displacement_pipeline =
             make_pipe(wgpu::TextureFormat::Rg16Float, "projection.pipe.disp");
+        let single_channel_pipeline =
+            make_pipe(wgpu::TextureFormat::R8Unorm, "projection.pipe.r8");
 
         Self {
             pipeline,
             displacement_pipeline,
+            single_channel_pipeline,
             bgl,
             uniform_buf,
             sampler,
@@ -255,10 +260,10 @@ impl ProjectionBrushPipeline {
         });
         pass.set_scissor_rect(x0, y0, w, h);
         // Pick the pipeline whose target format matches the bound view.
-        let pipe = if uniforms.mode == 1 {
-            &self.displacement_pipeline
-        } else {
-            &self.pipeline
+        let pipe = match uniforms.mode {
+            1 => &self.displacement_pipeline,
+            2 => &self.single_channel_pipeline,
+            _ => &self.pipeline,
         };
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, &bind_group, &[]);

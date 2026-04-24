@@ -42,11 +42,31 @@ pub struct App {
     uv_zoom: f32,
     /// Screen-pixel offset applied to the atlas (drag to pan).
     uv_pan: egui::Vec2,
-    /// Cached egui TextureIds for the composited paint_target.base_color
-    /// tiles, rebuilt when the tile count changes.
+    /// Cached egui TextureIds for the composited paint_target channel
+    /// tiles, rebuilt when the tile count or selected channel changes.
     uv_thumb_ids: Vec<Option<egui::TextureId>>,
+    /// Which channel `uv_thumb_ids` currently reflects. When the user
+    /// switches channel we clear the cache and re-register views.
+    uv_thumb_channel: Option<crate::render::ViewMode>,
+    /// Active layer index at the time `uv_thumb_ids` was populated —
+    /// only relevant for the Mask channel (which reads views off the
+    /// active Layer, so switching layers must invalidate the cache).
+    uv_thumb_layer_idx: Option<usize>,
+    /// Which channel the UV atlas is displaying. Tracks `view_mode`
+    /// for paintable/viewable channels; limited to ones that map to a
+    /// per-tile texture (BaseColor, Roughness, Metallic, Normal, Mask,
+    /// Height).
+    uv_channel: crate::render::ViewMode,
     /// Overlay the mesh's UV wireframe on top of the atlas.
     uv_show_wireframe: bool,
+    /// When true, the UV view renders as a floating `egui::Window` that
+    /// the user can drag around / resize freely. Otherwise it sits as a
+    /// bottom-docked panel inside the central viewport area.
+    uv_view_undocked: bool,
+    /// Last atlas-UV position painted inside the UV view. Used to bridge
+    /// fast drags with interpolated stamps, same pattern as the 3D
+    /// viewport's `last_paint_pos`. None between strokes.
+    uv_last_paint_atlas_uv: Option<egui::Vec2>,
 }
 
 /// Which channel a material-slot assignment should target on the
@@ -102,6 +122,7 @@ impl App {
             // defaults (false, (0,0), empty) are already what we want.
             uv_zoom: 400.0,
             uv_show_wireframe: true,
+            uv_channel: crate::render::ViewMode::BaseColor,
             ..Default::default()
         }
     }
@@ -421,29 +442,17 @@ impl eframe::App for App {
             });
 
         let mut tool_clicked: Option<Tool> = None;
+        // Thin icon-only tool column. Brush radius / hardness / opacity
+        // are on S / D / F drag shortcuts; per-channel color & value are
+        // picked from the viewport via the Eyedropper tool (E). Camera
+        // reset lives on the Home key.
         egui::SidePanel::left("tools")
-            .resizable(true)
-            .default_width(260.0)
+            .resizable(false)
+            .exact_width(48.0)
             .show(ctx, |ui| {
                 if let Some(vp) = &self.viewport {
                     tool_clicked = tool_strip(ui, vp);
-                    ui.separator();
                 }
-                egui::ScrollArea::vertical()
-                    .id_salt("left_panel_scroll")
-                    .show(ui, |ui| {
-                        if let Some(vp) = &mut self.viewport {
-                            egui::CollapsingHeader::new("Brush")
-                                .default_open(true)
-                                .show(ui, |ui| brush_section(ui, vp));
-                            egui::CollapsingHeader::new("Cursor")
-                                .default_open(false)
-                                .show(ui, |ui| cursor_section(ui, vp));
-                            egui::CollapsingHeader::new("View")
-                                .default_open(false)
-                                .show(ui, |ui| view_section(ui, vp));
-                        }
-                    });
             });
         if let Some(t) = tool_clicked {
             self.switch_tool(t, frame);
@@ -458,6 +467,9 @@ impl eframe::App for App {
                     .id_salt("right_panel_scroll")
                     .show(ui, |ui| {
                         if let Some(vp) = &mut self.viewport {
+                            egui::CollapsingHeader::new("Color")
+                                .default_open(true)
+                                .show(ui, |ui| color_section(ui, vp));
                             egui::CollapsingHeader::new("Layers")
                                 .default_open(true)
                                 .show(ui, |ui| layer_panel(ui, vp, frame));
@@ -520,45 +532,29 @@ impl eframe::App for App {
                                 }
                             });
                         // When the view is set to a single paintable channel,
-                        // follow with the brush so strokes land on what's shown.
+                        // follow with the brush + UV view so strokes land on
+                        // what's shown. The view mode, UV view channel, and
+                        // brush channel are all tied together: whichever you
+                        // change is the new source of truth.
                         if vp.view_mode != prev {
-                            use crate::paint::PaintChannel;
-                            use crate::render::ViewMode;
-                            match vp.view_mode {
-                                ViewMode::BaseColor => {
-                                    vp.brush.channel = PaintChannel::BaseColor;
-                                    vp.brush.mask_edit = false;
-                                }
-                                ViewMode::Roughness => {
-                                    vp.brush.channel = PaintChannel::Roughness;
-                                    vp.brush.mask_edit = false;
-                                }
-                                ViewMode::Metallic => {
-                                    vp.brush.channel = PaintChannel::Metallic;
-                                    vp.brush.mask_edit = false;
-                                }
-                                ViewMode::Mask => {
-                                    // Switch to mask edit if the active layer has
-                                    // one; otherwise leave the brush alone and the
-                                    // viewer just previews the dummy mask.
+                            self.uv_channel = vp.view_mode;
+                            if let Some(ch) = paint_channel_from_view_mode(vp.view_mode) {
+                                if ch == crate::paint::PaintChannel::Mask {
                                     if vp.layer_stack.active_layer().mask.is_some() {
                                         vp.brush.mask_edit = true;
                                     }
-                                }
-                                ViewMode::Height => {
-                                    vp.brush.channel = PaintChannel::Displacement;
+                                } else {
+                                    vp.brush.channel = ch;
                                     vp.brush.mask_edit = false;
                                 }
-                                ViewMode::Material
-                                | ViewMode::Normal
-                                | ViewMode::WorldNormalBaked => {}
                             }
                         }
                     });
-                    // UV view — a bottom strip inside the central area,
-                    // resizable, visible only when the View menu toggle
-                    // is on. Splits screen with the 3D viewport above.
-                    if self.show_uv_view {
+                    // UV view — a bottom strip inside the central area
+                    // when docked. When undocked, skip the panel here and
+                    // the floating Window below handles it.
+                    if self.show_uv_view && !self.uv_view_undocked {
+                        let prev_uv_channel = self.uv_channel;
                         egui::TopBottomPanel::bottom("uv_view_panel")
                             .default_height(280.0)
                             .resizable(true)
@@ -570,15 +566,61 @@ impl eframe::App for App {
                                     &mut self.uv_zoom,
                                     &mut self.uv_pan,
                                     &mut self.uv_thumb_ids,
+                                    &mut self.uv_thumb_channel,
+                                    &mut self.uv_thumb_layer_idx,
+                                    &mut self.uv_channel,
                                     &mut self.uv_show_wireframe,
+                                    &mut self.uv_view_undocked,
+                                    &mut self.uv_last_paint_atlas_uv,
                                 );
                             });
+                        if self.uv_channel != prev_uv_channel {
+                            vp.view_mode = self.uv_channel;
+                            apply_uv_channel_to_brush(self.uv_channel, vp);
+                        }
                     }
                     vp.show(ui, frame, stencil_view, stencil_aspect, stencil_tex_id);
                 } else {
                     ui.centered_and_justified(|ui| ui.label("Initializing GPU…"));
                 }
             });
+
+        // Floating UV view — only when the feature is enabled AND the
+        // user has undocked it. Closing the window via its [×] hides the
+        // UV view entirely (same as unchecking View → UV view).
+        if self.show_uv_view && self.uv_view_undocked {
+            if let Some(vp) = &mut self.viewport {
+                let mut open = true;
+                let prev_uv_channel = self.uv_channel;
+                egui::Window::new("UV view")
+                    .open(&mut open)
+                    .default_size(egui::vec2(720.0, 480.0))
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        uv_view_body(
+                            ui,
+                            vp,
+                            frame,
+                            &mut self.uv_zoom,
+                            &mut self.uv_pan,
+                            &mut self.uv_thumb_ids,
+                            &mut self.uv_thumb_channel,
+                            &mut self.uv_thumb_layer_idx,
+                            &mut self.uv_channel,
+                            &mut self.uv_show_wireframe,
+                            &mut self.uv_view_undocked,
+                            &mut self.uv_last_paint_atlas_uv,
+                        );
+                    });
+                if self.uv_channel != prev_uv_channel {
+                    vp.view_mode = self.uv_channel;
+                    apply_uv_channel_to_brush(self.uv_channel, vp);
+                }
+                if !open {
+                    self.show_uv_view = false;
+                }
+            }
+        }
 
         // Cmd/Ctrl+S: save to default work dir.
         let save_shortcut = ctx.input_mut(|i| {
@@ -612,6 +654,19 @@ impl eframe::App for App {
             self.do_undo(frame);
         }
 
+        // Home: reset the orbit camera to its default pose, preserving the
+        // current target so the reset still frames the loaded mesh. No
+        // left-panel "Reset camera" button any more — this is the only
+        // way to reset the view.
+        let home_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home));
+        if home_pressed {
+            if let Some(vp) = &mut self.viewport {
+                let t = vp.camera.target;
+                vp.camera = crate::camera::OrbitCamera::default();
+                vp.camera.target = t;
+            }
+        }
+
         // Tool hotkeys (single key, no modifiers). consume_key respects
         // focus — text fields intercept before these fire.
         let tool_change = ctx.input_mut(|i| {
@@ -637,10 +692,49 @@ impl eframe::App for App {
 /// Renders the tool strip and reports any tool the user just clicked.
 /// Caller handles the side effects (file dialog for stencil, clearing
 /// the active stencil when switching away, etc.).
+/// Map the current view mode to its paintable channel, if any. Material /
+/// Normal / WorldNormalBaked aren't direct paint targets so they return
+/// None (and the brush's current channel is preserved). Kept out-of-line
+/// so view → brush syncing stays consistent across the 3D view dropdown
+/// and the UV-view channel picker.
+fn paint_channel_from_view_mode(vm: crate::render::ViewMode) -> Option<crate::paint::PaintChannel> {
+    use crate::paint::PaintChannel;
+    use crate::render::ViewMode;
+    match vm {
+        ViewMode::BaseColor => Some(PaintChannel::BaseColor),
+        ViewMode::Roughness => Some(PaintChannel::Roughness),
+        ViewMode::Metallic => Some(PaintChannel::Metallic),
+        ViewMode::Mask => Some(PaintChannel::Mask),
+        ViewMode::Height => Some(PaintChannel::Displacement),
+        ViewMode::Material | ViewMode::Normal | ViewMode::WorldNormalBaked => None,
+    }
+}
+
+/// Apply a UV-view channel change to the brush. Paintable channels
+/// (BaseColor / Roughness / Metallic / Height) route to `brush.channel`
+/// and clear `mask_edit`. Mask flips `mask_edit` on (if the active layer
+/// has a mask). Non-paintable view channels (Normal, Material, World
+/// Normal) leave the brush as-is — the user is only viewing.
+fn apply_uv_channel_to_brush(vm: crate::render::ViewMode, vp: &mut Viewport) {
+    use crate::paint::PaintChannel;
+    match paint_channel_from_view_mode(vm) {
+        Some(PaintChannel::Mask) => {
+            if vp.layer_stack.active_layer().mask.is_some() {
+                vp.brush.mask_edit = true;
+            }
+        }
+        Some(ch) => {
+            vp.brush.channel = ch;
+            vp.brush.mask_edit = false;
+        }
+        None => {}
+    }
+}
+
 fn tool_strip(ui: &mut egui::Ui, vp: &Viewport) -> Option<Tool> {
     ui.add_space(4.0);
     let mut clicked: Option<Tool> = None;
-    ui.horizontal_wrapped(|ui| {
+    ui.vertical_centered(|ui| {
         let entries = [
             (Tool::Paint, egui_phosphor::regular::PAINT_BRUSH),
             (Tool::Erase, egui_phosphor::regular::ERASER),
@@ -667,6 +761,7 @@ fn tool_strip(ui: &mut egui::Ui, vp: &Viewport) -> Option<Tool> {
             if ui.add(btn).on_hover_text(tooltip).clicked() {
                 clicked = Some(tool);
             }
+            ui.add_space(2.0);
         }
     });
     clicked
@@ -690,6 +785,86 @@ fn run_post_export_hook(dir: &std::path::Path) -> String {
         Ok(s) => format!(" · post-export hook failed ({s})"),
         Err(e) => format!(" · post-export hook error: {e}"),
     }
+}
+
+fn color_section(ui: &mut egui::Ui, vp: &mut Viewport) {
+    use crate::paint::PaintChannel;
+
+    // A single color drives every channel: base color directly, scalar
+    // channels via luminance. Show the current channel's derived write
+    // value below the picker so the user can see what the swatch means
+    // for Roughness / Metallic / Displacement / Mask.
+    let channel = if vp.brush.mask_edit {
+        PaintChannel::Mask
+    } else {
+        vp.brush.channel
+    };
+    ui.horizontal(|ui| {
+        ui.label("Paint color");
+        ui.color_edit_button_rgb(&mut vp.brush.color_srgb);
+    });
+
+    // Channel-specific readout of what this swatch paints right now.
+    let lum = vp.brush.luminance();
+    match channel {
+        PaintChannel::BaseColor => {
+            ui.weak("base color — RGB used directly");
+        }
+        PaintChannel::Roughness => {
+            ui.weak(format!("roughness value: {lum:.2}  (color luminance)"));
+        }
+        PaintChannel::Metallic => {
+            ui.weak(format!("metallic value: {lum:.2}  (color luminance)"));
+        }
+        PaintChannel::Displacement => {
+            let h = 2.0 * lum - 1.0;
+            ui.weak(format!(
+                "height: {h:+.2}  (gray = 0, black carves, white pushes)"
+            ));
+        }
+        PaintChannel::Mask => {
+            let tag = if lum >= 0.5 { "reveal (white)" } else { "hide (black)" };
+            ui.weak(format!("mask: {tag}  (threshold at 0.5)"));
+        }
+    }
+
+    // Quick swatches — common neutrals + pure channel extremes. Makes
+    // "set roughness to 0" or "set metallic to 1" a single click.
+    ui.add_space(4.0);
+    ui.weak("swatches");
+    let swatches: &[([f32; 3], &str)] = &[
+        ([0.0, 0.0, 0.0], "black"),
+        ([0.5, 0.5, 0.5], "gray 0.5"),
+        ([1.0, 1.0, 1.0], "white"),
+        ([0.95, 0.2, 0.2], "red"),
+        ([0.2, 0.9, 0.35], "green"),
+        ([0.2, 0.45, 0.95], "blue"),
+    ];
+    ui.horizontal_wrapped(|ui| {
+        for (rgb, tip) in swatches {
+            let fill = egui::Color32::from_rgb(
+                (rgb[0] * 255.0) as u8,
+                (rgb[1] * 255.0) as u8,
+                (rgb[2] * 255.0) as u8,
+            );
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(22.0, 22.0),
+                egui::Sense::click(),
+            );
+            ui.painter()
+                .rect_filled(rect, 3.0, fill);
+            ui.painter().rect_stroke(
+                rect,
+                3.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(40)),
+                egui::StrokeKind::Outside,
+            );
+            let resp = resp.on_hover_text(*tip);
+            if resp.clicked() {
+                vp.brush.color_srgb = *rgb;
+            }
+        }
+    });
 }
 
 fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
@@ -1038,75 +1213,6 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
     }
 }
 
-fn brush_section(ui: &mut egui::Ui, vp: &mut Viewport) {
-    use crate::paint::PaintChannel;
-    if vp.brush.mask_edit {
-        ui.weak("painting mask — black/white only");
-        ui.horizontal(|ui| {
-            let mut white = vp.brush.value >= 0.5;
-            if ui.radio_value(&mut white, true, "paint (white)").changed() && white {
-                vp.brush.value = 1.0;
-            }
-            if ui.radio_value(&mut white, false, "erase (black)").changed() && !white {
-                vp.brush.value = 0.0;
-            }
-        });
-    } else {
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut vp.brush.channel, PaintChannel::BaseColor, "Color");
-            ui.radio_value(&mut vp.brush.channel, PaintChannel::Roughness, "Rough");
-            ui.radio_value(&mut vp.brush.channel, PaintChannel::Metallic, "Metal");
-            ui.radio_value(&mut vp.brush.channel, PaintChannel::Displacement, "Height");
-        });
-        match vp.brush.channel {
-            PaintChannel::BaseColor => {
-                ui.horizontal(|ui| {
-                    ui.label("color");
-                    ui.color_edit_button_rgb(&mut vp.brush.color_srgb);
-                });
-            }
-            PaintChannel::Displacement => {
-                // Signed height — negative values carve into the surface,
-                // positive values push out.
-                ui.add(egui::Slider::new(&mut vp.brush.value, -1.0..=1.0).text("height"));
-            }
-            PaintChannel::Roughness | PaintChannel::Metallic | PaintChannel::Mask => {
-                ui.add(egui::Slider::new(&mut vp.brush.value, 0.0..=1.0).text("value"));
-            }
-        }
-    }
-    ui.add(
-        egui::Slider::new(&mut vp.brush.radius, 2.0..=500.0)
-            .logarithmic(true)
-            .text("radius (px)"),
-    );
-    ui.add(egui::Slider::new(&mut vp.brush.hardness, 0.0..=1.0).text("hardness"));
-    ui.add(egui::Slider::new(&mut vp.brush.opacity, 0.0..=1.0).text("opacity"));
-}
-
-fn cursor_section(ui: &mut egui::Ui, vp: &Viewport) {
-    match (vp.last_hit_uv, vp.last_hit_tile) {
-        (Some(uv), Some(tile)) => {
-            ui.label(format!("uv    {:.3}, {:.3}", uv[0], uv[1]));
-            ui.label(format!("tile  {tile}"));
-        }
-        _ => {
-            ui.weak("(point at mesh)");
-        }
-    }
-}
-
-fn view_section(ui: &mut egui::Ui, vp: &mut Viewport) {
-    ui.label(format!("yaw   {:>6.2}", vp.camera.yaw));
-    ui.label(format!("pitch {:>6.2}", vp.camera.pitch));
-    ui.label(format!("dist  {:>6.2}", vp.camera.distance));
-    if ui.button("Reset camera").clicked() {
-        let t = vp.camera.target;
-        vp.camera = crate::camera::OrbitCamera::default();
-        vp.camera.target = t;
-    }
-}
-
 fn paint_target_section(
     ui: &mut egui::Ui,
     vp: &mut Viewport,
@@ -1163,34 +1269,110 @@ fn uv_view_body(
     zoom: &mut f32,
     pan: &mut egui::Vec2,
     thumb_ids: &mut Vec<Option<egui::TextureId>>,
+    thumb_channel: &mut Option<crate::render::ViewMode>,
+    thumb_layer_idx: &mut Option<usize>,
+    channel: &mut crate::render::ViewMode,
     show_wireframe: &mut bool,
+    undocked: &mut bool,
+    last_paint_atlas_uv: &mut Option<egui::Vec2>,
 ) {
-    // Header row: toggles + hints.
+    use crate::render::ViewMode;
+    // Allowed atlas channels — everything that has a per-tile, 2D image:
+    // the four paintable channels plus Normal (view-only) and Mask (the
+    // active layer's mask, also paintable via mask_edit). Material and
+    // WorldNormalBaked aren't flat UV atlases, so they're excluded.
+    let atlas_channels: &[ViewMode] = &[
+        ViewMode::BaseColor,
+        ViewMode::Roughness,
+        ViewMode::Metallic,
+        ViewMode::Normal,
+        ViewMode::Mask,
+        ViewMode::Height,
+    ];
+
+    // Header row: channel picker, toggles, hints, dock/undock button.
+    let active_layer_idx = vp.layer_stack.active;
+    let active_has_mask = vp.layer_stack.active_layer().mask.is_some();
     ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("uv_view_channel")
+            .selected_text(channel.label())
+            .show_ui(ui, |ui| {
+                for &m in atlas_channels {
+                    // Gray out Mask when the active layer has none — picking
+                    // it would just display the missing-mask placeholder.
+                    let enabled = m != ViewMode::Mask || active_has_mask;
+                    ui.add_enabled_ui(enabled, |ui| {
+                        ui.selectable_value(channel, m, m.label());
+                    });
+                }
+            });
         ui.checkbox(show_wireframe, "UV wireframe");
         ui.weak(" · RMB / MMB drag to pan · scroll to zoom");
+        // Right-aligned dock/undock toggle.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (label, tip) = if *undocked {
+                ("⮌ Dock", "Dock the UV view back into the main layout")
+            } else {
+                ("⮎ Undock", "Pop out the UV view into a floating window")
+            };
+            if ui.button(label).on_hover_text(tip).clicked() {
+                *undocked = !*undocked;
+            }
+        });
     });
     ui.separator();
-    // Ensure our cache matches the current tile count.
+    // Ensure our cache matches the current tile count, selected channel,
+    // and — when showing Mask — the currently active layer. Mask views
+    // live on each Layer, so switching layers requires re-registering.
     let tiles = vp.paint_target().tiles.to_vec();
-    if thumb_ids.len() != tiles.len() {
+    let channel_changed = *thumb_channel != Some(*channel);
+    let mask_layer_changed = *channel == ViewMode::Mask
+        && *thumb_layer_idx != Some(active_layer_idx);
+    if thumb_ids.len() != tiles.len() || channel_changed || mask_layer_changed {
         thumb_ids.clear();
         thumb_ids.resize(tiles.len(), None);
+        *thumb_channel = Some(*channel);
+        *thumb_layer_idx = Some(active_layer_idx);
     }
 
-    // Lazily register each tile's base_color layer view as an egui
+    // Resolve the source tile-array texture view for the selected channel.
+    // Mask is per-layer (active-layer's mask); everything else lives on
+    // the PaintTarget. None for Mask when the active layer has no mask —
+    // caller renders a placeholder.
+    let pick_view = |i: usize| -> Option<&eframe::wgpu::TextureView> {
+        match *channel {
+            ViewMode::BaseColor => Some(&vp.paint_target().base_color_layer_views[i]),
+            ViewMode::Roughness => Some(&vp.paint_target().roughness_layer_views[i]),
+            ViewMode::Metallic => Some(&vp.paint_target().metallic_layer_views[i]),
+            ViewMode::Normal => Some(&vp.paint_target().normal_layer_views[i]),
+            ViewMode::Height => Some(&vp.paint_target().displacement_layer_views[i]),
+            ViewMode::Mask => vp
+                .layer_stack
+                .active_layer()
+                .mask
+                .as_ref()
+                .map(|m| &m.layer_views[i]),
+            // These aren't per-tile atlases — the combo box excludes
+            // them, but handle defensively so we don't crash if the
+            // picker is ever bypassed.
+            ViewMode::Material | ViewMode::WorldNormalBaked => None,
+        }
+    };
+
+    // Lazily register each tile's current-channel layer view as an egui
     // texture — re-uses the live GPU view, so paints update the atlas
     // immediately.
     if let Some(rs) = frame.wgpu_render_state() {
         let mut renderer = rs.renderer.write();
-        for (i, slot) in thumb_ids.iter_mut().enumerate() {
-            if slot.is_none() {
-                let view = &vp.paint_target().base_color_layer_views[i];
-                *slot = Some(renderer.register_native_texture(
-                    &rs.device,
-                    view,
-                    eframe::wgpu::FilterMode::Linear,
-                ));
+        for i in 0..thumb_ids.len() {
+            if thumb_ids[i].is_none() {
+                if let Some(view) = pick_view(i) {
+                    thumb_ids[i] = Some(renderer.register_native_texture(
+                        &rs.device,
+                        view,
+                        eframe::wgpu::FilterMode::Linear,
+                    ));
+                }
             }
         }
     }
@@ -1311,23 +1493,97 @@ fn uv_view_body(
         }
     }
 
-    // Paint: map LMB position → atlas UV → tile + local_uv; stamp.
-    let primary_active = response.dragged_by(egui::PointerButton::Primary)
-        || response.clicked_by(egui::PointerButton::Primary);
+    // Paint: map LMB drag → atlas UV sequence (interpolated between last
+    // frame and this frame so fast drags don't leave gaps) → tile +
+    // local_uv → stamp. Mirrors the 3D viewport's `stamp_positions`
+    // pattern; step spacing tracks the brush so dense strokes stay dense
+    // and small brushes don't explode the step count.
+    // Only paintable view channels stamp; Normal / Material / WorldNormal
+    // are view-only. Paint routing already flips `mask_edit` appropriately
+    // via `apply_uv_channel_to_brush`, so we can just check whether the
+    // current ViewMode maps to any paint channel at all.
+    let paintable = paint_channel_from_view_mode(*channel).is_some();
+    let primary_active = paintable
+        && (response.dragged_by(egui::PointerButton::Primary)
+            || response.clicked_by(egui::PointerButton::Primary));
     if primary_active {
         if let Some(pos) = response.interact_pointer_pos() {
-            let atlas_uv = (pos - rect.min - *pan) / *zoom;
-            let tile_u = atlas_uv.x.floor() as i32;
-            let tile_v = atlas_uv.y.floor() as i32;
-            if tile_u >= 0 && tile_v >= 0 && tile_u < 10 {
-                let tile_id = 1001 + tile_u as u32 + 10 * tile_v as u32;
-                if let Some(tile_idx) = vp.paint_target().layer_for_tile(tile_id) {
-                    let local_uv = [atlas_uv.x.fract(), atlas_uv.y.fract()];
-                    if let Some(rs) = frame.wgpu_render_state() {
-                        vp.stamp_at_uv(&rs.device, &rs.queue, tile_idx, local_uv);
-                        ui.ctx().request_repaint();
-                    }
+            let atlas_uv_now = (pos - rect.min - *pan) / *zoom;
+            // Step distance in UV: ~half the brush radius in UV units (so
+            // stamps overlap by ~50%), floored to a small minimum.
+            let uv_radius = (vp.brush.radius / 400.0).max(1e-4);
+            let step_uv = (uv_radius * 0.5).max(1e-3);
+            const MAX_STEPS: u32 = 128;
+
+            let sequence: Vec<egui::Vec2> = match *last_paint_atlas_uv {
+                Some(prev) => {
+                    let delta = atlas_uv_now - prev;
+                    let dist = delta.length();
+                    let steps = ((dist / step_uv).ceil() as u32).clamp(1, MAX_STEPS);
+                    (1..=steps)
+                        .map(|i| prev + delta * (i as f32 / steps as f32))
+                        .collect()
                 }
+                None => vec![atlas_uv_now],
+            };
+
+            if let Some(rs) = frame.wgpu_render_state() {
+                for uv in &sequence {
+                    let tile_u = uv.x.floor() as i32;
+                    let tile_v = uv.y.floor() as i32;
+                    if tile_u < 0 || tile_v < 0 || tile_u >= 10 {
+                        continue;
+                    }
+                    let tile_id = 1001 + tile_u as u32 + 10 * tile_v as u32;
+                    let Some(tile_idx) = vp.paint_target().layer_for_tile(tile_id) else {
+                        continue;
+                    };
+                    let local_uv = [uv.x.fract(), uv.y.fract()];
+                    vp.stamp_at_uv(&rs.device, &rs.queue, tile_idx, local_uv);
+                }
+                ui.ctx().request_repaint();
+            }
+            *last_paint_atlas_uv = Some(atlas_uv_now);
+        }
+    } else {
+        // Stroke ended — clear the anchor so the next stroke starts fresh
+        // and doesn't interpolate a long line from wherever the previous
+        // one ended.
+        *last_paint_atlas_uv = None;
+    }
+
+    // Brush cursor preview — an outline ring matching the stamped radius
+    // at the current zoom. Only visible while the pointer hovers the
+    // panel and LMB isn't down on another widget.
+    if response.hovered() {
+        if let Some(hover) = response.hover_pos() {
+            let uv_radius = vp.brush.radius / 400.0;
+            let screen_radius = uv_radius * *zoom;
+            // Outer outline — dark, then bright, so it reads over both
+            // light and dark atlas content.
+            painter.circle_stroke(
+                hover,
+                screen_radius,
+                egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180)),
+            );
+            painter.circle_stroke(
+                hover,
+                screen_radius,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 255, 255)),
+            );
+            // Inner hardness ring — matches how the brush falls off in
+            // the shader (radius * hardness stays at full opacity, beyond
+            // that falls to zero).
+            let inner = screen_radius * vp.brush.hardness.clamp(0.0, 1.0);
+            if inner > 1.5 {
+                painter.circle_stroke(
+                    hover,
+                    inner,
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90),
+                    ),
+                );
             }
         }
     }
