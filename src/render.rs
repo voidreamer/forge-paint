@@ -66,6 +66,7 @@ pub enum ViewMode {
     Normal,
     Mask,
     WorldNormalBaked,
+    Height,
 }
 
 impl ViewMode {
@@ -78,6 +79,7 @@ impl ViewMode {
             ViewMode::Normal => 4,
             ViewMode::Mask => 5,
             ViewMode::WorldNormalBaked => 6,
+            ViewMode::Height => 7,
         }
     }
 
@@ -90,6 +92,7 @@ impl ViewMode {
             ViewMode::Normal => "Normal (tangent)",
             ViewMode::Mask => "Mask",
             ViewMode::WorldNormalBaked => "World Normal (baked)",
+            ViewMode::Height => "Height",
         }
     }
 
@@ -101,6 +104,7 @@ impl ViewMode {
         ViewMode::Normal,
         ViewMode::Mask,
         ViewMode::WorldNormalBaked,
+        ViewMode::Height,
     ];
 }
 

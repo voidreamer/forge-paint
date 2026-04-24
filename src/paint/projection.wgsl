@@ -16,6 +16,9 @@ struct ProjBrush {
     stencil_cos_rot: f32,
     stencil_sin_rot: f32,
     stencil_aspect: f32,
+    /// 0 = paint base color. 1 = paint displacement (output packed as
+    /// (height × coverage, coverage) into Rg16Float).
+    mode: u32,
 };
 
 @group(0) @binding(0) var<uniform> brush: ProjBrush;
@@ -90,5 +93,13 @@ fn fs_project(in: VsOut) -> @location(0) vec4<f32> {
     let inner = clamp(brush.hardness, 0.0, 0.95);
     let falloff = 1.0 - smoothstep(inner, 1.0, t);
     let a = falloff * brush.opacity * stencil.a;
+    if brush.mode == 1u {
+        // Displacement path — convert stencil to a scalar height
+        // (Rec.709 luminance) and pack premultiplied (h·a, a) into
+        // RG so the Rg16Float accumulator stays consistent with the
+        // regular displacement brush.
+        let height = dot(stencil.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        return vec4<f32>(height * a, a, 0.0, a);
+    }
     return vec4<f32>(stencil.rgb * a, a);
 }

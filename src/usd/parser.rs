@@ -186,7 +186,21 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
             continue;
         }
 
-        bail!("tokenizer: unexpected byte {:?} at offset {}", c as char, i);
+        // Show a window of context so the user has a chance to see
+        // which USD construct we can't handle yet (the parser is hand
+        // rolled and only covers UsdGeomMesh attributes — references,
+        // variants, material graphs, etc. fall over here).
+        let window_start = i.saturating_sub(40);
+        let window_end = (i + 40).min(bytes.len());
+        let context = String::from_utf8_lossy(&bytes[window_start..window_end]);
+        let line = bytes[..i].iter().filter(|&&b| b == b'\n').count() + 1;
+        bail!(
+            "tokenizer: unexpected byte {:?} at offset {} (line {}):\n    ...{}...",
+            c as char,
+            i,
+            line,
+            context.trim_end(),
+        );
     }
 
     Ok(out)

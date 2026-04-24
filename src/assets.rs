@@ -45,8 +45,17 @@ impl Tab {
     pub const ALL: &'static [Tab] = &[Tab::Textures, Tab::Meshes, Tab::Stencils, Tab::Swatches];
 }
 
+/// Reference to a USD file on disk — thumbnail comes later; for now we
+/// render a Phosphor cube glyph in the Meshes tab.
+#[derive(Debug, Clone)]
+pub struct MeshAsset {
+    pub name: String,
+    pub path: PathBuf,
+}
+
 pub struct AssetBrowser {
     pub textures: Vec<TextureAsset>,
+    pub meshes: Vec<MeshAsset>,
     pub active_tab: Tab,
 }
 
@@ -54,6 +63,7 @@ impl Default for AssetBrowser {
     fn default() -> Self {
         Self {
             textures: Vec::new(),
+            meshes: Vec::new(),
             active_tab: Tab::Textures,
         }
     }

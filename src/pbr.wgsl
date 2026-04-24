@@ -352,6 +352,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     textureSample(world_normal_map, texset_sampler, local_uv, layer).rgb;
             }
         }
+        case 7u: {
+            // Height preview: sample displacement (R=height×coverage,
+            // G=coverage), decode, visualise as grayscale with 0.5 as
+            // zero so positive and negative heights both read clearly.
+            if layer < 0 {
+                out_rgb = vec3<f32>(0.5);
+            } else {
+                let local_uv = fract(in.uv);
+                let d = textureSample(displacement_tex, texset_sampler, local_uv, layer);
+                let coverage = max(d.g, 1e-4);
+                let height = d.r / coverage;
+                let shown = clamp(0.5 + height * 0.5, 0.0, 1.0);
+                out_rgb = vec3<f32>(shown);
+            }
+        }
         default: {
             // Material: HDR linear — post will apply exposure + tonemap.
             out_rgb = lit;

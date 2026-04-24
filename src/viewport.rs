@@ -360,7 +360,7 @@ impl Viewport {
     /// mesh — this only adds geometry so vertex displacement has
     /// resolution to work with.
     pub fn set_subdivision(&mut self, device: &wgpu::Device, level: u32) {
-        let level = level.min(4);
+        let level = level.min(5);
         self.subdivision_level = level;
         let subdivided = if level == 0 {
             self.cpu_mesh.clone()
@@ -974,8 +974,15 @@ impl Viewport {
                         // layer with a baked position map, route stamps
                         // through the projection pipeline instead. Falls
                         // back to the regular radial brush otherwise.
+                        // Projection routes through a stencil for base
+                        // color OR displacement (the shader branches on
+                        // mode). Stencil tool + baked position map + a
+                        // stencil asset are the shared prerequisites.
                         let projection_active = stencil_view.is_some()
-                            && channel == PaintChannel::BaseColor
+                            && matches!(
+                                channel,
+                                PaintChannel::BaseColor | PaintChannel::Displacement,
+                            )
                             && self.tool == Tool::Stencil
                             && self.mesh_maps.baked;
 
@@ -1021,7 +1028,16 @@ impl Viewport {
                                     stencil_cos_rot: self.stencil_transform.rotation.cos(),
                                     stencil_sin_rot: self.stencil_transform.rotation.sin(),
                                     stencil_aspect,
-                                    _pad: [0.0; 2],
+                                    // mode=1 when projecting into the
+                                    // Rg16Float displacement buffer so
+                                    // the shader packs (h·a, a) instead
+                                    // of premultiplied color.
+                                    mode: if channel == PaintChannel::Displacement {
+                                        1
+                                    } else {
+                                        0
+                                    },
+                                    _pad: 0.0,
                                 };
                                 let position_view = self
                                     .mesh_maps

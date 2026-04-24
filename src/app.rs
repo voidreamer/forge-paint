@@ -406,6 +406,10 @@ impl eframe::App for App {
                                         vp.brush.mask_edit = true;
                                     }
                                 }
+                                ViewMode::Height => {
+                                    vp.brush.channel = PaintChannel::Displacement;
+                                    vp.brush.mask_edit = false;
+                                }
                                 ViewMode::Material
                                 | ViewMode::Normal
                                 | ViewMode::WorldNormalBaked => {}
@@ -863,10 +867,11 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
     ui.add_space(6.0);
     ui.label("Tessellation (for displacement)");
     let mut level = vp.subdivision_level;
-    // 4^3 = 64× triangles per level-3 vertex is the practical ceiling
-    // without introducing dedupe / GPU subdivision.
+    // Level 5 = 1024× triangles per base — expensive but workable on
+    // small to mid meshes. Beyond that the no-dedupe storage balloons
+    // VRAM hard.
     if ui
-        .add(egui::Slider::new(&mut level, 0..=3).text("subdivision"))
+        .add(egui::Slider::new(&mut level, 0..=5).text("subdivision"))
         .changed()
     {
         if let Some(rs) = frame.wgpu_render_state() {
@@ -1268,8 +1273,47 @@ impl App {
                 }
             }
         }
-        if count > 0 {
-            self.status = format!("Imported {count} bundled asset(s)");
+
+        // Also scan for USD meshes — populate the Meshes tab so the
+        // default mesh is available without hunting through File > Open.
+        let resolve = |rel: &str| -> std::path::PathBuf {
+            let cwd = std::path::PathBuf::from(rel);
+            if cwd.is_dir() {
+                return cwd;
+            }
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+        };
+        for dir in &[resolve("assets/default_mesh"), resolve("assets/meshes")] {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            let mut paths: Vec<std::path::PathBuf> =
+                entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for path in paths {
+                let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                    continue;
+                };
+                let lower = ext.to_lowercase();
+                if !matches!(lower.as_str(), "usd" | "usda" | "usdc" | "usdz") {
+                    continue;
+                }
+                let name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "mesh".into());
+                self.browser.meshes.push(assets::MeshAsset {
+                    name,
+                    path: path.clone(),
+                });
+            }
+        }
+
+        if count > 0 || !self.browser.meshes.is_empty() {
+            self.status = format!(
+                "Imported {count} texture(s), {} mesh(es)",
+                self.browser.meshes.len()
+            );
             log::info!("{}", self.status);
         }
     }
@@ -1311,6 +1355,9 @@ impl App {
             assets::Tab::Textures => {
                 self.texture_strip(ui, frame);
             }
+            assets::Tab::Meshes => {
+                self.mesh_strip(ui, frame);
+            }
             _ => {
                 ui.weak("(this tab is not implemented yet)");
             }
@@ -1324,6 +1371,55 @@ impl App {
                 vp.active_stencil = None;
             }
             self.status = "Stencil cleared".to_string();
+        }
+    }
+
+    fn mesh_strip(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        if self.browser.meshes.is_empty() {
+            ui.weak(
+                "No meshes found. Drop .usd / .usda / .usdc / .usdz files \
+                 into assets/default_mesh/ or assets/meshes/ and restart.",
+            );
+            return;
+        }
+        let mut load_requested: Option<std::path::PathBuf> = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("asset_mesh_strip")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for mesh in &self.browser.meshes {
+                        ui.vertical(|ui| {
+                            // Placeholder: large Phosphor cube glyph in
+                            // a 80×80 button. Real rendered-mesh
+                            // thumbnails are a follow-up — would need
+                            // a one-shot offscreen PBR render per mesh
+                            // at import time.
+                            let glyph =
+                                egui::RichText::new(egui_phosphor::regular::CUBE).size(48.0);
+                            let btn = egui::Button::new(glyph)
+                                .min_size(egui::vec2(80.0, 80.0));
+                            if ui
+                                .add(btn)
+                                .on_hover_text(format!(
+                                    "Load '{}' ({})",
+                                    mesh.name,
+                                    mesh.path.display(),
+                                ))
+                                .clicked()
+                            {
+                                load_requested = Some(mesh.path.clone());
+                            }
+                            ui.label(
+                                egui::RichText::new(&mesh.name).small().color(
+                                    ui.style().visuals.weak_text_color(),
+                                ),
+                            );
+                        });
+                    }
+                });
+            });
+        if let Some(path) = load_requested {
+            self.load_usd(frame, path);
         }
     }
 

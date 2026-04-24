@@ -28,11 +28,17 @@ pub struct ProjBrushUniforms {
     /// Stencil's own width/height ratio — used to correct its display
     /// aspect so a wide photo doesn't stretch vertically.
     pub stencil_aspect: f32,
-    pub _pad: [f32; 2],
+    /// 0 = base color projection (RGBA). 1 = displacement projection
+    /// (luminance → height × coverage, coverage packed into RG).
+    pub mode: u32,
+    pub _pad: f32,
 }
 
 pub struct ProjectionBrushPipeline {
+    /// Targets Rgba8UnormSrgb — projected base color.
     pub pipeline: wgpu::RenderPipeline,
+    /// Targets Rg16Float — projected displacement (R=h·cov, G=cov).
+    pub displacement_pipeline: wgpu::RenderPipeline,
     pub bgl: wgpu::BindGroupLayout,
     pub uniform_buf: wgpu::Buffer,
     pub sampler: wgpu::Sampler,
@@ -117,49 +123,56 @@ impl ProjectionBrushPipeline {
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("projection.pipe"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_project"),
-                buffers: &[],
-                compilation_options: Default::default(),
+        let blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_project"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
             },
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
+        };
+        let make_pipe = |format: wgpu::TextureFormat, label: &str| -> wgpu::RenderPipeline {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_project"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_project"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipe(wgpu::TextureFormat::Rgba8UnormSrgb, "projection.pipe");
+        let displacement_pipeline =
+            make_pipe(wgpu::TextureFormat::Rg16Float, "projection.pipe.disp");
 
         Self {
             pipeline,
+            displacement_pipeline,
             bgl,
             uniform_buf,
             sampler,
@@ -238,7 +251,13 @@ impl ProjectionBrushPipeline {
             ..Default::default()
         });
         pass.set_scissor_rect(x0, y0, w, h);
-        pass.set_pipeline(&self.pipeline);
+        // Pick the pipeline whose target format matches the bound view.
+        let pipe = if uniforms.mode == 1 {
+            &self.displacement_pipeline
+        } else {
+            &self.pipeline
+        };
+        pass.set_pipeline(pipe);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
