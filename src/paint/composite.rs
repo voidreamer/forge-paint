@@ -302,8 +302,9 @@ impl Compositor {
         &self.pipelines[idx]
     }
 
-    /// Composite `stack` into `target`. One render pass per tile; one draw per
-    /// visible layer. Appends commands into `encoder`; caller submits.
+    /// Composite `stack` into `target`, re-flattening **every** tile.
+    /// Use this on layer-stack topology or property changes. For paint
+    /// strokes use `run_sparse` — it only touches stamped tiles.
     pub fn run(
         &self,
         device: &wgpu::Device,
@@ -313,7 +314,36 @@ impl Compositor {
         target: &PaintTarget,
     ) {
         let tile_count = target.tiles.len();
-        if tile_count == 0 {
+        self.run_tiles(device, queue, encoder, stack, target, 0..tile_count);
+    }
+
+    /// Composite only the listed tile indices. Indices must refer into
+    /// `target.tiles` (array-layer index, not UDIM id). Out-of-range
+    /// entries are silently skipped.
+    pub fn run_sparse(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        stack: &LayerStack,
+        target: &PaintTarget,
+        dirty_tiles: &[usize],
+    ) {
+        let tile_count = target.tiles.len();
+        let iter = dirty_tiles.iter().copied().filter(move |&t| t < tile_count);
+        self.run_tiles(device, queue, encoder, stack, target, iter);
+    }
+
+    fn run_tiles<I: IntoIterator<Item = usize>>(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        stack: &LayerStack,
+        target: &PaintTarget,
+        tile_indices: I,
+    ) {
+        if target.tiles.is_empty() {
             return;
         }
 
@@ -346,7 +376,7 @@ impl Compositor {
         let rm_clear = defaults::rough_metal_clear();
         let nm_clear = defaults::normal_clear();
 
-        for t in 0..tile_count {
+        for t in tile_indices {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite_pass"),
                 color_attachments: &[

@@ -186,7 +186,7 @@ impl eframe::App for App {
                     ui.label(&self.status);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("LMB paint · Ctrl+LMB orbit · Shift+LMB or MMB pan · wheel zoom · S/D/F + LMB = brush size/hardness/opacity");
+                    ui.weak("LMB paint · Ctrl+LMB orbit · Shift+LMB / MMB pan · wheel zoom · S/D/F+LMB brush size/hardness/opacity · M/R/T+LMB stencil move/rotate/scale");
                 });
             });
         });
@@ -199,12 +199,13 @@ impl eframe::App for App {
                 self.asset_browser_panel(ui, frame);
             });
 
+        let mut tool_clicked: Option<Tool> = None;
         egui::SidePanel::left("tools")
             .resizable(true)
             .default_width(260.0)
             .show(ctx, |ui| {
-                if let Some(vp) = &mut self.viewport {
-                    tool_strip(ui, vp);
+                if let Some(vp) = &self.viewport {
+                    tool_clicked = tool_strip(ui, vp);
                     ui.separator();
                 }
                 egui::ScrollArea::vertical()
@@ -223,6 +224,9 @@ impl eframe::App for App {
                         }
                     });
             });
+        if let Some(t) = tool_clicked {
+            self.switch_tool(t, frame);
+        }
 
         egui::SidePanel::right("props")
             .resizable(true)
@@ -255,6 +259,18 @@ impl eframe::App for App {
                         }
                     });
             });
+
+        // Resolve the active stencil's GPU view + metadata up front,
+        // outside the mutable borrow of viewport inside the CentralPanel
+        // closure. We also hand the egui TextureId through for the
+        // preview overlay.
+        let stencil_idx = self.viewport.as_ref().and_then(|vp| vp.active_stencil);
+        let stencil_asset = stencil_idx.and_then(|i| self.browser.textures.get(i));
+        let stencil_view = stencil_asset.map(|a| &a.view);
+        let stencil_aspect = stencil_asset
+            .map(|a| a.width as f32 / a.height.max(1) as f32)
+            .unwrap_or(1.0);
+        let stencil_tex_id = stencil_asset.map(|a| a.thumb_id);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 22)))
@@ -302,7 +318,7 @@ impl eframe::App for App {
                             }
                         }
                     });
-                    vp.show(ui, frame);
+                    vp.show(ui, frame, stencil_view, stencil_aspect, stencil_tex_id);
                 } else {
                     ui.centered_and_justified(|ui| ui.label("Initializing GPU…"));
                 }
@@ -357,21 +373,24 @@ impl eframe::App for App {
             }
         });
         if let Some(tool) = tool_change {
-            if let Some(vp) = &mut self.viewport {
-                vp.tool = tool;
-            }
+            self.switch_tool(tool, frame);
         }
     }
 }
 
-fn tool_strip(ui: &mut egui::Ui, vp: &mut Viewport) {
+/// Renders the tool strip and reports any tool the user just clicked.
+/// Caller handles the side effects (file dialog for stencil, clearing
+/// the active stencil when switching away, etc.).
+fn tool_strip(ui: &mut egui::Ui, vp: &Viewport) -> Option<Tool> {
     ui.add_space(4.0);
+    let mut clicked: Option<Tool> = None;
     ui.horizontal_wrapped(|ui| {
         let entries = [
             (Tool::Paint, egui_phosphor::regular::PAINT_BRUSH),
             (Tool::Erase, egui_phosphor::regular::ERASER),
             (Tool::Fill, egui_phosphor::regular::PAINT_BUCKET),
             (Tool::Eyedropper, egui_phosphor::regular::EYEDROPPER),
+            (Tool::Stencil, egui_phosphor::regular::PROJECTOR_SCREEN),
         ];
         for (tool, glyph) in entries {
             let selected = vp.tool == tool;
@@ -383,12 +402,18 @@ fn tool_strip(ui: &mut egui::Ui, vp: &mut Viewport) {
             let btn = egui::Button::new(egui::RichText::new(glyph).size(22.0))
                 .min_size(egui::vec2(36.0, 36.0))
                 .fill(fill);
-            let tooltip = format!("{} [{}]", tool.label(), tool.shortcut());
+            let shortcut = tool.shortcut();
+            let tooltip = if shortcut.is_empty() {
+                tool.label().to_string()
+            } else {
+                format!("{} [{}]", tool.label(), shortcut)
+            };
             if ui.add(btn).on_hover_text(tooltip).clicked() {
-                vp.tool = tool;
+                clicked = Some(tool);
             }
         }
     });
+    clicked
 }
 
 /// Run the command template in `FORGE_PAINT_POST_EXPORT` (if set), substituting
@@ -773,7 +798,11 @@ fn brush_section(ui: &mut egui::Ui, vp: &mut Viewport) {
             }
         }
     }
-    ui.add(egui::Slider::new(&mut vp.brush.radius, 0.002..=0.3).text("radius"));
+    ui.add(
+        egui::Slider::new(&mut vp.brush.radius, 2.0..=500.0)
+            .logarithmic(true)
+            .text("radius (px)"),
+    );
     ui.add(egui::Slider::new(&mut vp.brush.hardness, 0.0..=1.0).text("hardness"));
     ui.add(egui::Slider::new(&mut vp.brush.opacity, 0.0..=1.0).text("opacity"));
 }
@@ -1079,6 +1108,15 @@ impl App {
 
     fn asset_browser_panel(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let mut want_import = false;
+        let mut want_clear_stencil = false;
+        // Snapshot the active-stencil label so we can render it inside
+        // this closure without holding a mutable borrow of the viewport.
+        let stencil_label = self
+            .viewport
+            .as_ref()
+            .and_then(|vp| vp.active_stencil)
+            .and_then(|i| self.browser.textures.get(i))
+            .map(|a| a.name.clone());
         ui.horizontal(|ui| {
             for &tab in assets::Tab::ALL {
                 ui.selectable_value(&mut self.browser.active_tab, tab, tab.label());
@@ -1088,6 +1126,14 @@ impl App {
                     && ui.button("+ Import").clicked()
                 {
                     want_import = true;
+                }
+                if let Some(name) = &stencil_label {
+                    if ui.button("Clear stencil").clicked() {
+                        want_clear_stencil = true;
+                    }
+                    ui.label(egui::RichText::new(format!("Stencil: {}", name)).strong().color(
+                        egui::Color32::from_rgb(255, 220, 100),
+                    ));
                 }
             });
         });
@@ -1104,6 +1150,12 @@ impl App {
 
         if want_import {
             self.import_texture_dialog(frame);
+        }
+        if want_clear_stencil {
+            if let Some(vp) = &mut self.viewport {
+                vp.active_stencil = None;
+            }
+            self.status = "Stencil cleared".to_string();
         }
     }
 
@@ -1127,6 +1179,11 @@ impl App {
                             .sense(egui::Sense::click());
                             let response = ui.add(img);
                             response.context_menu(|ui| {
+                                if ui.button("Project with stencil").clicked() {
+                                    action = Some((i, AssetAction::SetStencil));
+                                    ui.close_menu();
+                                }
+                                ui.separator();
                                 if ui.button("New paint layer from texture").clicked() {
                                     action = Some((i, AssetAction::NewLayer));
                                     ui.close_menu();
@@ -1155,11 +1212,13 @@ impl App {
     }
 
     fn import_texture_dialog(&mut self, frame: &eframe::Frame) {
-        // Only PNG is enabled in the image crate's features today; adding
-        // JPEG/TGA/BMP means enabling more features in Cargo.toml.
+        // PNG + EXR are enabled via the image crate's feature flags in
+        // Cargo.toml. EXR loads as HDR floats; we tonemap/clamp to LDR
+        // on upload for now (HDR displacement channel is a follow-up —
+        // see the roadmap task).
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Image", &["png"])
-            .set_title("Import texture")
+            .add_filter("Image", &["png", "exr"])
+            .set_title("Import texture / stencil")
             .pick_file()
         else {
             return;
@@ -1248,8 +1307,96 @@ impl App {
                 vp.recomposite(&rs.device, &rs.queue);
                 self.status = format!("Applied '{}' as mask", asset.name);
             }
+            AssetAction::SetStencil => {
+                if !vp.mesh_maps.baked {
+                    self.status = "Bake mesh maps first (Mesh maps panel → Bake) \
+                                   so projection painting has a position map."
+                        .to_string();
+                    return;
+                }
+                vp.active_stencil = Some(idx);
+                vp.tool = Tool::Stencil;
+                // Fresh stencil starts centered at default transform so
+                // the overlay always shows up predictably.
+                vp.stencil_transform = crate::viewport::StencilTransform::default();
+                self.status = format!(
+                    "Stencil: '{}' · M/R/T + LMB to move/rotate/scale · \
+                    switch tool to exit",
+                    asset.name
+                );
+            }
         }
         log::info!("{}", self.status);
+    }
+
+    /// Central tool-switch. Clicking the Stencil button opens a file
+    /// picker; picking a file activates it as the stencil. Switching to
+    /// any non-Stencil tool cancels the active stencil so the user is
+    /// back in normal paint.
+    fn switch_tool(&mut self, tool: Tool, frame: &eframe::Frame) {
+        if tool == Tool::Stencil {
+            self.open_stencil_dialog(frame);
+            return;
+        }
+        if let Some(vp) = &mut self.viewport {
+            if vp.tool == Tool::Stencil {
+                vp.active_stencil = None;
+            }
+            vp.tool = tool;
+        }
+    }
+
+    fn open_stencil_dialog(&mut self, frame: &eframe::Frame) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Image", &["png", "exr"])
+            .set_title("Pick stencil")
+            .pick_file()
+        else {
+            // Dialog cancelled — leave the current tool untouched.
+            return;
+        };
+        let Some(rs) = frame.wgpu_render_state() else {
+            self.status = "No GPU available.".to_string();
+            return;
+        };
+        let baked = self
+            .viewport
+            .as_ref()
+            .map(|vp| vp.mesh_maps.baked)
+            .unwrap_or(false);
+        if !baked {
+            self.status = "Bake mesh maps first (Mesh maps panel → Bake) \
+                           so projection painting has a position map."
+                .to_string();
+            return;
+        }
+        let mut renderer = rs.renderer.write();
+        let result = self.browser.import_texture(
+            &path,
+            &rs.device,
+            &rs.queue,
+            &mut renderer,
+        );
+        drop(renderer);
+        match result {
+            Ok(()) => {
+                let idx = self.browser.textures.len() - 1;
+                let name = self.browser.textures[idx].name.clone();
+                if let Some(vp) = &mut self.viewport {
+                    vp.tool = Tool::Stencil;
+                    vp.active_stencil = Some(idx);
+                    vp.stencil_transform =
+                        crate::viewport::StencilTransform::default();
+                }
+                self.status = format!(
+                    "Stencil: '{}' · M/R/T + LMB to move/rotate/scale",
+                    name
+                );
+            }
+            Err(e) => {
+                self.status = format!("Failed to load stencil: {e}");
+            }
+        }
     }
 }
 
@@ -1258,4 +1405,5 @@ enum AssetAction {
     NewLayer,
     ApplyBaseColor,
     ApplyMask,
+    SetStencil,
 }

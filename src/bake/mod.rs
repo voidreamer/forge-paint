@@ -13,6 +13,11 @@ use crate::mesh::{GpuMesh, Vertex};
 pub struct MeshMaps {
     pub world_normal: wgpu::Texture,
     pub world_normal_view: wgpu::TextureView,
+    /// World-space position sampled at each UV texel. Baked in the same
+    /// pass as world_normal via MRT. Consumed by the projection brush
+    /// (world → screen → stencil) and future smart-mask generators.
+    pub world_position: wgpu::Texture,
+    pub world_position_view: wgpu::TextureView,
     pub sampler: wgpu::Sampler,
     pub baked: bool,
 }
@@ -25,19 +30,22 @@ impl MeshMaps {
         let world_normal =
             make_array(device, "mesh_maps.world_normal", 1, tile_count, FORMAT);
         let world_normal_view = array_view(&world_normal, "mesh_maps.world_normal.array_view");
+        let world_position =
+            make_array(device, "mesh_maps.world_position", 1, tile_count, FORMAT);
+        let world_position_view =
+            array_view(&world_position, "mesh_maps.world_position.array_view");
 
-        // Fill with flat-up (0.5, 0.5, 1.0, 1.0) so preview looks sensible.
+        // Flat-up (0.5, 0.5, 1.0, 1.0) normal; zeroed position. Preview looks
+        // sensible before the first bake, and the projection brush early-outs
+        // on (0,0,0) positions via its falloff check.
         let flat_normal = encode_normal(&[0.0, 0.0, 1.0]);
+        let zero_pos: [half::f16; 4] = [half::f16::ZERO; 4];
         for layer in 0..tile_count {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &world_normal,
                     mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: 0,
-                        y: 0,
-                        z: layer,
-                    },
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
                     aspect: wgpu::TextureAspect::All,
                 },
                 bytemuck::cast_slice(&flat_normal),
@@ -46,11 +54,22 @@ impl MeshMaps {
                     bytes_per_row: Some(8),
                     rows_per_image: Some(1),
                 },
-                wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
+                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            );
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &world_position,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                    aspect: wgpu::TextureAspect::All,
                 },
+                bytemuck::cast_slice(&zero_pos),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(8),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
             );
         }
 
@@ -68,6 +87,8 @@ impl MeshMaps {
         Self {
             world_normal,
             world_normal_view,
+            world_position,
+            world_position_view,
             sampler,
             baked: false,
         }
@@ -87,7 +108,6 @@ impl MeshMaps {
     ) {
         let tile_count = tiles.len().max(1) as u32;
 
-        // Allocate the output at full resolution.
         let world_normal = make_array(
             device,
             "mesh_maps.world_normal.baked",
@@ -97,17 +117,31 @@ impl MeshMaps {
         );
         let world_normal_view =
             array_view(&world_normal, "mesh_maps.world_normal.baked.array_view");
+        let world_position = make_array(
+            device,
+            "mesh_maps.world_position.baked",
+            resolution,
+            tile_count,
+            FORMAT,
+        );
+        let world_position_view =
+            array_view(&world_position, "mesh_maps.world_position.baked.array_view");
 
-        // Per-tile passes. Each pass renders the mesh into one array layer
-        // via a per-tile view, with the shader offsetting UVs by the tile's
-        // integer origin.
+        // One pass per tile; inside the pass we MRT into normal + position.
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("mesh_maps.bake_enc"),
         });
         for (layer, &tile_id) in tiles.iter().enumerate() {
             let (tu, tv) = udim_offset(tile_id);
-            let layer_view = world_normal.create_view(&wgpu::TextureViewDescriptor {
+            let normal_view = world_normal.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("mesh_maps.world_normal.baked.layer_view"),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: layer as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            });
+            let position_view = world_position.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("mesh_maps.world_position.baked.layer_view"),
                 dimension: Some(wgpu::TextureViewDimension::D2),
                 base_array_layer: layer as u32,
                 array_layer_count: Some(1),
@@ -141,21 +175,29 @@ impl MeshMaps {
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("mesh_maps.bake_pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &layer_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                // Flat-up normal as clear so empty UV regions
-                                // look neutral rather than black.
-                                r: 0.5,
-                                g: 0.5,
-                                b: 1.0,
-                                a: 1.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
+                    color_attachments: &[
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &normal_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.5,
+                                    g: 0.5,
+                                    b: 1.0,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &position_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                    ],
                     depth_stencil_attachment: None,
                     ..Default::default()
                 });
@@ -173,6 +215,8 @@ impl MeshMaps {
 
         self.world_normal = world_normal;
         self.world_normal_view = world_normal_view;
+        self.world_position = world_position;
+        self.world_position_view = world_position_view;
         self.baked = true;
     }
 }
@@ -223,11 +267,19 @@ impl Baker {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_bake"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                // MRT: [0] = world normal, [1] = world position.
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {

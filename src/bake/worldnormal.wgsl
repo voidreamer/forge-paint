@@ -20,6 +20,7 @@ struct VsIn {
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_normal: vec3<f32>,
+    @location(1) world_pos: vec3<f32>,
 };
 
 @vertex
@@ -34,12 +35,23 @@ fn vs_bake(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip_pos = vec4<f32>(clip_x, clip_y, 0.0, 1.0);
     out.world_normal = in.normal;
+    out.world_pos = in.position;
     return out;
 }
 
+struct FragOut {
+    // 0..1-biased world normal (0.5 = zero).
+    @location(0) normal: vec4<f32>,
+    // Raw world-space position. Rgba16Float supports [-65504, 65504] with
+    // float-16 precision — plenty for typical mesh scales.
+    @location(1) position: vec4<f32>,
+};
+
 @fragment
-fn fs_bake(in: VsOut) -> @location(0) vec4<f32> {
+fn fs_bake(in: VsOut) -> FragOut {
     let n = normalize(in.world_normal);
-    // Bake as 0..1 unorm-style; PBR preview remaps back if needed.
-    return vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
+    var out: FragOut;
+    out.normal = vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
+    out.position = vec4<f32>(in.world_pos, 1.0);
+    return out;
 }

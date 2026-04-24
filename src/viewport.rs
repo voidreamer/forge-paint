@@ -12,7 +12,7 @@ use crate::env::{
 use crate::mesh::{CpuMesh, GpuMesh};
 use crate::paint::{
     target::MaterialUniforms, udim, BrushPipeline, BrushUniforms, Compositor, Layer, LayerStack,
-    PaintChannel, PaintTarget,
+    PaintChannel, PaintTarget, ProjBrushUniforms, ProjectionBrushPipeline,
 };
 use crate::pick;
 use crate::fxaa::FxaaPipeline;
@@ -26,6 +26,30 @@ pub enum Tool {
     Erase,
     Fill,
     Eyedropper,
+    /// Projection-paint a chosen stencil through the current camera.
+    /// Selecting this tool is what activates an asset as the stencil;
+    /// switching to any other tool cancels the stencil mode.
+    Stencil,
+}
+
+/// Screen-space transform for the projected stencil. `offset` is in NDC,
+/// `rotation` in radians (CCW), `scale` covers NDC [-scale, scale] in Y
+/// with X scaled by the stencil's own aspect ratio.
+#[derive(Debug, Clone, Copy)]
+pub struct StencilTransform {
+    pub offset: [f32; 2],
+    pub rotation: f32,
+    pub scale: f32,
+}
+
+impl Default for StencilTransform {
+    fn default() -> Self {
+        Self {
+            offset: [0.0, 0.0],
+            rotation: 0.0,
+            scale: 0.8,
+        }
+    }
 }
 
 impl Tool {
@@ -35,6 +59,7 @@ impl Tool {
             Tool::Erase => "Erase",
             Tool::Fill => "Fill",
             Tool::Eyedropper => "Eyedropper",
+            Tool::Stencil => "Stencil",
         }
     }
     pub fn shortcut(self) -> &'static str {
@@ -43,6 +68,7 @@ impl Tool {
             Tool::Erase => "E",
             Tool::Fill => "G",
             Tool::Eyedropper => "I",
+            Tool::Stencil => "",
         }
     }
 }
@@ -54,6 +80,13 @@ pub struct Viewport {
     pub fxaa: FxaaPipeline,
     pub wireframe: WireframePipeline,
     brush_pipeline: BrushPipeline,
+    projection_brush: ProjectionBrushPipeline,
+
+    /// Index into `AssetBrowser.textures` for the stencil currently
+    /// routed through the projection brush. `None` = regular painting.
+    pub active_stencil: Option<usize>,
+    /// Screen-space transform for the stencil preview + projection sample.
+    pub stencil_transform: StencilTransform,
     compositor: Compositor,
     color: Option<(wgpu::Texture, wgpu::TextureView, [u32; 2])>,
     egui_tex_id: Option<egui::TextureId>,
@@ -133,7 +166,10 @@ pub struct BrushState {
     pub channel: PaintChannel,
     pub color_srgb: [f32; 3], // base_color
     pub value: f32,           // 0..1, used for Roughness / Metallic / Mask
-    pub radius: f32,          // in UV units (local to a tile)
+    /// Brush radius in **screen pixels**. Converted to UV at stamp time
+    /// via the UV gradient at the hit — this way the ring size is
+    /// consistent regardless of how the mesh is UV-unwrapped.
+    pub radius: f32,
     pub hardness: f32,        // 0 soft, 1 hard
     pub opacity: f32,         // 0..1
     /// When true and the active layer has a mask, paint routes to the mask.
@@ -146,7 +182,7 @@ impl Default for BrushState {
             channel: PaintChannel::BaseColor,
             color_srgb: [0.95, 0.2, 0.2],
             value: 0.5,
-            radius: 0.04,
+            radius: 40.0,
             hardness: 0.4,
             opacity: 1.0,
             mask_edit: false,
@@ -164,6 +200,7 @@ impl Viewport {
         let background = BackgroundPipeline::new(device);
         let wireframe = WireframePipeline::new(device, &renderer.frame_bgl);
         let brush_pipeline = BrushPipeline::new(device);
+        let projection_brush = ProjectionBrushPipeline::new(device);
         let compositor = Compositor::new(device, queue);
         let gpu = GpuMesh::from_cpu(device, cpu);
         let tile_resolution = std::env::var("FORGE_PAINT_RESOLUTION")
@@ -227,6 +264,9 @@ impl Viewport {
             fxaa,
             wireframe,
             brush_pipeline,
+            projection_brush,
+            active_stencil: None,
+            stencil_transform: StencilTransform::default(),
             compositor,
             color: None,
             egui_tex_id: None,
@@ -456,7 +496,14 @@ impl Viewport {
         3 * tiles * res * res * 4
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+        stencil_view: Option<&wgpu::TextureView>,
+        stencil_aspect: f32,
+        stencil_egui_tex: Option<egui::TextureId>,
+    ) {
         let available = ui.available_size();
         let (rect, response) =
             ui.allocate_exact_size(available, egui::Sense::click_and_drag());
@@ -495,6 +542,37 @@ impl Viewport {
             )
         });
         let adjust_mode = adj_s || adj_d || adj_f;
+
+        // Stencil transform manipulation — only meaningful when a stencil
+        // is active, but the key-held detection is cheap enough to do
+        // unconditionally (suppresses paint on accidental presses even
+        // without a stencil, but that's fine).
+        let (sxf_m, sxf_r, sxf_t) = ui.ctx().input(|i| {
+            (
+                i.key_down(egui::Key::M),
+                i.key_down(egui::Key::R),
+                i.key_down(egui::Key::T),
+            )
+        });
+        let stencil_xf_mode = (sxf_m || sxf_r || sxf_t) && self.active_stencil.is_some();
+        if primary_active && stencil_xf_mode {
+            let delta = response.drag_delta();
+            if sxf_m {
+                // Pixels → NDC: 2 NDC units span the viewport height.
+                self.stencil_transform.offset[0] += delta.x * 2.0 / rect.height();
+                self.stencil_transform.offset[1] -= delta.y * 2.0 / rect.height();
+            }
+            if sxf_r {
+                // ~180 px horizontal = half a turn.
+                self.stencil_transform.rotation += delta.x * 0.01;
+            }
+            if sxf_t {
+                // ~200 px horizontal = one unit scale.
+                self.stencil_transform.scale =
+                    (self.stencil_transform.scale + delta.x * 0.005).clamp(0.05, 4.0);
+            }
+        }
+
         if primary_active && adjust_mode {
             // Lock the cursor-ring anchor at wherever the drag started
             // so the preview stays put while the mouse moves to scrub.
@@ -505,8 +583,10 @@ impl Viewport {
             }
             let dx = response.drag_delta().x;
             if adj_s {
-                // ~200 px horizontal ≈ 20% of the radius range.
-                self.brush.radius = (self.brush.radius + dx * 0.0008).clamp(0.002, 0.5);
+                // brush.radius is screen pixels; 1 drag-pixel = 1 px of
+                // brush-radius feels right (200 px of motion = 200 px of
+                // size change).
+                self.brush.radius = (self.brush.radius + dx).clamp(2.0, 500.0);
             }
             if adj_d {
                 self.brush.hardness = (self.brush.hardness + dx * 0.003).clamp(0.0, 1.0);
@@ -518,7 +598,7 @@ impl Viewport {
             self.adjust_anchor = None;
         }
 
-        let paint_pos = if primary_active && no_mods && !adjust_mode {
+        let paint_pos = if primary_active && no_mods && !adjust_mode && !stencil_xf_mode {
             response.interact_pointer_pos()
         } else {
             None
@@ -672,7 +752,7 @@ impl Viewport {
                 (None, _) => Vec::new(),
             };
 
-            let strokes: Vec<(u32, Vec2)> = stamp_positions
+            let strokes: Vec<(u32, Vec2, egui::Pos2)> = stamp_positions
                 .iter()
                 .filter_map(|p| {
                     let (orig, dir) = pick::screen_to_ray(*p, rect, view_proj, eye);
@@ -681,7 +761,7 @@ impl Viewport {
                     let layer = self.paint_target.layer_for_tile(tile)?;
                     let local_uv =
                         Vec2::new(hit.uv.x - hit.uv.x.floor(), hit.uv.y - hit.uv.y.floor());
-                    Some((layer, local_uv))
+                    Some((layer, local_uv, *p))
                 })
                 .collect();
 
@@ -704,7 +784,7 @@ impl Viewport {
             // write it into the brush color. Uses a synchronous readback —
             // acceptable for a one-shot click action.
             if self.tool == Tool::Eyedropper && stroke_starting && !strokes.is_empty() {
-                let (layer, local_uv) = strokes[0];
+                let (layer, local_uv, _) = strokes[0];
                 let res = self.paint_target.resolution;
                 let px = ((local_uv.x * res as f32) as u32).min(res.saturating_sub(1));
                 let py = ((local_uv.y * res as f32) as u32).min(res.saturating_sub(1));
@@ -738,15 +818,19 @@ impl Viewport {
 
             // Stamping tools. Fill layers are parameter-only, so we skip them.
             let active_is_fill = self.layer_stack.active_layer().is_fill();
-            let is_stamping = matches!(self.tool, Tool::Paint | Tool::Erase | Tool::Fill);
+            let is_stamping =
+                matches!(self.tool, Tool::Paint | Tool::Erase | Tool::Fill | Tool::Stencil);
             if is_stamping && !strokes.is_empty() && !active_is_fill {
                 let active_idx = self.layer_stack.active;
                 let active = self.layer_stack.active_layer();
                 let has_mask = active.mask.is_some();
 
-                // Erase always routes to the mask. Paint / Fill honor mask_edit.
+                // Erase always routes to the mask. Stencil always writes
+                // to base color (the projection pipeline is baseline-only).
+                // Paint / Fill honor mask_edit.
                 let channel = match self.tool {
                     Tool::Erase => PaintChannel::Mask,
+                    Tool::Stencil => PaintChannel::BaseColor,
                     _ => {
                         if self.brush.mask_edit && has_mask {
                             PaintChannel::Mask
@@ -764,7 +848,7 @@ impl Viewport {
                     // Fill is one-shot per stroke; Paint/Erase stamp every
                     // interpolated position along the drag.
                     let fill_stamp;
-                    let stamps: &[(u32, Vec2)] = if self.tool == Tool::Fill {
+                    let stamps: &[(u32, Vec2, egui::Pos2)] = if self.tool == Tool::Fill {
                         if stroke_starting {
                             fill_stamp = [strokes[0]];
                             &fill_stamp
@@ -815,20 +899,47 @@ impl Viewport {
                         };
                         let uniform_fill = if self.tool == Tool::Fill { 1u32 } else { 0u32 };
 
-                        for (layer, local_uv) in stamps {
-                            let uniforms = BrushUniforms {
-                                color: [
-                                    color_comp[0],
-                                    color_comp[1],
-                                    color_comp[2],
-                                    self.brush.opacity,
-                                ],
-                                center_uv: local_uv.to_array(),
-                                radius: self.brush.radius,
-                                hardness: self.brush.hardness,
-                                uniform_fill,
-                                _pad: [0; 3],
-                            };
+                        // brush.radius lives in screen pixels; the shader
+                        // expects UV. Probe the UV gradient at the first
+                        // stamp's screen position and reuse it for the
+                        // whole batch — drag interpolation keeps stamps
+                        // in the same neighborhood so one Jacobian is fine.
+                        let pixels_per_uv: Option<f32> =
+                            stamp_positions.first().and_then(|p| {
+                                let off = 2.0;
+                                let ray_uv = |sp: egui::Pos2| -> Option<Vec2> {
+                                    if !rect.contains(sp) {
+                                        return None;
+                                    }
+                                    let (orig, dir) =
+                                        pick::screen_to_ray(sp, rect, view_proj, eye);
+                                    pick::pick(&self.cpu_mesh, orig, dir).map(|h| h.uv)
+                                };
+                                let uv_c = ray_uv(*p)?;
+                                let uv_x = ray_uv(*p + egui::vec2(off, 0.0))?;
+                                let uv_y = ray_uv(*p + egui::vec2(0.0, off))?;
+                                let d_x = (uv_x - uv_c) / off;
+                                let d_y = (uv_y - uv_c) / off;
+                                let px_x = 1.0 / d_x.length().max(1e-6);
+                                let px_y = 1.0 / d_y.length().max(1e-6);
+                                Some(0.5 * (px_x + px_y))
+                            });
+                        // Convert pixels → UV. Fallback uses a sane default
+                        // so a rare Jacobian miss doesn't skip the stamp.
+                        let uv_radius = self.brush.radius
+                            / pixels_per_uv.unwrap_or(rect.height() * 0.5).max(1.0);
+
+                        // Projection painting: when a stencil is selected
+                        // and we're brushing into base color on a paint
+                        // layer with a baked position map, route stamps
+                        // through the projection pipeline instead. Falls
+                        // back to the regular radial brush otherwise.
+                        let projection_active = stencil_view.is_some()
+                            && channel == PaintChannel::BaseColor
+                            && self.tool == Tool::Stencil
+                            && self.mesh_maps.baked;
+
+                        for (layer, local_uv, screen_pos) in stamps {
                             let layer_view = match channel {
                                 PaintChannel::BaseColor => {
                                     &active.base_color_layer_views[*layer as usize]
@@ -840,22 +951,94 @@ impl Viewport {
                                     &active.mask.as_ref().unwrap().layer_views[*layer as usize]
                                 }
                             };
-                            self.brush_pipeline.stamp(
-                                &render_state.queue,
-                                &mut encoder,
-                                layer_view,
-                                channel,
-                                &uniforms,
-                                self.paint_target.resolution,
-                            );
+
+                            if projection_active {
+                                // Screen pos → NDC. rect.left()/top() are the
+                                // viewport origin in screen coords.
+                                let ndc_x =
+                                    2.0 * (screen_pos.x - rect.left()) / rect.width() - 1.0;
+                                let ndc_y =
+                                    1.0 - 2.0 * (screen_pos.y - rect.top()) / rect.height();
+                                // Brush radius (screen px) → NDC. NDC covers
+                                // [-1, 1] over the viewport height → 2 units.
+                                let radius_ndc =
+                                    self.brush.radius * 2.0 / rect.height();
+                                let proj_uniforms = ProjBrushUniforms {
+                                    view_proj: view_proj.to_cols_array_2d(),
+                                    center_screen: [ndc_x, ndc_y],
+                                    radius_screen: radius_ndc,
+                                    opacity: self.brush.opacity,
+                                    hardness: self.brush.hardness,
+                                    aspect: rect.width() / rect.height(),
+                                    stencil_offset: self.stencil_transform.offset,
+                                    stencil_scale: self.stencil_transform.scale,
+                                    stencil_cos_rot: self.stencil_transform.rotation.cos(),
+                                    stencil_sin_rot: self.stencil_transform.rotation.sin(),
+                                    stencil_aspect,
+                                    _pad: [0.0; 2],
+                                };
+                                let position_view = self
+                                    .mesh_maps
+                                    .world_position
+                                    .create_view(&wgpu::TextureViewDescriptor {
+                                        label: Some("mesh_maps.world_position.tile_view"),
+                                        dimension: Some(wgpu::TextureViewDimension::D2),
+                                        base_array_layer: *layer,
+                                        array_layer_count: Some(1),
+                                        ..Default::default()
+                                    });
+                                self.projection_brush.stamp(
+                                    &render_state.device,
+                                    &render_state.queue,
+                                    &mut encoder,
+                                    layer_view,
+                                    &position_view,
+                                    stencil_view.unwrap(),
+                                    &proj_uniforms,
+                                    self.paint_target.resolution,
+                                    local_uv.to_array(),
+                                    uv_radius,
+                                );
+                            } else {
+                                let uniforms = BrushUniforms {
+                                    color: [
+                                        color_comp[0],
+                                        color_comp[1],
+                                        color_comp[2],
+                                        self.brush.opacity,
+                                    ],
+                                    center_uv: local_uv.to_array(),
+                                    radius: uv_radius,
+                                    hardness: self.brush.hardness,
+                                    uniform_fill,
+                                    _pad: [0; 3],
+                                };
+                                self.brush_pipeline.stamp(
+                                    &render_state.queue,
+                                    &mut encoder,
+                                    layer_view,
+                                    channel,
+                                    &uniforms,
+                                    self.paint_target.resolution,
+                                );
+                            }
                         }
-                        // Flatten the stack into the display target before PBR samples it.
-                        self.compositor.run(
+                        // Flatten only the tiles that received stamps this
+                        // frame — full recomposite runs on layer-property
+                        // changes, not per paint frame. De-dupe before the
+                        // composite call since drag interpolation usually
+                        // lands repeated tile indices.
+                        let mut dirty: Vec<usize> =
+                            stamps.iter().map(|(l, _, _)| *l as usize).collect();
+                        dirty.sort_unstable();
+                        dirty.dedup();
+                        self.compositor.run_sparse(
                             &render_state.device,
                             &render_state.queue,
                             &mut encoder,
                             &self.layer_stack,
                             &self.paint_target,
+                            &dirty,
                         );
                     }
                 }
@@ -1004,6 +1187,89 @@ impl Viewport {
             egui::Color32::WHITE,
         );
 
+        // Stencil preview overlay — faint projection of the stencil at
+        // its current transform, hidden while actively painting so the
+        // stroke is clearly visible. Shown while idling and while
+        // manipulating the transform via M/R/T.
+        if let (Some(tex_id), Some(_)) = (stencil_egui_tex, self.active_stencil) {
+            let is_painting_now = primary_active
+                && !adjust_mode
+                && !stencil_xf_mode
+                && no_mods;
+            if !is_painting_now {
+                let xf = self.stencil_transform;
+                let cr = xf.rotation.cos();
+                let sr = xf.rotation.sin();
+                let viewport_aspect = rect.width() / rect.height();
+                // Stencil corners in stencil-local space. X spans
+                // [-stencil_aspect, +stencil_aspect], Y spans [-1, 1]
+                // — "isotropic" units where X and Y have the same
+                // visual scale on screen.
+                let local = [
+                    ([-stencil_aspect,  1.0], [0.0, 0.0]),
+                    ([ stencil_aspect,  1.0], [1.0, 0.0]),
+                    ([ stencil_aspect, -1.0], [1.0, 1.0]),
+                    ([-stencil_aspect, -1.0], [0.0, 1.0]),
+                ];
+                let ndc_to_screen = |nx: f32, ny: f32| -> egui::Pos2 {
+                    egui::pos2(
+                        rect.left() + (nx * 0.5 + 0.5) * rect.width(),
+                        rect.top() + (0.5 - ny * 0.5) * rect.height(),
+                    )
+                };
+                // Transform a local stencil corner into screen NDC.
+                // Rotation happens in isotropic space; the final step
+                // divides X by the viewport's aspect so NDC X ranges
+                // match the screen's horizontal extent.
+                let place = |lx: f32, ly: f32| -> egui::Pos2 {
+                    let sx = lx * xf.scale;
+                    let sy = ly * xf.scale;
+                    let rx = sx * cr - sy * sr;
+                    let ry = sx * sr + sy * cr;
+                    let ndc_x = rx / viewport_aspect + xf.offset[0];
+                    let ndc_y = ry + xf.offset[1];
+                    ndc_to_screen(ndc_x, ndc_y)
+                };
+                let mut mesh = egui::epaint::Mesh::with_texture(tex_id);
+                let alpha = if stencil_xf_mode { 180 } else { 110 };
+                let tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+                let mut pts = Vec::with_capacity(4);
+                for ([lx, ly], [u, v]) in local {
+                    let pos = place(lx, ly);
+                    pts.push(pos);
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos,
+                        uv: egui::pos2(u, v),
+                        color: tint,
+                    });
+                }
+                mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                ui.painter().add(egui::Shape::mesh(mesh));
+
+                // Rectangle outline so the footprint is readable against
+                // busy backgrounds.
+                let outline = egui::Stroke::new(
+                    1.5,
+                    egui::Color32::from_rgb(255, 220, 100),
+                );
+                ui.painter().line_segment([pts[0], pts[1]], outline);
+                ui.painter().line_segment([pts[1], pts[2]], outline);
+                ui.painter().line_segment([pts[2], pts[3]], outline);
+                ui.painter().line_segment([pts[3], pts[0]], outline);
+
+                // Shortcut reminder at the bottom of the viewport while
+                // a stencil is active.
+                let hint = "Stencil: M+drag move · R+drag rotate · T+drag scale";
+                ui.painter().text(
+                    egui::pos2(rect.center().x, rect.bottom() - 10.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    hint,
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::from_rgb(255, 220, 100),
+                );
+            }
+        }
+
         // Brush cursor — ring over the cursor in paint mode, or locked
         // to the adjust anchor while scrubbing brush parameters.
         if response.hovered() && (no_mods || adjust_mode) {
@@ -1013,37 +1279,11 @@ impl Viewport {
                 response.hover_pos()
             };
             if let Some(pos) = cursor_pos {
-                // Screen radius from the actual UV gradient at the cursor
-                // — matches the stroke footprint instead of the old
-                // heuristic that assumed "1 UV unit ≈ screen height".
-                // Extra picks at ±offset_px cost ~2 brute-force ray
-                // tests, fine for hover-frequency.
-                let accurate_radius: Option<f32> = (|| {
-                    let aspect = w as f32 / h as f32;
-                    let view_proj = self.camera.view_proj(aspect);
-                    let eye = self.camera.eye();
-                    let offset_px: f32 = 2.0;
-                    let ray_uv = |p: egui::Pos2| -> Option<glam::Vec2> {
-                        if !rect.contains(p) {
-                            return None;
-                        }
-                        let (orig, dir) = pick::screen_to_ray(p, rect, view_proj, eye);
-                        pick::pick(&self.cpu_mesh, orig, dir).map(|h| h.uv)
-                    };
-                    let uv_c = ray_uv(pos)?;
-                    let uv_x = ray_uv(pos + egui::vec2(offset_px, 0.0))?;
-                    let uv_y = ray_uv(pos + egui::vec2(0.0, offset_px))?;
-                    let d_x = (uv_x - uv_c) / offset_px;
-                    let d_y = (uv_y - uv_c) / offset_px;
-                    let px_per_uv_x = 1.0 / d_x.length().max(1e-6);
-                    let px_per_uv_y = 1.0 / d_y.length().max(1e-6);
-                    let avg = 0.5 * (px_per_uv_x + px_per_uv_y);
-                    Some(self.brush.radius * avg)
-                })();
-                let on_mesh = accurate_radius.is_some() || self.last_hit_uv.is_some();
-                let screen_radius = accurate_radius
-                    .unwrap_or(self.brush.radius * rect.height() * 0.5)
-                    .clamp(2.0, rect.height() * 0.4);
+                // Brush radius is already in screen pixels — the cursor
+                // ring is a trivial mapping now. No more UV-gradient
+                // picker dance.
+                let on_mesh = self.last_hit_uv.is_some();
+                let screen_radius = self.brush.radius.clamp(2.0, rect.height() * 0.5);
 
                 let (color, stroke_width) = if adjust_mode {
                     (egui::Color32::from_rgb(255, 220, 100), 2.0)
@@ -1070,7 +1310,7 @@ impl Viewport {
                 // Live value readout while adjusting.
                 if adjust_mode {
                     let label = if adj_s {
-                        format!("radius {:.3}", self.brush.radius)
+                        format!("radius {:.0} px", self.brush.radius)
                     } else if adj_d {
                         format!("hardness {:.2}", self.brush.hardness)
                     } else {
@@ -1097,9 +1337,11 @@ impl Viewport {
             ui.ctx().request_repaint();
         }
 
-        // Keep the redraw going while painting or adjusting so drags and
-        // live cursor-ring updates stay smooth.
-        if paint_pos.is_some() || (primary_active && adjust_mode) {
+        // Keep the redraw going while painting, adjusting brush, or
+        // manipulating the stencil transform so drags stay smooth.
+        if paint_pos.is_some()
+            || (primary_active && (adjust_mode || stencil_xf_mode))
+        {
             ui.ctx().request_repaint();
         }
     }
