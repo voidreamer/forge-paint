@@ -18,7 +18,8 @@ use crate::paint::{Layer, PaintTarget};
 
 const LAYER_CHANNELS: &[(&str, fn(&Layer) -> &wgpu::Texture)] = &[
     ("basecolor", |l| &l.base_color),
-    ("roughmetal", |l| &l.rough_metal),
+    ("roughness", |l| &l.roughness),
+    ("metallic", |l| &l.metallic),
     ("normal", |l| &l.normal),
 ];
 

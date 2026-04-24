@@ -713,33 +713,39 @@ impl Viewport {
                             wgpu::BindGroupEntry {
                                 binding: 2,
                                 resource: wgpu::BindingResource::TextureView(
-                                    &self.paint_target.rough_metal_view,
+                                    &self.paint_target.roughness_view,
                                 ),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
                                 resource: wgpu::BindingResource::TextureView(
-                                    &self.paint_target.normal_view,
+                                    &self.paint_target.metallic_view,
                                 ),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 4,
-                                resource: wgpu::BindingResource::TextureView(active_mask_view),
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.paint_target.normal_view,
+                                ),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 5,
+                                resource: wgpu::BindingResource::TextureView(active_mask_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
                                 resource: wgpu::BindingResource::Sampler(
                                     &self.paint_target.sampler,
                                 ),
                             },
                             wgpu::BindGroupEntry {
-                                binding: 6,
+                                binding: 7,
                                 resource: wgpu::BindingResource::TextureView(
                                     &self.mesh_maps.world_normal_view,
                                 ),
                             },
                             wgpu::BindGroupEntry {
-                                binding: 7,
+                                binding: 8,
                                 resource: wgpu::BindingResource::TextureView(
                                     &self.paint_target.displacement_view,
                                 ),
@@ -991,8 +997,11 @@ impl Viewport {
                                 PaintChannel::BaseColor => {
                                     &active.base_color_layer_views[*layer as usize]
                                 }
-                                PaintChannel::Roughness | PaintChannel::Metallic => {
-                                    &active.rough_metal_layer_views[*layer as usize]
+                                PaintChannel::Roughness => {
+                                    &active.roughness_layer_views[*layer as usize]
+                                }
+                                PaintChannel::Metallic => {
+                                    &active.metallic_layer_views[*layer as usize]
                                 }
                                 PaintChannel::Mask => {
                                     &active.mask.as_ref().unwrap().layer_views[*layer as usize]

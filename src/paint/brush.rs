@@ -97,16 +97,16 @@ impl BrushPipeline {
             device,
             &shader,
             &pipeline_layout,
-            wgpu::TextureFormat::Rgba8Unorm,
-            wgpu::ColorWrites::GREEN,
+            wgpu::TextureFormat::R8Unorm,
+            wgpu::ColorWrites::ALL,
             "brush_pipe_roughness",
         );
         let metallic = make_pipeline(
             device,
             &shader,
             &pipeline_layout,
-            wgpu::TextureFormat::Rgba8Unorm,
-            wgpu::ColorWrites::BLUE,
+            wgpu::TextureFormat::R8Unorm,
+            wgpu::ColorWrites::ALL,
             "brush_pipe_metallic",
         );
         // Mask target is R8Unorm — only R exists, so ALL = R.

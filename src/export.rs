@@ -27,7 +27,8 @@ struct Readback {
 
 const CHANNELS: &[(&str, fn(&PaintTarget) -> &wgpu::Texture)] = &[
     ("basecolor", |p| &p.base_color),
-    ("roughmetal", |p| &p.rough_metal),
+    ("roughness", |p| &p.roughness),
+    ("metallic", |p| &p.metallic),
     ("normal", |p| &p.normal),
 ];
 

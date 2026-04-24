@@ -43,9 +43,13 @@ pub struct PaintTarget {
     /// Per-layer views for render-attachment stamping (one per UDIM tile).
     pub base_color_layer_views: Vec<wgpu::TextureView>,
 
-    pub rough_metal: wgpu::Texture,
-    pub rough_metal_view: wgpu::TextureView,
-    pub rough_metal_layer_views: Vec<wgpu::TextureView>,
+    pub roughness: wgpu::Texture,
+    pub roughness_view: wgpu::TextureView,
+    pub roughness_layer_views: Vec<wgpu::TextureView>,
+
+    pub metallic: wgpu::Texture,
+    pub metallic_view: wgpu::TextureView,
+    pub metallic_layer_views: Vec<wgpu::TextureView>,
 
     pub normal: wgpu::Texture,
     pub normal_view: wgpu::TextureView,
@@ -106,12 +110,19 @@ impl PaintTarget {
             layer_count,
             wgpu::TextureFormat::Rgba8UnormSrgb,
         );
-        let rough_metal = create_array_texture(
+        let roughness = create_array_texture(
             device,
-            "paint.rough_metal",
+            "paint.roughness",
             resolution,
             layer_count,
-            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::R8Unorm,
+        );
+        let metallic = create_array_texture(
+            device,
+            "paint.metallic",
+            resolution,
+            layer_count,
+            wgpu::TextureFormat::R8Unorm,
         );
         let normal = create_array_texture(
             device,
@@ -132,7 +143,8 @@ impl PaintTarget {
         );
 
         let base_color_view = make_array_view(&base_color);
-        let rough_metal_view = make_array_view(&rough_metal);
+        let roughness_view = make_array_view(&roughness);
+        let metallic_view = make_array_view(&metallic);
         let normal_view = make_array_view(&normal);
         let displacement_view = make_array_view(&displacement);
 
@@ -148,10 +160,21 @@ impl PaintTarget {
                 })
             })
             .collect();
-        let rough_metal_layer_views: Vec<wgpu::TextureView> = (0..layer_count)
+        let roughness_layer_views: Vec<wgpu::TextureView> = (0..layer_count)
             .map(|layer| {
-                rough_metal.create_view(&wgpu::TextureViewDescriptor {
-                    label: Some("paint.rough_metal.layer_view"),
+                roughness.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("paint.roughness.layer_view"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let metallic_layer_views: Vec<wgpu::TextureView> = (0..layer_count)
+            .map(|layer| {
+                metallic.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("paint.metallic.layer_view"),
                     dimension: Some(wgpu::TextureViewDimension::D2),
                     base_array_layer: layer,
                     array_layer_count: Some(1),
@@ -196,13 +219,8 @@ impl PaintTarget {
             b: srgb_to_linear(180.0 / 255.0) as f64,
             a: 1.0,
         };
-        let rm_clear = wgpu::Color {
-            // glTF packing: R=AO(1), G=roughness(0.5), B=metallic(0)
-            r: 1.0,
-            g: 128.0 / 255.0,
-            b: 0.0,
-            a: 1.0,
-        };
+        let rough_clear = defaults::roughness_clear();
+        let metal_clear = defaults::metallic_clear();
         let nm_clear = wgpu::Color {
             // Flat tangent-space normal (0.5, 0.5, 1.0) stored as bytes (128,128,255)
             r: 128.0 / 255.0,
@@ -217,7 +235,8 @@ impl PaintTarget {
             Vec::with_capacity((layer_count * 3) as usize);
         for layer in 0..layer_count {
             fills.push((make_layer_view(&base_color, layer), bc_clear));
-            fills.push((make_layer_view(&rough_metal, layer), rm_clear));
+            fills.push((make_layer_view(&roughness, layer), rough_clear));
+            fills.push((make_layer_view(&metallic, layer), metal_clear));
             fills.push((make_layer_view(&normal, layer), nm_clear));
             // Displacement: R=height, G=coverage — both 0 = no displacement.
             fills.push((
@@ -321,9 +340,12 @@ impl PaintTarget {
             base_color,
             base_color_view,
             base_color_layer_views,
-            rough_metal,
-            rough_metal_view,
-            rough_metal_layer_views,
+            roughness,
+            roughness_view,
+            roughness_layer_views,
+            metallic,
+            metallic_view,
+            metallic_layer_views,
             normal,
             normal_view,
             normal_layer_views,
@@ -430,13 +452,23 @@ pub mod defaults {
         }
     }
 
-    pub fn rough_metal_clear() -> wgpu::Color {
-        // glTF packing: R=AO(1), G=rough(0.5), B=metal(0)
+    pub fn roughness_clear() -> wgpu::Color {
+        // R8Unorm: R stores the scalar; default neutral 0.5.
         wgpu::Color {
-            r: 1.0,
-            g: 128.0 / 255.0,
+            r: 128.0 / 255.0,
+            g: 0.0,
             b: 0.0,
-            a: 1.0,
+            a: 0.0,
+        }
+    }
+
+    pub fn metallic_clear() -> wgpu::Color {
+        // R8Unorm: dielectric by default (0.0).
+        wgpu::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
         }
     }
 

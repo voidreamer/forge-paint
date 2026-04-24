@@ -19,7 +19,8 @@ const DEFAULT_DEPTH: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotKind {
     BaseColor,
-    RoughMetal,
+    Roughness,
+    Metallic,
     Mask,
 }
 
@@ -157,7 +158,8 @@ fn source_texture(stack: &LayerStack, layer_index: usize, kind: SnapshotKind) ->
     let layer = stack.layers.get(layer_index)?;
     match kind {
         SnapshotKind::BaseColor => Some(&layer.base_color),
-        SnapshotKind::RoughMetal => Some(&layer.rough_metal),
+        SnapshotKind::Roughness => Some(&layer.roughness),
+        SnapshotKind::Metallic => Some(&layer.metallic),
         SnapshotKind::Mask => layer.mask.as_ref().map(|m| &m.texture),
     }
 }
@@ -206,7 +208,8 @@ pub fn snapshot_kind_for_stamp(
     } else {
         match channel {
             PaintChannel::BaseColor => SnapshotKind::BaseColor,
-            PaintChannel::Roughness | PaintChannel::Metallic => SnapshotKind::RoughMetal,
+            PaintChannel::Roughness => SnapshotKind::Roughness,
+            PaintChannel::Metallic => SnapshotKind::Metallic,
             PaintChannel::Mask => SnapshotKind::Mask,
             // Displacement lives on PaintTarget in v0, outside the
             // per-layer snapshot machinery. Undo is a follow-up; for

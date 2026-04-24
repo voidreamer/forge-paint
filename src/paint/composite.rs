@@ -61,7 +61,7 @@ impl Compositor {
                     },
                     count: None,
                 },
-                // rough_metal
+                // roughness (R8)
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -72,7 +72,7 @@ impl Compositor {
                     },
                     count: None,
                 },
-                // normal
+                // metallic (R8)
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -83,7 +83,7 @@ impl Compositor {
                     },
                     count: None,
                 },
-                // mask (R8)
+                // normal
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -94,9 +94,20 @@ impl Compositor {
                     },
                     count: None,
                 },
-                // sampler
+                // mask (R8)
                 wgpu::BindGroupLayoutEntry {
                     binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -164,16 +175,25 @@ impl Compositor {
                     module: shader,
                     entry_point: Some("fs_composite"),
                     targets: &[
+                        // base_color
                         Some(wgpu::ColorTargetState {
                             format: wgpu::TextureFormat::Rgba8UnormSrgb,
                             blend: Some(blend),
                             write_mask: wgpu::ColorWrites::ALL,
                         }),
+                        // roughness
                         Some(wgpu::ColorTargetState {
-                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            format: wgpu::TextureFormat::R8Unorm,
                             blend: Some(blend),
                             write_mask: wgpu::ColorWrites::ALL,
                         }),
+                        // metallic
+                        Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::R8Unorm,
+                            blend: Some(blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        // normal
                         Some(wgpu::ColorTargetState {
                             format: wgpu::TextureFormat::Rgba8Unorm,
                             blend: Some(blend),
@@ -373,7 +393,8 @@ impl Compositor {
             .collect();
 
         let base_clear = defaults::base_color_clear();
-        let rm_clear = defaults::rough_metal_clear();
+        let rough_clear = defaults::roughness_clear();
+        let metal_clear = defaults::metallic_clear();
         let nm_clear = defaults::normal_clear();
 
         for t in tile_indices {
@@ -389,10 +410,18 @@ impl Compositor {
                         },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &target.rough_metal_layer_views[t],
+                        view: &target.roughness_layer_views[t],
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(rm_clear),
+                            load: wgpu::LoadOp::Clear(rough_clear),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &target.metallic_layer_views[t],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(metal_clear),
                             store: wgpu::StoreOp::Store,
                         },
                     }),
@@ -435,21 +464,27 @@ impl Compositor {
                         wgpu::BindGroupEntry {
                             binding: 2,
                             resource: wgpu::BindingResource::TextureView(
-                                &layer.rough_metal_layer_views[t],
+                                &layer.roughness_layer_views[t],
                             ),
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
                             resource: wgpu::BindingResource::TextureView(
-                                &layer.normal_layer_views[t],
+                                &layer.metallic_layer_views[t],
                             ),
                         },
                         wgpu::BindGroupEntry {
                             binding: 4,
-                            resource: wgpu::BindingResource::TextureView(mask_view),
+                            resource: wgpu::BindingResource::TextureView(
+                                &layer.normal_layer_views[t],
+                            ),
                         },
                         wgpu::BindGroupEntry {
                             binding: 5,
+                            resource: wgpu::BindingResource::TextureView(mask_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
                             resource: wgpu::BindingResource::Sampler(&self.sampler),
                         },
                     ],

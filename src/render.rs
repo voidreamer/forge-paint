@@ -173,6 +173,7 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // 1: base_color
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -183,6 +184,7 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // 2: roughness (R8 D2Array)
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -193,6 +195,7 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // 3: metallic (R8 D2Array)
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -203,8 +206,7 @@ impl Renderer {
                     },
                     count: None,
                 },
-                // Active layer mask (R8 D2Array) — shown in Mask view mode,
-                // falls back to a dummy all-1.0 array when the layer has no mask.
+                // 4: normal
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -215,19 +217,10 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // 5: active layer mask (R8 D2Array) — dummy all-1.0 when
+                // the layer has no mask.
                 wgpu::BindGroupLayoutEntry {
                     binding: 5,
-                    // Shared by vertex displacement sample + all
-                    // fragment texture samples.
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // World-normal mesh map (Rgba16Float D2Array). Shown in the
-                // WorldNormalBaked view mode and later consumed by smart-mask
-                // generators.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -236,11 +229,28 @@ impl Renderer {
                     },
                     count: None,
                 },
-                // Displacement texture (Rg16Float D2Array). R=height*coverage,
-                // G=coverage. Vertex shader samples to offset vertices along
-                // normal; fragment samples for optional debug view mode.
+                // 6: shared sampler — VERTEX_FRAGMENT because the vertex
+                // shader reads the displacement map.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // 7: world_normal mesh map (Rgba16Float D2Array).
                 wgpu::BindGroupLayoutEntry {
                     binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 8: displacement (Rg16Float D2Array).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },

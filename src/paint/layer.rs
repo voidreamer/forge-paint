@@ -70,9 +70,13 @@ pub struct Layer {
     pub base_color_view: wgpu::TextureView,               // full array view
     pub base_color_layer_views: Vec<wgpu::TextureView>,    // per tile — stamp / sample
 
-    pub rough_metal: wgpu::Texture,
-    pub rough_metal_view: wgpu::TextureView,
-    pub rough_metal_layer_views: Vec<wgpu::TextureView>,
+    pub roughness: wgpu::Texture,
+    pub roughness_view: wgpu::TextureView,
+    pub roughness_layer_views: Vec<wgpu::TextureView>,
+
+    pub metallic: wgpu::Texture,
+    pub metallic_view: wgpu::TextureView,
+    pub metallic_layer_views: Vec<wgpu::TextureView>,
 
     pub normal: wgpu::Texture,
     pub normal_view: wgpu::TextureView,
@@ -181,12 +185,19 @@ impl Layer {
             tile_count,
             wgpu::TextureFormat::Rgba8UnormSrgb,
         );
-        let rough_metal = make_array(
+        let roughness = make_array(
             device,
-            "layer.rough_metal",
+            "layer.roughness",
             resolution,
             tile_count,
-            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::R8Unorm,
+        );
+        let metallic = make_array(
+            device,
+            "layer.metallic",
+            resolution,
+            tile_count,
+            wgpu::TextureFormat::R8Unorm,
         );
         let normal = make_array(
             device,
@@ -197,21 +208,23 @@ impl Layer {
         );
 
         let base_color_view = array_view(&base_color, "layer.base_color.array_view");
-        let rough_metal_view = array_view(&rough_metal, "layer.rough_metal.array_view");
+        let roughness_view = array_view(&roughness, "layer.roughness.array_view");
+        let metallic_view = array_view(&metallic, "layer.metallic.array_view");
         let normal_view = array_view(&normal, "layer.normal.array_view");
 
         let base_color_layer_views: Vec<_> = (0..tile_count)
             .map(|t| tile_view(&base_color, t, "layer.base_color.tile_view"))
             .collect();
-        let rough_metal_layer_views: Vec<_> = (0..tile_count)
-            .map(|t| tile_view(&rough_metal, t, "layer.rough_metal.tile_view"))
+        let roughness_layer_views: Vec<_> = (0..tile_count)
+            .map(|t| tile_view(&roughness, t, "layer.roughness.tile_view"))
+            .collect();
+        let metallic_layer_views: Vec<_> = (0..tile_count)
+            .map(|t| tile_view(&metallic, t, "layer.metallic.tile_view"))
             .collect();
         let normal_layer_views: Vec<_> = (0..tile_count)
             .map(|t| tile_view(&normal, t, "layer.normal.tile_view"))
             .collect();
 
-        // Seed neutral defaults via GPU clear-fill passes — same technique as
-        // the display PaintTarget uses. No host-side buffers.
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("layer.init_fill"),
         });
@@ -222,8 +235,12 @@ impl Layer {
                     crate::paint::target::defaults::base_color_clear(),
                 ),
                 (
-                    &rough_metal_layer_views[t as usize],
-                    crate::paint::target::defaults::rough_metal_clear(),
+                    &roughness_layer_views[t as usize],
+                    crate::paint::target::defaults::roughness_clear(),
+                ),
+                (
+                    &metallic_layer_views[t as usize],
+                    crate::paint::target::defaults::metallic_clear(),
                 ),
                 (
                     &normal_layer_views[t as usize],
@@ -256,9 +273,12 @@ impl Layer {
             base_color,
             base_color_view,
             base_color_layer_views,
-            rough_metal,
-            rough_metal_view,
-            rough_metal_layer_views,
+            roughness,
+            roughness_view,
+            roughness_layer_views,
+            metallic,
+            metallic_view,
+            metallic_layer_views,
             normal,
             normal_view,
             normal_layer_views,
@@ -313,12 +333,19 @@ impl Layer {
             tile_count,
             wgpu::TextureFormat::Rgba8UnormSrgb,
         );
-        let rough_metal = make_array(
+        let roughness = make_array(
             device,
-            "layer.fill.rough_metal",
+            "layer.fill.roughness",
             1,
             tile_count,
-            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::R8Unorm,
+        );
+        let metallic = make_array(
+            device,
+            "layer.fill.metallic",
+            1,
+            tile_count,
+            wgpu::TextureFormat::R8Unorm,
         );
         let normal = make_array(
             device,
@@ -329,20 +356,24 @@ impl Layer {
         );
 
         let base_color_view = array_view(&base_color, "layer.fill.base_color.array_view");
-        let rough_metal_view = array_view(&rough_metal, "layer.fill.rough_metal.array_view");
+        let roughness_view = array_view(&roughness, "layer.fill.roughness.array_view");
+        let metallic_view = array_view(&metallic, "layer.fill.metallic.array_view");
         let normal_view = array_view(&normal, "layer.fill.normal.array_view");
 
         let base_color_layer_views: Vec<_> = (0..tile_count)
             .map(|t| tile_view(&base_color, t, "layer.fill.base_color.tile_view"))
             .collect();
-        let rough_metal_layer_views: Vec<_> = (0..tile_count)
-            .map(|t| tile_view(&rough_metal, t, "layer.fill.rough_metal.tile_view"))
+        let roughness_layer_views: Vec<_> = (0..tile_count)
+            .map(|t| tile_view(&roughness, t, "layer.fill.roughness.tile_view"))
+            .collect();
+        let metallic_layer_views: Vec<_> = (0..tile_count)
+            .map(|t| tile_view(&metallic, t, "layer.fill.metallic.tile_view"))
             .collect();
         let normal_layer_views: Vec<_> = (0..tile_count)
             .map(|t| tile_view(&normal, t, "layer.fill.normal.tile_view"))
             .collect();
 
-        let mut layer = Self {
+        let layer = Self {
             name: name.into(),
             opacity: 1.0,
             visible: true,
@@ -351,9 +382,12 @@ impl Layer {
             base_color,
             base_color_view,
             base_color_layer_views,
-            rough_metal,
-            rough_metal_view,
-            rough_metal_layer_views,
+            roughness,
+            roughness_view,
+            roughness_layer_views,
+            metallic,
+            metallic_view,
+            metallic_layer_views,
             normal,
             normal_view,
             normal_layer_views,
@@ -389,22 +423,18 @@ impl Layer {
             (params.base_color_srgb[2].clamp(0.0, 1.0) * 255.0) as u8,
             255,
         ];
-        // glTF rough_metal packing: R=AO(1), G=roughness, B=metallic.
-        let rm = [
-            255,
-            (params.roughness.clamp(0.0, 1.0) * 255.0) as u8,
-            (params.metallic.clamp(0.0, 1.0) * 255.0) as u8,
-            255,
-        ];
+        let r = [(params.roughness.clamp(0.0, 1.0) * 255.0) as u8];
+        let m = [(params.metallic.clamp(0.0, 1.0) * 255.0) as u8];
         // Flat tangent-space normal — fill layers don't perturb normals.
         let nm = [128u8, 128, 255, 255];
 
         let tiles = self.base_color_layer_views.len() as u32;
         for tile in 0..tiles {
-            for (tex, bytes) in [
-                (&self.base_color, &bc),
-                (&self.rough_metal, &rm),
-                (&self.normal, &nm),
+            for (tex, bytes, bpp) in [
+                (&self.base_color, &bc[..], 4u32),
+                (&self.roughness, &r[..], 1u32),
+                (&self.metallic, &m[..], 1u32),
+                (&self.normal, &nm[..], 4u32),
             ] {
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -420,7 +450,7 @@ impl Layer {
                     bytes,
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(4),
+                        bytes_per_row: Some(bpp),
                         rows_per_image: Some(1),
                     },
                     wgpu::Extent3d {

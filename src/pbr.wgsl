@@ -35,14 +35,15 @@ struct Env {
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(1) @binding(0) var<uniform> material: Material;
 @group(1) @binding(1) var base_color_tex: texture_2d_array<f32>;
-@group(1) @binding(2) var rough_metal_tex: texture_2d_array<f32>;
-@group(1) @binding(3) var normal_tex: texture_2d_array<f32>;
-@group(1) @binding(4) var active_mask_tex: texture_2d_array<f32>;
-@group(1) @binding(5) var texset_sampler: sampler;
-@group(1) @binding(6) var world_normal_map: texture_2d_array<f32>;
+@group(1) @binding(2) var roughness_tex: texture_2d_array<f32>;
+@group(1) @binding(3) var metallic_tex: texture_2d_array<f32>;
+@group(1) @binding(4) var normal_tex: texture_2d_array<f32>;
+@group(1) @binding(5) var active_mask_tex: texture_2d_array<f32>;
+@group(1) @binding(6) var texset_sampler: sampler;
+@group(1) @binding(7) var world_normal_map: texture_2d_array<f32>;
 /// Displacement (Rg16Float D2Array). R = height × coverage, G = coverage.
 /// Final height = R / max(G, eps). Vertex shader reads to offset geometry.
-@group(1) @binding(7) var displacement_tex: texture_2d_array<f32>;
+@group(1) @binding(8) var displacement_tex: texture_2d_array<f32>;
 @group(2) @binding(0) var<uniform> env: Env;
 @group(2) @binding(1) var env_tex: texture_2d<f32>;
 @group(2) @binding(2) var irradiance_tex: texture_2d<f32>;
@@ -238,10 +239,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let bc = textureSample(base_color_tex, texset_sampler, local_uv, layer).rgb;
         base_color = bc * material.base_color_factor.rgb;
 
-        let rm = textureSample(rough_metal_tex, texset_sampler, local_uv, layer);
-        // glTF packing: R=AO (unused Phase 1b), G=roughness, B=metallic
-        roughness = rm.g * material.params.y;
-        metallic = rm.b * material.params.x;
+        roughness = textureSample(roughness_tex, texset_sampler, local_uv, layer).r
+            * material.params.y;
+        metallic = textureSample(metallic_tex, texset_sampler, local_uv, layer).r
+            * material.params.x;
 
         let nn = textureSample(normal_tex, texset_sampler, local_uv, layer).rgb * 2.0 - 1.0;
         n_tangent_space = normalize(nn);
