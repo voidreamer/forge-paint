@@ -863,12 +863,20 @@ impl Viewport {
                 let active = self.layer_stack.active_layer();
                 let has_mask = active.mask.is_some();
 
-                // Erase always routes to the mask. Stencil always writes
-                // to base color (the projection pipeline is baseline-only).
+                // Erase always routes to the mask. Stencil can write to
+                // either base color (default) or displacement (when the
+                // user picks Height on the brush) — the projection
+                // pipeline has a variant for each target format.
                 // Paint / Fill honor mask_edit.
                 let channel = match self.tool {
                     Tool::Erase => PaintChannel::Mask,
-                    Tool::Stencil => PaintChannel::BaseColor,
+                    Tool::Stencil => {
+                        if self.brush.channel == PaintChannel::Displacement {
+                            PaintChannel::Displacement
+                        } else {
+                            PaintChannel::BaseColor
+                        }
+                    }
                     _ => {
                         if self.brush.mask_edit && has_mask {
                             PaintChannel::Mask
@@ -1046,7 +1054,7 @@ impl Viewport {
                                     } else {
                                         0
                                     },
-                                    _pad: 0.0,
+                                    _pad: [0.0; 3],
                                 };
                                 let position_view = self
                                     .mesh_maps

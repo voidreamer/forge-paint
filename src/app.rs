@@ -1500,7 +1500,7 @@ impl App {
                 log::info!("{}", self.status);
             }
             Err(e) => {
-                self.status = format!("Import failed: {e}");
+                self.status = format!("Import failed: {e:#}");
                 log::warn!("{}", self.status);
             }
         }
@@ -1670,7 +1670,7 @@ impl App {
                 self.activate_stencil(idx, frame);
             }
             Err(e) => {
-                self.status = format!("Failed to load stencil: {e}");
+                self.status = format!("Failed to load stencil: {e:#}");
             }
         }
     }

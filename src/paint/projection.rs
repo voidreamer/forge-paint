@@ -31,7 +31,10 @@ pub struct ProjBrushUniforms {
     /// 0 = base color projection (RGBA). 1 = displacement projection
     /// (luminance → height × coverage, coverage packed into RG).
     pub mode: u32,
-    pub _pad: f32,
+    /// Padding to 128 bytes. WGSL rounds the uniform struct's size up
+    /// to the next 16-byte multiple, so `mode` alone (4 B after 112 B
+    /// of real data) would leave the Rust side 8 B short.
+    pub _pad: [f32; 3],
 }
 
 pub struct ProjectionBrushPipeline {
