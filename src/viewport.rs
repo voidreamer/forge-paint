@@ -3,6 +3,7 @@ use egui_wgpu::wgpu;
 use glam::Vec2;
 
 use crate::accel::MeshAccel;
+use crate::background::BackgroundPipeline;
 use crate::bake::{Baker, MeshMaps};
 use crate::camera::OrbitCamera;
 use crate::env::{
@@ -14,7 +15,10 @@ use crate::paint::{
     PaintChannel, PaintTarget,
 };
 use crate::pick;
-use crate::render::{FrameUniforms, Renderer, TonemapMode, ViewMode};
+use crate::fxaa::FxaaPipeline;
+use crate::post::{PostPipeline, PostUniforms};
+use crate::render::{FrameUniforms, Renderer, TonemapMode, ViewMode, HDR_FORMAT, LDR_FORMAT};
+use crate::wireframe::WireframePipeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -45,6 +49,10 @@ impl Tool {
 
 pub struct Viewport {
     renderer: Renderer,
+    background: BackgroundPipeline,
+    post: PostPipeline,
+    pub fxaa: FxaaPipeline,
+    pub wireframe: WireframePipeline,
     brush_pipeline: BrushPipeline,
     compositor: Compositor,
     color: Option<(wgpu::Texture, wgpu::TextureView, [u32; 2])>,
@@ -108,6 +116,11 @@ pub struct Viewport {
     /// stamps between frames so fast drags don't leave gaps.
     last_paint_pos: Option<egui::Pos2>,
 
+    /// Anchor position for the brush-adjust overlay — captured at the
+    /// start of an S/D/F drag so the cursor ring stays put while the
+    /// mouse moves to scrub.
+    adjust_anchor: Option<egui::Pos2>,
+
     /// Stroke-level undo / redo.
     undo_stack: crate::undo::UndoStack,
 
@@ -143,7 +156,13 @@ impl Default for BrushState {
 
 impl Viewport {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, cpu: &CpuMesh) -> Self {
-        let renderer = Renderer::new(device, wgpu::TextureFormat::Bgra8UnormSrgb);
+        let renderer = Renderer::new(device);
+        // Post now writes to the LDR intermediate; FXAA writes to the
+        // egui-facing color texture. Both use Bgra8UnormSrgb.
+        let post = PostPipeline::new(device, LDR_FORMAT);
+        let fxaa = FxaaPipeline::new(device, LDR_FORMAT);
+        let background = BackgroundPipeline::new(device);
+        let wireframe = WireframePipeline::new(device, &renderer.frame_bgl);
         let brush_pipeline = BrushPipeline::new(device);
         let compositor = Compositor::new(device, queue);
         let gpu = GpuMesh::from_cpu(device, cpu);
@@ -189,7 +208,7 @@ impl Viewport {
             &renderer.frame_bgl,
             &renderer.material_bgl,
             &renderer.env_bgl,
-            wgpu::TextureFormat::Bgra8UnormSrgb,
+            HDR_FORMAT,
             wgpu::TextureFormat::Depth32Float,
         );
 
@@ -203,6 +222,10 @@ impl Viewport {
         let accel = MeshAccel::build(cpu);
         Self {
             renderer,
+            background,
+            post,
+            fxaa,
+            wireframe,
             brush_pipeline,
             compositor,
             color: None,
@@ -241,6 +264,7 @@ impl Viewport {
             last_hit_uv: None,
             last_hit_tile: None,
             last_paint_pos: None,
+            adjust_anchor: None,
             undo_stack: crate::undo::UndoStack::default(),
             layer_thumb_cache: Vec::new(),
         }
@@ -459,7 +483,42 @@ impl Viewport {
             && !modifiers.alt;
         let primary_active = response.dragged_by(egui::PointerButton::Primary)
             || response.clicked_by(egui::PointerButton::Primary);
-        let paint_pos = if primary_active && no_mods {
+
+        // Brush-adjust modifier drags — hold S/D/F and drag LMB to scrub
+        // radius/hardness/opacity. Mari-ish workflow. Holding any of them
+        // suppresses the paint path so we don't stroke while tweaking.
+        let (adj_s, adj_d, adj_f) = ui.ctx().input(|i| {
+            (
+                i.key_down(egui::Key::S),
+                i.key_down(egui::Key::D),
+                i.key_down(egui::Key::F),
+            )
+        });
+        let adjust_mode = adj_s || adj_d || adj_f;
+        if primary_active && adjust_mode {
+            // Lock the cursor-ring anchor at wherever the drag started
+            // so the preview stays put while the mouse moves to scrub.
+            if self.adjust_anchor.is_none() {
+                self.adjust_anchor = response
+                    .interact_pointer_pos()
+                    .or_else(|| response.hover_pos());
+            }
+            let dx = response.drag_delta().x;
+            if adj_s {
+                // ~200 px horizontal ≈ 20% of the radius range.
+                self.brush.radius = (self.brush.radius + dx * 0.0008).clamp(0.002, 0.5);
+            }
+            if adj_d {
+                self.brush.hardness = (self.brush.hardness + dx * 0.003).clamp(0.0, 1.0);
+            }
+            if adj_f {
+                self.brush.opacity = (self.brush.opacity + dx * 0.003).clamp(0.0, 1.0);
+            }
+        } else {
+            self.adjust_anchor = None;
+        }
+
+        let paint_pos = if primary_active && no_mods && !adjust_mode {
             response.interact_pointer_pos()
         } else {
             None
@@ -469,6 +528,8 @@ impl Viewport {
             let mut egui_renderer = render_state.renderer.write();
             self.ensure_color(&render_state.device, &mut egui_renderer, w, h);
             self.renderer.ensure_depth(&render_state.device, w, h);
+            self.renderer.ensure_hdr(&render_state.device, w, h);
+            self.renderer.ensure_ldr(&render_state.device, w, h);
 
             let aspect = w as f32 / h as f32;
             let view_proj = self.camera.view_proj(aspect);
@@ -785,6 +846,7 @@ impl Viewport {
                                 layer_view,
                                 channel,
                                 &uniforms,
+                                self.paint_target.resolution,
                             );
                         }
                         // Flatten the stack into the display target before PBR samples it.
@@ -799,15 +861,17 @@ impl Viewport {
                 }
             }
 
-            // PBR render pass
+            // Mesh pass → HDR intermediate (Rgba16Float). The post pass
+            // below reads this and writes the tonemapped result into the
+            // egui-facing color texture.
             {
-                let color_view = &self.color.as_ref().unwrap().1;
+                let hdr_view = self.renderer.hdr_view();
                 let depth_view = self.renderer.depth_view();
 
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("forge_paint_pass"),
+                    label: Some("forge_paint_hdr_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: color_view,
+                        view: hdr_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -834,6 +898,16 @@ impl Viewport {
                 pass.set_bind_group(1, &material_bg, &[]);
                 pass.set_bind_group(2, &self.env.bind_group, &[]);
 
+                // Gradient background first — fills the whole viewport
+                // before anything else lands. Skybox (if visible) and
+                // mesh overwrite it where pixels actually have content.
+                // Skipped in channel-isolation views so the background
+                // doesn't tint the displayed value.
+                if matches!(self.view_mode, ViewMode::Material) {
+                    pass.set_pipeline(&self.background.pipeline);
+                    pass.draw(0..3, 0..1);
+                }
+
                 // Skybox background (optional) — draws at the far plane with
                 // LessEqual depth so the mesh renders over it. Skipped in
                 // channel-isolation view modes so they're easier to read.
@@ -846,6 +920,77 @@ impl Viewport {
                 pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.mesh.index_count, 0, 0..1);
+
+                // Wireframe overlay sits on top of the shaded mesh in
+                // the SAME pass so it gets depth-tested against it.
+                if self.wireframe.visible && matches!(self.view_mode, ViewMode::Material) {
+                    pass.set_pipeline(&self.wireframe.pipeline);
+                    pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(
+                        self.mesh.line_index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..self.mesh.line_index_count, 0, 0..1);
+                }
+            }
+
+            // Post pass: HDR → tonemapped LDR intermediate.
+            {
+                let hdr_view = self.renderer.hdr_view();
+                let ldr_view = self.renderer.ldr_view();
+
+                self.post.write_uniforms(
+                    &render_state.queue,
+                    &PostUniforms {
+                        exposure: (2.0_f32).powf(self.exposure_stops),
+                        view_mode: self.view_mode.as_u32(),
+                        tonemap_mode: self.tonemap_mode.as_u32(),
+                        _pad: 0,
+                    },
+                );
+                let post_bg = self.post.make_bind_group(&render_state.device, hdr_view);
+
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("forge_paint_post_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: ldr_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.post.pipeline);
+                pass.set_bind_group(0, &post_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            // FXAA pass: LDR → final egui viewport texture.
+            {
+                let ldr_view = self.renderer.ldr_view();
+                let color_view = &self.color.as_ref().unwrap().1;
+                self.fxaa.write_uniforms(&render_state.queue);
+                let fxaa_bg = self.fxaa.make_bind_group(&render_state.device, ldr_view);
+
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("forge_paint_fxaa_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: color_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.fxaa.pipeline);
+                pass.set_bind_group(0, &fxaa_bg, &[]);
+                pass.draw(0..3, 0..1);
             }
             render_state.queue.submit(Some(encoder.finish()));
             self.egui_tex_id.unwrap()
@@ -859,15 +1004,50 @@ impl Viewport {
             egui::Color32::WHITE,
         );
 
-        // Brush cursor — ring over the native cursor when the pointer is
-        // hovering the viewport in paint mode (plain LMB, no modifiers).
-        // Size is an approximation of brush.radius in UV → screen space.
-        if response.hovered() && no_mods {
-            if let Some(pos) = response.hover_pos() {
-                let on_mesh = self.last_hit_uv.is_some();
-                let screen_radius = (self.brush.radius * rect.height() * 0.5)
-                    .clamp(4.0, rect.height() * 0.3);
-                let (color, stroke_width) = if on_mesh {
+        // Brush cursor — ring over the cursor in paint mode, or locked
+        // to the adjust anchor while scrubbing brush parameters.
+        if response.hovered() && (no_mods || adjust_mode) {
+            let cursor_pos = if adjust_mode {
+                self.adjust_anchor.or_else(|| response.hover_pos())
+            } else {
+                response.hover_pos()
+            };
+            if let Some(pos) = cursor_pos {
+                // Screen radius from the actual UV gradient at the cursor
+                // — matches the stroke footprint instead of the old
+                // heuristic that assumed "1 UV unit ≈ screen height".
+                // Extra picks at ±offset_px cost ~2 brute-force ray
+                // tests, fine for hover-frequency.
+                let accurate_radius: Option<f32> = (|| {
+                    let aspect = w as f32 / h as f32;
+                    let view_proj = self.camera.view_proj(aspect);
+                    let eye = self.camera.eye();
+                    let offset_px: f32 = 2.0;
+                    let ray_uv = |p: egui::Pos2| -> Option<glam::Vec2> {
+                        if !rect.contains(p) {
+                            return None;
+                        }
+                        let (orig, dir) = pick::screen_to_ray(p, rect, view_proj, eye);
+                        pick::pick(&self.cpu_mesh, orig, dir).map(|h| h.uv)
+                    };
+                    let uv_c = ray_uv(pos)?;
+                    let uv_x = ray_uv(pos + egui::vec2(offset_px, 0.0))?;
+                    let uv_y = ray_uv(pos + egui::vec2(0.0, offset_px))?;
+                    let d_x = (uv_x - uv_c) / offset_px;
+                    let d_y = (uv_y - uv_c) / offset_px;
+                    let px_per_uv_x = 1.0 / d_x.length().max(1e-6);
+                    let px_per_uv_y = 1.0 / d_y.length().max(1e-6);
+                    let avg = 0.5 * (px_per_uv_x + px_per_uv_y);
+                    Some(self.brush.radius * avg)
+                })();
+                let on_mesh = accurate_radius.is_some() || self.last_hit_uv.is_some();
+                let screen_radius = accurate_radius
+                    .unwrap_or(self.brush.radius * rect.height() * 0.5)
+                    .clamp(2.0, rect.height() * 0.4);
+
+                let (color, stroke_width) = if adjust_mode {
+                    (egui::Color32::from_rgb(255, 220, 100), 2.0)
+                } else if on_mesh {
                     if self.brush.mask_edit {
                         (egui::Color32::from_rgb(120, 200, 255), 1.5)
                     } else {
@@ -887,6 +1067,23 @@ impl Viewport {
                         egui::Stroke::new(1.0, color.linear_multiply(0.5)),
                     );
                 }
+                // Live value readout while adjusting.
+                if adjust_mode {
+                    let label = if adj_s {
+                        format!("radius {:.3}", self.brush.radius)
+                    } else if adj_d {
+                        format!("hardness {:.2}", self.brush.hardness)
+                    } else {
+                        format!("opacity {:.2}", self.brush.opacity)
+                    };
+                    painter.text(
+                        pos + egui::vec2(screen_radius + 10.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::monospace(12.0),
+                        color,
+                    );
+                }
             }
         }
 
@@ -900,8 +1097,9 @@ impl Viewport {
             ui.ctx().request_repaint();
         }
 
-        // Keep the redraw going while painting so drags are smooth.
-        if paint_pos.is_some() {
+        // Keep the redraw going while painting or adjusting so drags and
+        // live cursor-ring updates stay smooth.
+        if paint_pos.is_some() || (primary_active && adjust_mode) {
             ui.ctx().request_repaint();
         }
     }

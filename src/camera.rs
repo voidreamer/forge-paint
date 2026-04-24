@@ -36,14 +36,20 @@ impl OrbitCamera {
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
-        let view = Mat4::look_at_rh(self.eye(), self.target, Vec3::Y);
-        let proj = Mat4::perspective_rh(
+        self.proj(aspect) * self.view()
+    }
+
+    pub fn view(&self) -> Mat4 {
+        Mat4::look_at_rh(self.eye(), self.target, Vec3::Y)
+    }
+
+    pub fn proj(&self, aspect: f32) -> Mat4 {
+        Mat4::perspective_rh(
             self.fov_y_deg.to_radians(),
             aspect.max(1e-4),
             self.z_near,
             self.z_far,
-        );
-        proj * view
+        )
     }
 
     /// Modifier-based nav, frees plain LMB for painting.

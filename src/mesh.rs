@@ -37,6 +37,10 @@ pub struct GpuMesh {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub index_count: u32,
+    /// Line-list index buffer — each triangle contributes 3 edges (6
+    /// indices). Used by the wireframe overlay pipeline.
+    pub line_index_buffer: wgpu::Buffer,
+    pub line_index_count: u32,
     pub center: Vec3,
     pub radius: f32,
 }
@@ -55,6 +59,11 @@ impl GpuMesh {
             .collect();
 
         let flat_indices: Vec<u32> = cpu.indices.iter().flatten().copied().collect();
+        let line_indices: Vec<u32> = cpu
+            .indices
+            .iter()
+            .flat_map(|&[a, b, c]| [a, b, b, c, c, a])
+            .collect();
 
         let mut center = Vec3::ZERO;
         for p in &cpu.positions {
@@ -76,11 +85,18 @@ impl GpuMesh {
             contents: bytemuck::cast_slice(&flat_indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let line_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("forge_paint_mesh_wireframe_ib"),
+            contents: bytemuck::cast_slice(&line_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
 
         Self {
             vertex_buffer,
             index_buffer,
             index_count: flat_indices.len() as u32,
+            line_index_buffer,
+            line_index_count: line_indices.len() as u32,
             center,
             radius,
         }

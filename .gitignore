@@ -7,6 +7,12 @@
 /assets/hdri/*.hdr
 /assets/hdri/*.exr
 
+# Default mesh — user-provided. Drop default.usda (or any .usd/.usda) in
+# assets/default_mesh/ and the viewport will open it instead of the cube.
+/assets/default_mesh/*.usd
+/assets/default_mesh/*.usda
+/assets/default_mesh/*.usdc
+
 # Editor
 .vscode/
 .idea/

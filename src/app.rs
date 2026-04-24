@@ -24,8 +24,26 @@ pub struct App {
 
 impl App {
     pub fn new(initial_usd: Option<PathBuf>) -> Self {
+        // CLI path wins. Otherwise fall back to a user-provided default
+        // mesh at assets/default_mesh/default.usda (relative to CWD).
+        // Override the location via FORGE_PAINT_DEFAULT_MESH if you run
+        // the binary from elsewhere.
+        let pending_open = initial_usd.or_else(|| {
+            if let Some(override_path) = std::env::var_os("FORGE_PAINT_DEFAULT_MESH") {
+                let p = PathBuf::from(override_path);
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+            let default_path = PathBuf::from("assets/default_mesh/default.usda");
+            if default_path.exists() {
+                Some(default_path)
+            } else {
+                None
+            }
+        });
         Self {
-            pending_open: initial_usd,
+            pending_open,
             ..Default::default()
         }
     }
@@ -168,7 +186,7 @@ impl eframe::App for App {
                     ui.label(&self.status);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("LMB paint · Ctrl+LMB orbit · Shift+LMB or MMB pan · wheel zoom");
+                    ui.weak("LMB paint · Ctrl+LMB orbit · Shift+LMB or MMB pan · wheel zoom · S/D/F + LMB = brush size/hardness/opacity");
                 });
             });
         });
@@ -663,6 +681,13 @@ fn env_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
             .text("exposure (stops)")
             .show_value(true),
     );
+
+    ui.add_space(6.0);
+    ui.label("Display");
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut vp.fxaa.enabled, "FXAA");
+        ui.checkbox(&mut vp.wireframe.visible, "wireframe");
+    });
 
     if let Some(render_state) = frame.wgpu_render_state() {
         if load_procedural {

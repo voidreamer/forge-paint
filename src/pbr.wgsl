@@ -291,16 +291,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ibl_specular = ibl_spec_raw * (f_ss + fms);
 
     let lit = direct + ibl_diffuse + ibl_specular;
-    let lit_exposed = lit * frame.exposure;
-    let tonemapped = apply_tonemap(lit_exposed, frame.tonemap_mode);
 
-    // View mode override — isolate a channel for debugging / inspection.
-    // The render target is Bgra8UnormSrgb, so the hardware applies sRGB
-    // encoding on store. We output linear values throughout.
+    // View-mode override — isolate a channel for inspection. The PBR pass
+    // writes to an HDR Rgba16Float buffer; the post pass handles exposure
+    // and tonemap for Material view, and passes inspection modes through
+    // unchanged.
     var out_rgb: vec3<f32>;
     switch frame.view_mode {
         case 1u: {
-            // Base color — already linear (sampled from Rgba8UnormSrgb).
+            // Base color — linear.
             out_rgb = base_color;
         }
         case 2u: {
@@ -310,12 +309,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             out_rgb = vec3<f32>(metallic);
         }
         case 4u: {
-            // Visualise the tangent-space normal as the typical (0.5,0.5,1.0)-
-            // biased RGB.
+            // Tangent-space normal, (0.5,0.5,1.0)-biased.
             out_rgb = n_tangent_space * 0.5 + vec3<f32>(0.5);
         }
         case 5u: {
-            // Mask preview — grayscale R of the active layer's mask.
             if layer < 0 {
                 out_rgb = vec3<f32>(0.5);
             } else {
@@ -325,7 +322,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             }
         }
         case 6u: {
-            // World-normal bake preview — stored 0..1 biased, display as RGB.
             if layer < 0 {
                 out_rgb = vec3<f32>(0.5, 0.5, 1.0);
             } else {
@@ -335,7 +331,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             }
         }
         default: {
-            out_rgb = tonemapped;
+            // Material: HDR linear — post will apply exposure + tonemap.
+            out_rgb = lit;
         }
     }
     return vec4<f32>(out_rgb, 1.0);

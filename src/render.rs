@@ -113,10 +113,26 @@ pub struct Renderer {
     pub frame_buf: wgpu::Buffer,
     pub frame_bg: wgpu::BindGroup,
     pub depth: Option<(wgpu::Texture, wgpu::TextureView, [u32; 2])>,
+    /// Rgba16Float HDR intermediate — PBR writes here, the post pass reads.
+    /// Moving tonemap out of pbr.wgsl means we can also layer AO and bloom
+    /// into the post pass later.
+    pub hdr: Option<(wgpu::Texture, wgpu::TextureView, [u32; 2])>,
+    /// Tonemapped LDR intermediate — the post pass writes here and FXAA
+    /// reads it before producing the final viewport texture.
+    pub ldr: Option<(wgpu::Texture, wgpu::TextureView, [u32; 2])>,
 }
 
+/// Target format for the HDR intermediate. Must match what the post pass
+/// samples from.
+pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Target format for the LDR intermediate (post → FXAA chain) and the
+/// final egui viewport texture.
+pub const LDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
+
 impl Renderer {
-    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let color_format = HDR_FORMAT;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pbr.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("pbr.wgsl").into()),
@@ -281,6 +297,8 @@ impl Renderer {
             frame_buf,
             frame_bg,
             depth: None,
+            hdr: None,
+            ldr: None,
         }
     }
 
@@ -301,7 +319,10 @@ impl Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Depth32Float,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                // TEXTURE_BINDING so the post pass (SSAO in E.4) can sample
+                // depth without a separate depth-prepass.
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let view = tex.create_view(&Default::default());
@@ -311,6 +332,66 @@ impl Renderer {
 
     pub fn depth_view(&self) -> &wgpu::TextureView {
         &self.depth.as_ref().expect("ensure_depth first").1
+    }
+
+    pub fn ensure_hdr(&mut self, device: &wgpu::Device, w: u32, h: u32) {
+        let need = match &self.hdr {
+            Some((_, _, s)) => s[0] != w || s[1] != h,
+            None => true,
+        };
+        if need {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("hdr_color"),
+                size: wgpu::Extent3d {
+                    width: w.max(1),
+                    height: h.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: HDR_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            self.hdr = Some((tex, view, [w, h]));
+        }
+    }
+
+    pub fn hdr_view(&self) -> &wgpu::TextureView {
+        &self.hdr.as_ref().expect("ensure_hdr first").1
+    }
+
+    pub fn ensure_ldr(&mut self, device: &wgpu::Device, w: u32, h: u32) {
+        let need = match &self.ldr {
+            Some((_, _, s)) => s[0] != w || s[1] != h,
+            None => true,
+        };
+        if need {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("ldr_color"),
+                size: wgpu::Extent3d {
+                    width: w.max(1),
+                    height: h.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: LDR_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            self.ldr = Some((tex, view, [w, h]));
+        }
+    }
+
+    pub fn ldr_view(&self) -> &wgpu::TextureView {
+        &self.ldr.as_ref().expect("ensure_ldr first").1
     }
 
     pub fn write_frame(&self, queue: &wgpu::Queue, u: &FrameUniforms) {

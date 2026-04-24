@@ -136,6 +136,11 @@ impl BrushPipeline {
 
     /// Stamp a single brush dab onto `layer_view`. Caller is responsible for
     /// passing a view whose format matches the channel's pipeline.
+    ///
+    /// `tile_resolution` is used to compute a scissor rect tight around the
+    /// brush footprint — without it the fragment shader runs over the
+    /// entire tile (millions of fragments) and `discard`s 99%+ of them.
+    /// This is the main reason 4K / 8K painting was slow.
     pub fn stamp(
         &self,
         queue: &wgpu::Queue,
@@ -143,7 +148,29 @@ impl BrushPipeline {
         layer_view: &wgpu::TextureView,
         channel: PaintChannel,
         uniforms: &BrushUniforms,
+        tile_resolution: u32,
     ) {
+        // Fill tool covers the whole tile; radial stamp gets a tight box.
+        let res = tile_resolution as f32;
+        let scissor = if uniforms.uniform_fill == 1 {
+            Some((0u32, 0u32, tile_resolution, tile_resolution))
+        } else {
+            let cx = uniforms.center_uv[0] * res;
+            let cy = uniforms.center_uv[1] * res;
+            // Add 1-pixel margin for rasterization coverage at the edges.
+            let r = uniforms.radius * res + 1.0;
+            let x0 = (cx - r).max(0.0).floor() as u32;
+            let y0 = (cy - r).max(0.0).floor() as u32;
+            let x1 = (cx + r).min(res).ceil() as u32;
+            let y1 = (cy + r).min(res).ceil() as u32;
+            let w = x1.saturating_sub(x0);
+            let h = y1.saturating_sub(y0);
+            if w == 0 || h == 0 {
+                return; // brush footprint lies outside the tile
+            }
+            Some((x0, y0, w, h))
+        };
+
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(uniforms));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("brush_stamp_pass"),
@@ -158,6 +185,9 @@ impl BrushPipeline {
             depth_stencil_attachment: None,
             ..Default::default()
         });
+        if let Some((x, y, w, h)) = scissor {
+            pass.set_scissor_rect(x, y, w, h);
+        }
         pass.set_pipeline(self.pipeline_for(channel));
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..3, 0..1);
