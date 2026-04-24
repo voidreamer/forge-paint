@@ -1308,11 +1308,12 @@ impl App {
                 self.status = format!("Applied '{}' as mask", asset.name);
             }
             AssetAction::SetStencil => {
+                // Auto-bake mesh maps if they're still the empty
+                // placeholder — projection needs the position map, and
+                // having to click a separate Bake button is friction.
                 if !vp.mesh_maps.baked {
-                    self.status = "Bake mesh maps first (Mesh maps panel → Bake) \
-                                   so projection painting has a position map."
-                        .to_string();
-                    return;
+                    vp.bake_mesh_maps(&rs.device, &rs.queue);
+                    log::info!("Auto-baked mesh maps for stencil projection");
                 }
                 vp.active_stencil = Some(idx);
                 vp.tool = Tool::Stencil;
@@ -1359,16 +1360,18 @@ impl App {
             self.status = "No GPU available.".to_string();
             return;
         };
+        // Auto-bake mesh maps on demand — projection needs the position
+        // map, and requiring a manual Bake click is unfriendly.
         let baked = self
             .viewport
             .as_ref()
             .map(|vp| vp.mesh_maps.baked)
-            .unwrap_or(false);
+            .unwrap_or(true);
         if !baked {
-            self.status = "Bake mesh maps first (Mesh maps panel → Bake) \
-                           so projection painting has a position map."
-                .to_string();
-            return;
+            if let Some(vp) = &mut self.viewport {
+                vp.bake_mesh_maps(&rs.device, &rs.queue);
+                log::info!("Auto-baked mesh maps for stencil projection");
+            }
         }
         let mut renderer = rs.renderer.write();
         let result = self.browser.import_texture(
