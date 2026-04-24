@@ -20,6 +20,11 @@ pub struct App {
     uri_buffer: String,
 
     browser: AssetBrowser,
+
+    /// When true, the stencil picker modal is open. Set by the Stencil
+    /// tool button; closed when the user picks a texture, imports a new
+    /// one, or cancels.
+    show_stencil_picker: bool,
 }
 
 impl App {
@@ -175,6 +180,80 @@ impl eframe::App for App {
             if let Some(uri) = load_requested {
                 self.show_uri_dialog = false;
                 self.load_usd(frame, PathBuf::from(uri));
+            }
+        }
+
+        // Stencil picker modal — grid of already-imported textures plus
+        // an Import button for when the user wants a fresh one. Clicking
+        // a thumbnail activates it as the stencil.
+        if self.show_stencil_picker {
+            let mut open = true;
+            let mut picked: Option<usize> = None;
+            let mut want_import = false;
+            let mut want_cancel = false;
+            egui::Window::new("Pick stencil")
+                .open(&mut open)
+                .resizable(true)
+                .default_width(440.0)
+                .default_height(360.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("+ Import new…").clicked() {
+                            want_import = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            want_cancel = true;
+                        }
+                    });
+                    ui.separator();
+                    if self.browser.textures.is_empty() {
+                        ui.weak("No textures imported yet. Click \"+ Import new…\".");
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .id_salt("stencil_picker_scroll")
+                            .show(ui, |ui| {
+                                let columns = 4;
+                                let thumb = egui::vec2(90.0, 90.0);
+                                egui::Grid::new("stencil_picker_grid")
+                                    .num_columns(columns)
+                                    .spacing(egui::vec2(8.0, 8.0))
+                                    .show(ui, |ui| {
+                                        for (i, asset) in
+                                            self.browser.textures.iter().enumerate()
+                                        {
+                                            ui.vertical(|ui| {
+                                                let img = egui::Image::new((
+                                                    asset.thumb_id,
+                                                    thumb,
+                                                ))
+                                                .fit_to_exact_size(thumb)
+                                                .sense(egui::Sense::click());
+                                                if ui.add(img).on_hover_text(&asset.name).clicked()
+                                                {
+                                                    picked = Some(i);
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new(&asset.name).small(),
+                                                );
+                                            });
+                                            if (i + 1) % columns == 0 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                            });
+                    }
+                });
+            if !open || want_cancel {
+                self.show_stencil_picker = false;
+            }
+            if let Some(idx) = picked {
+                self.activate_stencil(idx, frame);
+                self.show_stencil_picker = false;
+            }
+            if want_import {
+                self.open_stencil_dialog(frame);
+                self.show_stencil_picker = false;
             }
         }
 
@@ -1308,35 +1387,27 @@ impl App {
                 self.status = format!("Applied '{}' as mask", asset.name);
             }
             AssetAction::SetStencil => {
-                // Auto-bake mesh maps if they're still the empty
-                // placeholder — projection needs the position map, and
-                // having to click a separate Bake button is friction.
-                if !vp.mesh_maps.baked {
-                    vp.bake_mesh_maps(&rs.device, &rs.queue);
-                    log::info!("Auto-baked mesh maps for stencil projection");
-                }
-                vp.active_stencil = Some(idx);
-                vp.tool = Tool::Stencil;
-                // Fresh stencil starts centered at default transform so
-                // the overlay always shows up predictably.
-                vp.stencil_transform = crate::viewport::StencilTransform::default();
-                self.status = format!(
-                    "Stencil: '{}' · M/R/T + LMB to move/rotate/scale · \
-                    switch tool to exit",
-                    asset.name
-                );
+                // Delegate to the shared helper so the context menu,
+                // the tool-strip picker, and the file-dialog import
+                // path all behave identically. Bail out early since
+                // `rs` borrowed self and `activate_stencil` takes
+                // `&mut self` again.
+                let _ = rs;
+                self.activate_stencil(idx, frame);
+                return;
             }
         }
         log::info!("{}", self.status);
     }
 
-    /// Central tool-switch. Clicking the Stencil button opens a file
-    /// picker; picking a file activates it as the stencil. Switching to
-    /// any non-Stencil tool cancels the active stencil so the user is
-    /// back in normal paint.
-    fn switch_tool(&mut self, tool: Tool, frame: &eframe::Frame) {
+    /// Central tool-switch. Clicking the Stencil button opens the
+    /// picker modal — letting the user reuse already-imported textures
+    /// instead of forcing a file dialog every time. Switching to any
+    /// non-Stencil tool cancels the active stencil so the user is back
+    /// in normal paint.
+    fn switch_tool(&mut self, tool: Tool, _frame: &eframe::Frame) {
         if tool == Tool::Stencil {
-            self.open_stencil_dialog(frame);
+            self.show_stencil_picker = true;
             return;
         }
         if let Some(vp) = &mut self.viewport {
@@ -1345,6 +1416,34 @@ impl App {
             }
             vp.tool = tool;
         }
+        self.show_stencil_picker = false;
+    }
+
+    /// Activate the texture at `idx` in the asset browser as the
+    /// projection stencil. Auto-bakes mesh maps if the position map
+    /// isn't ready yet.
+    fn activate_stencil(&mut self, idx: usize, frame: &eframe::Frame) {
+        let Some(rs) = frame.wgpu_render_state() else {
+            self.status = "No GPU available.".to_string();
+            return;
+        };
+        let name = match self.browser.textures.get(idx) {
+            Some(a) => a.name.clone(),
+            None => return,
+        };
+        if let Some(vp) = &mut self.viewport {
+            if !vp.mesh_maps.baked {
+                vp.bake_mesh_maps(&rs.device, &rs.queue);
+                log::info!("Auto-baked mesh maps for stencil projection");
+            }
+            vp.tool = Tool::Stencil;
+            vp.active_stencil = Some(idx);
+            vp.stencil_transform = crate::viewport::StencilTransform::default();
+        }
+        self.status = format!(
+            "Stencil: '{}' · M/R/T + LMB to move/rotate/scale",
+            name
+        );
     }
 
     fn open_stencil_dialog(&mut self, frame: &eframe::Frame) {
@@ -1384,17 +1483,7 @@ impl App {
         match result {
             Ok(()) => {
                 let idx = self.browser.textures.len() - 1;
-                let name = self.browser.textures[idx].name.clone();
-                if let Some(vp) = &mut self.viewport {
-                    vp.tool = Tool::Stencil;
-                    vp.active_stencil = Some(idx);
-                    vp.stencil_transform =
-                        crate::viewport::StencilTransform::default();
-                }
-                self.status = format!(
-                    "Stencil: '{}' · M/R/T + LMB to move/rotate/scale",
-                    name
-                );
+                self.activate_stencil(idx, frame);
             }
             Err(e) => {
                 self.status = format!("Failed to load stencil: {e}");
