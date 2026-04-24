@@ -8,6 +8,253 @@ use std::path::{Path, PathBuf};
 
 use crate::paint::Layer;
 
+/// Cheap string-match against the `exr` crate's error message for the
+/// DWAA/DWAB case. The crate prints something like
+/// `"yet unimplemented compression method: dwaa compression"` so both
+/// "dwa" and "not supported" are reasonable markers. Using string match
+/// (instead of matching on the concrete error variant) keeps us robust
+/// if the exr crate reshapes its error types in minor releases.
+fn looks_like_unsupported_dwa(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("dwa")
+        || (lower.contains("not supported") && lower.contains("compression"))
+        || lower.contains("unimplemented compression")
+}
+
+/// Run an external tool (oiiotool first, ffmpeg as fallback) to transcode
+/// a DWA-compressed EXR into a ZIP-compressed EXR the `exr` crate can
+/// read. Returns the path of the produced temp file on success — the
+/// caller is responsible for deleting it.
+fn transcode_dwa_to_zip(src: &Path) -> Result<PathBuf> {
+    use std::process::Command;
+
+    // Derive a unique-ish temp path. std::env::temp_dir() + PID + file
+    // stem keeps parallel imports from fighting over the same file.
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "asset".into());
+    let tmp = std::env::temp_dir().join(format!(
+        "forge-paint-dwa-{}-{}.exr",
+        std::process::id(),
+        stem
+    ));
+
+    // oiiotool: preserves all channels and layers; the preferred path.
+    //   oiiotool <src> --compression zip -o <dst>
+    let oiio = Command::new("oiiotool")
+        .arg(src)
+        .arg("--compression")
+        .arg("zip")
+        .arg("-o")
+        .arg(&tmp)
+        .output();
+    if let Ok(out) = oiio {
+        if out.status.success() && tmp.exists() {
+            log::info!(
+                "DWA EXR transcoded via oiiotool: {} -> {}",
+                src.display(),
+                tmp.display()
+            );
+            return Ok(tmp);
+        }
+        log::warn!(
+            "oiiotool transcode failed ({}). stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    // ffmpeg fallback: flattens multi-channel / multi-layer EXRs to RGBA,
+    // which is fine for asset browser imports.
+    //   ffmpeg -y -i <src> -compression zip1 <dst>
+    let ff = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(src)
+        .arg("-compression")
+        .arg("zip1")
+        .arg(&tmp)
+        .output();
+    if let Ok(out) = ff {
+        if out.status.success() && tmp.exists() {
+            log::info!(
+                "DWA EXR transcoded via ffmpeg: {} -> {}",
+                src.display(),
+                tmp.display()
+            );
+            return Ok(tmp);
+        }
+        log::warn!(
+            "ffmpeg transcode failed ({}). stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    Err(anyhow!(
+        "neither `oiiotool` (OpenImageIO) nor `ffmpeg` could transcode the file; \
+         install either tool (macOS: brew install openimageio / ffmpeg)"
+    ))
+}
+
+/// Read an EXR file into an sRGB-encoded RGBA8 buffer, bypassing the
+/// `image` crate's stricter wrapper so we handle the files Poly Haven
+/// actually ships: single-channel luminance (Y), 8K normal RGB, and
+/// arbitrary channel layouts. DWAA/DWAB-compressed files still fail
+/// (exr 1.74 can't decode them); we surface a clear error for those.
+///
+/// The result is linear float → sRGB 8-bit, clamped to [0, 1]. Float
+/// HDR values > 1 get clipped — fine for asset-browser thumbnails and
+/// for stamping as base color / roughness / metallic where channels
+/// are 8-bit anyway.
+fn load_exr_rgba8(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
+    use exr::prelude::*;
+
+    // Fast path — stock exr read. On failure, check whether it tripped on
+    // DWAA/DWAB compression (which exr 1.74 doesn't decode yet). If so,
+    // transparently transcode to a ZIP-compressed temp file via oiiotool
+    // or ffmpeg and retry. Keeps zero C/C++ build deps at the cost of a
+    // subprocess per DWA file; Poly Haven-sized assets transcode in ~1s
+    // and the temp file is deleted after the re-read.
+    let image = match read_first_flat_layer_from_file(path) {
+        Ok(img) => img,
+        Err(e) => {
+            let msg = e.to_string();
+            if looks_like_unsupported_dwa(&msg) {
+                match transcode_dwa_to_zip(path) {
+                    Ok(tmp) => {
+                        let result = read_first_flat_layer_from_file(&tmp);
+                        let _ = std::fs::remove_file(&tmp);
+                        result.map_err(|e2| {
+                            anyhow!(
+                                "EXR {}: transcoded via external tool but re-read still failed: {e2}",
+                                path.display()
+                            )
+                        })?
+                    }
+                    Err(transcode_err) => {
+                        return Err(anyhow!(
+                            "EXR {}: uses DWAA/DWAB compression, which the exr 1.74 Rust crate \
+                             doesn't support. Install `oiiotool` (brew install openimageio) or \
+                             `ffmpeg` so forge-paint can auto-transcode to ZIP on import, or \
+                             re-export the file as ZIP / PIZ (or PNG) manually. \n\
+                             Transcode attempt: {transcode_err}\nExr error: {msg}",
+                            path.display()
+                        ));
+                    }
+                }
+            } else {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("read EXR {}", path.display())));
+            }
+        }
+    };
+
+    // Use the layer's own size (matches the actual channel sample count);
+    // attributes.display_window can differ from data_window in exotic
+    // crops and would mislead per-pixel iteration below.
+    let size = image.layer_data.size;
+    let w = size.width() as u32;
+    let h = size.height() as u32;
+    let total = (w as usize) * (h as usize);
+
+    let channels = &image.layer_data.channel_data.list;
+    if channels.is_empty() {
+        return Err(anyhow!("EXR {}: no channels", path.display()));
+    }
+
+    // Pull each channel's samples into a contiguous Vec<f32> so the
+    // per-pixel assembly loop below indexes by flat pixel index without
+    // caring about f16 vs f32 vs u32 storage.
+    let channel_f32: Vec<(String, Vec<f32>)> = channels
+        .iter()
+        .map(|ch| {
+            let name = ch.name.to_string();
+            let v: Vec<f32> = match &ch.sample_data {
+                FlatSamples::F16(v) => v.iter().map(|s| s.to_f32()).collect(),
+                FlatSamples::F32(v) => v.clone(),
+                FlatSamples::U32(v) => v.iter().map(|&s| s as f32).collect(),
+            };
+            (name, v)
+        })
+        .collect();
+
+    let find = |target: &str| -> Option<usize> {
+        channel_f32
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(target))
+    };
+    let r_idx = find("R");
+    let g_idx = find("G");
+    let b_idx = find("B");
+    let a_idx = find("A");
+    let y_idx = find("Y").or_else(|| find("L")).or_else(|| find("Luminance"));
+
+    // Single-channel fallback: if no R/G/B and no Y, replicate the first
+    // channel as grayscale. Matches ArmorPaint's behavior for arbitrary
+    // scalar maps (often what Poly Haven's metalness/AO exports look like).
+    let scalar_only = r_idx.is_none() && g_idx.is_none() && b_idx.is_none();
+    let fallback_idx = if scalar_only && y_idx.is_none() {
+        Some(0usize)
+    } else {
+        None
+    };
+
+    let mut rgba = vec![0u8; total * 4];
+    let to_srgb_byte = |linear: f32| -> u8 {
+        let v = linear.clamp(0.0, 1.0);
+        let c = if v < 0.003_130_8 {
+            v * 12.92
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        };
+        (c * 255.0 + 0.5) as u8
+    };
+
+    for i in 0..total {
+        let (rf, gf, bf) = if let Some(yi) = y_idx.or(fallback_idx) {
+            let v = channel_f32[yi].1.get(i).copied().unwrap_or(0.0);
+            (v, v, v)
+        } else {
+            (
+                r_idx.map(|ci| channel_f32[ci].1.get(i).copied().unwrap_or(0.0)).unwrap_or(0.0),
+                g_idx.map(|ci| channel_f32[ci].1.get(i).copied().unwrap_or(0.0)).unwrap_or(0.0),
+                b_idx.map(|ci| channel_f32[ci].1.get(i).copied().unwrap_or(0.0)).unwrap_or(0.0),
+            )
+        };
+        let af = a_idx
+            .map(|ci| channel_f32[ci].1.get(i).copied().unwrap_or(1.0))
+            .unwrap_or(1.0);
+
+        rgba[i * 4] = to_srgb_byte(rf);
+        rgba[i * 4 + 1] = to_srgb_byte(gf);
+        rgba[i * 4 + 2] = to_srgb_byte(bf);
+        rgba[i * 4 + 3] = (af.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    }
+
+    Ok((w, h, rgba))
+}
+
+fn decode_texture_rgba8(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
+    // EXRs go through our custom loader so Poly Haven's single-channel
+    // and 8K-sized normals decode. PNG / JPG / HDR stay on the `image`
+    // crate which handles them fine.
+    let is_exr = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("exr"))
+        .unwrap_or(false);
+    if is_exr {
+        load_exr_rgba8(path)
+    } else {
+        let img = image::open(path)
+            .with_context(|| format!("open image {}", path.display()))?
+            .to_rgba8();
+        let (w, h) = img.dimensions();
+        Ok((w, h, img.into_raw()))
+    }
+}
+
 /// A single imported texture — kept in CPU memory so we can re-upload to
 /// Layer textures at any tile resolution, and mirrored to a GPU texture for
 /// the thumbnail preview in the browser.
@@ -77,11 +324,7 @@ impl AssetBrowser {
         queue: &wgpu::Queue,
         renderer: &mut egui_wgpu::Renderer,
     ) -> Result<()> {
-        let img = image::open(path)
-            .with_context(|| format!("open image {}", path.display()))?
-            .to_rgba8();
-        let (w, h) = img.dimensions();
-        let pixels = img.into_raw();
+        let (w, h, pixels) = decode_texture_rgba8(path)?;
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("asset.texture"),

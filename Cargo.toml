@@ -23,6 +23,10 @@ anyhow = "1"
 thiserror = "2"
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }
+# exr is pulled in directly so we can bypass the `image` crate's strict
+# channel/memory assumptions (needed for Poly Haven single-channel and 8K
+# normal-map EXRs).
+exr = "1.74"
 half = { version = "2", features = ["bytemuck"] }
 clap = { version = "4", features = ["derive"] }
 

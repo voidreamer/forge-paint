@@ -1048,6 +1048,7 @@ dependencies = [
  "half",
  "lebe",
  "miniz_oxide",
+ "rayon-core",
  "smallvec",
  "zune-inflate",
 ]
@@ -1150,6 +1151,7 @@ dependencies = [
  "egui-phosphor",
  "egui-wgpu",
  "env_logger",
+ "exr",
  "glam",
  "half",
  "image",
