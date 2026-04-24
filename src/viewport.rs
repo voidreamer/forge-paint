@@ -126,6 +126,14 @@ pub struct Viewport {
     pub metallic_factor: f32,
     pub roughness_factor: f32,
     pub normal_scale: f32,
+    /// Multiplier applied to the painted height when vertex-displacing
+    /// the mesh. 0 = display disabled (paint data still persists).
+    pub displacement_scale: f32,
+    /// How many midpoint subdivisions to apply to the display mesh.
+    /// Picking + paint UV still use the *base* mesh; this only changes
+    /// the rendered geometry so vertex displacement has fine enough
+    /// resolution to look smooth.
+    pub subdivision_level: u32,
 
     // Lighting
     pub light_intensity: f32,
@@ -293,6 +301,8 @@ impl Viewport {
             metallic_factor: 1.0,
             roughness_factor: 1.0,
             normal_scale: 1.0,
+            displacement_scale: 0.0,
+            subdivision_level: 0,
             light_intensity: 3.0,
             light_dir: [-0.4, -1.0, -0.3],
             view_mode: ViewMode::Material,
@@ -343,6 +353,21 @@ impl Viewport {
         // Thumbnail TextureIds from the old stack point to textures that have
         // been dropped — we leak the egui slots here (rare enough to ignore).
         self.layer_thumb_cache.clear();
+    }
+
+    /// Rebuild the display GpuMesh by midpoint-subdividing the base
+    /// cpu_mesh `level` times. Picking / paint UV still use the base
+    /// mesh — this only adds geometry so vertex displacement has
+    /// resolution to work with.
+    pub fn set_subdivision(&mut self, device: &wgpu::Device, level: u32) {
+        let level = level.min(4);
+        self.subdivision_level = level;
+        let subdivided = if level == 0 {
+            self.cpu_mesh.clone()
+        } else {
+            crate::mesh::subdivide(&self.cpu_mesh, level)
+        };
+        self.mesh = GpuMesh::from_cpu(device, &subdivided);
     }
 
     /// Bake mesh maps (currently: world normal) for the loaded mesh.
@@ -642,6 +667,7 @@ impl Viewport {
                 self.metallic_factor,
                 self.roughness_factor,
                 self.normal_scale,
+                self.displacement_scale,
             );
             render_state.queue.write_buffer(
                 &self.material_buf,
@@ -710,6 +736,12 @@ impl Viewport {
                                 binding: 6,
                                 resource: wgpu::BindingResource::TextureView(
                                     &self.mesh_maps.world_normal_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.paint_target.displacement_view,
                                 ),
                             },
                         ],
@@ -861,8 +893,10 @@ impl Viewport {
 
                     if !stamps.is_empty() {
                         // Snapshot BEFORE the stamp lands so Cmd+Z rolls back.
-                        // Only at stroke start.
-                        if stroke_starting {
+                        // Only at stroke start. Displacement lives on
+                        // PaintTarget in v0 — outside the per-Layer
+                        // snapshot machinery — so we skip undo for it.
+                        if stroke_starting && channel != PaintChannel::Displacement {
                             let kind = crate::undo::snapshot_kind_for_stamp(
                                 channel,
                                 matches!(channel, PaintChannel::Mask),
@@ -895,6 +929,12 @@ impl Viewport {
                                 // feathering comes from the brush's falloff.
                                 let v = if value >= 0.5 { 1.0 } else { 0.0 };
                                 [v, v, v]
+                            }
+                            PaintChannel::Displacement => {
+                                // Shader writes (r*a, g*a, b*a, a). We want
+                                // (value*a, 1*a, 0, a) on the Rg16Float
+                                // target → R=height*coverage, G=coverage.
+                                [value, 1.0, 0.0]
                             }
                         };
                         let uniform_fill = if self.tool == Tool::Fill { 1u32 } else { 0u32 };
@@ -949,6 +989,12 @@ impl Viewport {
                                 }
                                 PaintChannel::Mask => {
                                     &active.mask.as_ref().unwrap().layer_views[*layer as usize]
+                                }
+                                PaintChannel::Displacement => {
+                                    // Displacement lives on PaintTarget
+                                    // for v0, not per-Layer.
+                                    &self.paint_target.displacement_layer_views
+                                        [*layer as usize]
                                 }
                             };
 
@@ -1027,19 +1073,23 @@ impl Viewport {
                         // frame — full recomposite runs on layer-property
                         // changes, not per paint frame. De-dupe before the
                         // composite call since drag interpolation usually
-                        // lands repeated tile indices.
-                        let mut dirty: Vec<usize> =
-                            stamps.iter().map(|(l, _, _)| *l as usize).collect();
-                        dirty.sort_unstable();
-                        dirty.dedup();
-                        self.compositor.run_sparse(
-                            &render_state.device,
-                            &render_state.queue,
-                            &mut encoder,
-                            &self.layer_stack,
-                            &self.paint_target,
-                            &dirty,
-                        );
+                        // lands repeated tile indices. Displacement is
+                        // painted directly onto paint_target outside the
+                        // layer stack, so no composite is needed for it.
+                        if channel != PaintChannel::Displacement {
+                            let mut dirty: Vec<usize> =
+                                stamps.iter().map(|(l, _, _)| *l as usize).collect();
+                            dirty.sort_unstable();
+                            dirty.dedup();
+                            self.compositor.run_sparse(
+                                &render_state.device,
+                                &render_state.queue,
+                                &mut encoder,
+                                &self.layer_stack,
+                                &self.paint_target,
+                                &dirty,
+                            );
+                        }
                     }
                 }
             }

@@ -51,6 +51,14 @@ pub struct PaintTarget {
     pub normal_view: wgpu::TextureView,
     pub normal_layer_views: Vec<wgpu::TextureView>,
 
+    /// Scalar height buffer — R16Float keeps the HDR range we need for
+    /// projected displacement maps without quadrupling the per-tile VRAM.
+    /// R = accumulated displacement value (premultiplied), G = coverage.
+    /// Final sampled height = R / max(G, epsilon).
+    pub displacement: wgpu::Texture,
+    pub displacement_view: wgpu::TextureView,
+    pub displacement_layer_views: Vec<wgpu::TextureView>,
+
     pub sampler: wgpu::Sampler,
 
     /// Shared fully-visible mask bound when the active layer has none. D2Array
@@ -112,10 +120,21 @@ impl PaintTarget {
             layer_count,
             wgpu::TextureFormat::Rgba8Unorm,
         );
+        // Rg16Float = 4 bytes/texel. R = premultiplied height, G = coverage.
+        // Stored separately so the brush can composite signed height
+        // changes (Rgba8-style premultiplied alpha in 16-bit precision).
+        let displacement = create_array_texture(
+            device,
+            "paint.displacement",
+            resolution,
+            layer_count,
+            wgpu::TextureFormat::Rg16Float,
+        );
 
         let base_color_view = make_array_view(&base_color);
         let rough_metal_view = make_array_view(&rough_metal);
         let normal_view = make_array_view(&normal);
+        let displacement_view = make_array_view(&displacement);
 
         // Per-layer views for render-attachment stamping on base_color and rough_metal.
         let base_color_layer_views: Vec<wgpu::TextureView> = (0..layer_count)
@@ -144,6 +163,17 @@ impl PaintTarget {
             .map(|layer| {
                 normal.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("paint.normal.layer_view"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let displacement_layer_views: Vec<wgpu::TextureView> = (0..layer_count)
+            .map(|layer| {
+                displacement.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("paint.displacement.layer_view"),
                     dimension: Some(wgpu::TextureViewDimension::D2),
                     base_array_layer: layer,
                     array_layer_count: Some(1),
@@ -189,6 +219,11 @@ impl PaintTarget {
             fills.push((make_layer_view(&base_color, layer), bc_clear));
             fills.push((make_layer_view(&rough_metal, layer), rm_clear));
             fills.push((make_layer_view(&normal, layer), nm_clear));
+            // Displacement: R=height, G=coverage — both 0 = no displacement.
+            fills.push((
+                make_layer_view(&displacement, layer),
+                wgpu::Color::TRANSPARENT,
+            ));
         }
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -292,6 +327,9 @@ impl PaintTarget {
             normal,
             normal_view,
             normal_layer_views,
+            displacement,
+            displacement_view,
+            displacement_layer_views,
             sampler,
             dummy_mask,
             dummy_mask_view,
@@ -307,10 +345,11 @@ impl PaintTarget {
         metallic: f32,
         roughness: f32,
         normal_scale: f32,
+        displacement_scale: f32,
     ) -> MaterialUniforms {
         let mut u = MaterialUniforms::default();
         u.base_color_factor = base_color_factor;
-        u.params = [metallic, roughness, normal_scale, 0.0];
+        u.params = [metallic, roughness, normal_scale, displacement_scale];
         u.tile_count = self.tiles.len() as u32;
         for (i, &tid) in self.tiles.iter().enumerate() {
             u.tile_ids[i / 4][i % 4] = tid;

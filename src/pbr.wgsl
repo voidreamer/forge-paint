@@ -40,6 +40,9 @@ struct Env {
 @group(1) @binding(4) var active_mask_tex: texture_2d_array<f32>;
 @group(1) @binding(5) var texset_sampler: sampler;
 @group(1) @binding(6) var world_normal_map: texture_2d_array<f32>;
+/// Displacement (Rg16Float D2Array). R = height × coverage, G = coverage.
+/// Final height = R / max(G, eps). Vertex shader reads to offset geometry.
+@group(1) @binding(7) var displacement_tex: texture_2d_array<f32>;
 @group(2) @binding(0) var<uniform> env: Env;
 @group(2) @binding(1) var env_tex: texture_2d<f32>;
 @group(2) @binding(2) var irradiance_tex: texture_2d<f32>;
@@ -66,8 +69,27 @@ struct VsOut {
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
-    out.clip_pos = frame.view_proj * vec4<f32>(in.position, 1.0);
-    out.world_pos = in.position;
+    // Sample displacement at the vertex's UV, decode premultiplied
+    // (R=h*coverage, G=coverage) by dividing, offset along normal.
+    // params.w = displacement_scale (user-controlled in the Material
+    // factors panel).
+    var position = in.position;
+    let layer = uv_to_layer(in.uv);
+    if layer >= 0 && material.params.w != 0.0 {
+        let local_uv = fract(in.uv);
+        let d = textureSampleLevel(
+            displacement_tex,
+            texset_sampler,
+            local_uv,
+            layer,
+            0.0,
+        );
+        let coverage = max(d.g, 1e-4);
+        let height = d.r / coverage;
+        position = position + normalize(in.normal) * height * material.params.w;
+    }
+    out.clip_pos = frame.view_proj * vec4<f32>(position, 1.0);
+    out.world_pos = position;
     out.world_normal = in.normal;
     out.world_tangent = in.tangent;
     out.uv = in.uv;

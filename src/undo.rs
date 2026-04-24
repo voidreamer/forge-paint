@@ -208,6 +208,11 @@ pub fn snapshot_kind_for_stamp(
             PaintChannel::BaseColor => SnapshotKind::BaseColor,
             PaintChannel::Roughness | PaintChannel::Metallic => SnapshotKind::RoughMetal,
             PaintChannel::Mask => SnapshotKind::Mask,
+            // Displacement lives on PaintTarget in v0, outside the
+            // per-layer snapshot machinery. Undo is a follow-up; for
+            // now we route to BaseColor so the match is exhaustive —
+            // callers should skip push_pre_stroke for this channel.
+            PaintChannel::Displacement => SnapshotKind::BaseColor,
         }
     }
 }

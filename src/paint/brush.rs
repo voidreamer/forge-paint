@@ -20,6 +20,9 @@ pub enum PaintChannel {
     Roughness,
     Metallic,
     Mask,
+    /// Scalar height, accumulated premultiplied into R (value × coverage)
+    /// + G (coverage). Final sampled height = R / max(G, ε).
+    Displacement,
 }
 
 pub struct BrushPipeline {
@@ -31,6 +34,8 @@ pub struct BrushPipeline {
     pub metallic: wgpu::RenderPipeline,
     /// Writes an R8Unorm layer mask.
     pub mask: wgpu::RenderPipeline,
+    /// Writes Rg16Float displacement (R=height, G=coverage).
+    pub displacement: wgpu::RenderPipeline,
 
     pub bgl: wgpu::BindGroupLayout,
     pub uniform_buf: wgpu::Buffer,
@@ -113,12 +118,25 @@ impl BrushPipeline {
             wgpu::ColorWrites::ALL,
             "brush_pipe_mask",
         );
+        // Displacement target is Rg16Float — the shader writes
+        // (value*a, 1*a, 0, a); the RG channels of that are exactly
+        // (height*coverage, coverage) which is what the PBR vertex
+        // shader divides to reconstruct the composed height.
+        let displacement = make_pipeline(
+            device,
+            &shader,
+            &pipeline_layout,
+            wgpu::TextureFormat::Rg16Float,
+            wgpu::ColorWrites::ALL,
+            "brush_pipe_displacement",
+        );
 
         Self {
             base_color,
             roughness,
             metallic,
             mask,
+            displacement,
             bgl,
             uniform_buf,
             bind_group,
@@ -131,6 +149,7 @@ impl BrushPipeline {
             PaintChannel::Roughness => &self.roughness,
             PaintChannel::Metallic => &self.metallic,
             PaintChannel::Mask => &self.mask,
+            PaintChannel::Displacement => &self.displacement,
         }
     }
 
