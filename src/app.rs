@@ -31,6 +31,37 @@ pub struct App {
     /// auto-import everything there so the user doesn't have to click
     /// "+ Import" for bundled assets.
     asset_scan_done: bool,
+
+    /// When `Some`, the material slot picker modal is open. The value
+    /// tracks which channel the picked texture should be assigned to.
+    show_slot_picker: Option<MaterialSlot>,
+}
+
+/// Which channel a material-slot assignment should target on the
+/// active layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterialSlot {
+    BaseColor,
+    Roughness,
+    Metallic,
+    Normal,
+}
+
+impl MaterialSlot {
+    fn label(self) -> &'static str {
+        match self {
+            MaterialSlot::BaseColor => "Base color",
+            MaterialSlot::Roughness => "Roughness",
+            MaterialSlot::Metallic => "Metallic",
+            MaterialSlot::Normal => "Normal",
+        }
+    }
+    const ALL: &'static [MaterialSlot] = &[
+        MaterialSlot::BaseColor,
+        MaterialSlot::Roughness,
+        MaterialSlot::Metallic,
+        MaterialSlot::Normal,
+    ];
 }
 
 impl App {
@@ -272,6 +303,78 @@ impl eframe::App for App {
             }
         }
 
+        // Material slot picker — same grid as the stencil picker but
+        // clicking a texture routes it to whichever channel the user
+        // selected in the Material section.
+        if let Some(slot) = self.show_slot_picker {
+            let mut open = true;
+            let mut picked: Option<usize> = None;
+            let mut want_cancel = false;
+            egui::Window::new(format!("Assign {} texture", slot.label()))
+                .open(&mut open)
+                .resizable(true)
+                .default_width(440.0)
+                .default_height(360.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            want_cancel = true;
+                        }
+                    });
+                    ui.separator();
+                    if self.browser.textures.is_empty() {
+                        ui.weak(
+                            "No textures imported yet. Use + Import in the \
+                             bottom asset browser first.",
+                        );
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .id_salt("slot_picker_scroll")
+                            .show(ui, |ui| {
+                                let columns = 4;
+                                let thumb = egui::vec2(90.0, 90.0);
+                                egui::Grid::new("slot_picker_grid")
+                                    .num_columns(columns)
+                                    .spacing(egui::vec2(8.0, 8.0))
+                                    .show(ui, |ui| {
+                                        for (i, asset) in
+                                            self.browser.textures.iter().enumerate()
+                                        {
+                                            ui.vertical(|ui| {
+                                                let img = egui::Image::new((
+                                                    asset.thumb_id,
+                                                    thumb,
+                                                ))
+                                                .fit_to_exact_size(thumb)
+                                                .sense(egui::Sense::click());
+                                                if ui
+                                                    .add(img)
+                                                    .on_hover_text(&asset.name)
+                                                    .clicked()
+                                                {
+                                                    picked = Some(i);
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new(&asset.name).small(),
+                                                );
+                                            });
+                                            if (i + 1) % columns == 0 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                            });
+                    }
+                });
+            if !open || want_cancel {
+                self.show_slot_picker = None;
+            }
+            if let Some(idx) = picked {
+                self.apply_slot(slot, idx, frame);
+                self.show_slot_picker = None;
+            }
+        }
+
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.status.is_empty() {
@@ -322,6 +425,7 @@ impl eframe::App for App {
             self.switch_tool(t, frame);
         }
 
+        let mut slot_clicked: Option<MaterialSlot> = None;
         egui::SidePanel::right("props")
             .resizable(true)
             .default_width(320.0)
@@ -344,6 +448,11 @@ impl eframe::App for App {
                                 .show(ui, |ui| {
                                     paint_target_section(ui, vp, frame, &mut self.status)
                                 });
+                            egui::CollapsingHeader::new("Material")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    slot_clicked = material_slots_section(ui, vp);
+                                });
                             egui::CollapsingHeader::new("Material factors")
                                 .default_open(false)
                                 .show(ui, |ui| material_factors_section(ui, vp));
@@ -353,6 +462,12 @@ impl eframe::App for App {
                         }
                     });
             });
+        // If the user clicked a slot's "Assign…" button, queue the
+        // picker modal to open next frame. (The modal lives near the
+        // URI dialog block above; see show_slot_picker below.)
+        if let Some(slot) = slot_clicked {
+            self.show_slot_picker = Some(slot);
+        }
 
         // Resolve the active stencil's GPU view + metadata up front,
         // outside the mutable borrow of viewport inside the CentralPanel
@@ -995,6 +1110,31 @@ fn paint_target_section(
         });
 }
 
+fn material_slots_section(ui: &mut egui::Ui, vp: &Viewport) -> Option<MaterialSlot> {
+    let mut clicked: Option<MaterialSlot> = None;
+    let active_name = vp.layer_stack.layers[vp.layer_stack.active].name.clone();
+    ui.weak(format!("Active layer: {}", active_name));
+    ui.add_space(4.0);
+    egui::Grid::new("material_slots_grid")
+        .num_columns(2)
+        .spacing(egui::vec2(8.0, 4.0))
+        .show(ui, |ui| {
+            for &slot in MaterialSlot::ALL {
+                ui.label(slot.label());
+                if ui.button("Assign…").clicked() {
+                    clicked = Some(slot);
+                }
+                ui.end_row();
+            }
+        });
+    ui.add_space(4.0);
+    ui.weak(
+        "Clicking Assign uploads the picked texture into the active layer's \
+         channel. Layers + masks compose on top.",
+    );
+    clicked
+}
+
 fn material_factors_section(ui: &mut egui::Ui, vp: &mut Viewport) {
     ui.horizontal(|ui| {
         ui.label("base color ×");
@@ -1606,6 +1746,55 @@ impl App {
     /// Activate the texture at `idx` in the asset browser as the
     /// projection stencil. Auto-bakes mesh maps if the position map
     /// isn't ready yet.
+    /// Upload the texture at `idx` in the asset browser into the active
+    /// layer's channel that corresponds to `slot`, then recomposite.
+    fn apply_slot(&mut self, slot: MaterialSlot, idx: usize, frame: &eframe::Frame) {
+        let Some(rs) = frame.wgpu_render_state() else {
+            self.status = "No GPU available.".to_string();
+            return;
+        };
+        let Some(asset) = self.browser.textures.get(idx) else {
+            return;
+        };
+        let Some(vp) = &mut self.viewport else {
+            return;
+        };
+        let tile_count = vp.paint_target().tiles.len() as u32;
+        let res = vp.tile_resolution();
+        let active_idx = vp.layer_stack.active;
+        let layer = &vp.layer_stack.layers[active_idx];
+        let result = match slot {
+            MaterialSlot::BaseColor => {
+                assets::apply_as_base_color(&rs.queue, asset, layer, tile_count, res)
+            }
+            MaterialSlot::Roughness => {
+                assets::apply_as_roughness(&rs.queue, asset, layer, tile_count, res)
+            }
+            MaterialSlot::Metallic => {
+                assets::apply_as_metallic(&rs.queue, asset, layer, tile_count, res)
+            }
+            MaterialSlot::Normal => {
+                assets::apply_as_normal(&rs.queue, asset, layer, tile_count, res)
+            }
+        };
+        match result {
+            Ok(()) => {
+                vp.recomposite(&rs.device, &rs.queue);
+                self.status = format!(
+                    "Assigned '{}' to {} on '{}'",
+                    asset.name,
+                    slot.label(),
+                    vp.layer_stack.layers[active_idx].name,
+                );
+                log::info!("{}", self.status);
+            }
+            Err(e) => {
+                self.status = format!("Slot assign failed: {e:#}");
+                log::warn!("{}", self.status);
+            }
+        }
+    }
+
     fn activate_stencil(&mut self, idx: usize, frame: &eframe::Frame) {
         let Some(rs) = frame.wgpu_render_state() else {
             self.status = "No GPU available.".to_string();

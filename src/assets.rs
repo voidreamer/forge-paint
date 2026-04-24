@@ -207,6 +207,107 @@ pub fn apply_as_base_color(
     Ok(())
 }
 
+/// Upload `asset` into `layer.normal` across every tile. Normal maps are
+/// RGBA8 direct — no channel conversion, just resize + V-flip.
+pub fn apply_as_normal(
+    queue: &wgpu::Queue,
+    asset: &TextureAsset,
+    layer: &Layer,
+    tile_count: u32,
+    tile_resolution: u32,
+) -> Result<()> {
+    if tile_count == 0 {
+        return Err(anyhow!("layer has no tiles"));
+    }
+    let mut pixels = resize_rgba8(&asset.pixels, asset.width, asset.height, tile_resolution, tile_resolution);
+    flip_rows_rgba8(&mut pixels, tile_resolution, tile_resolution);
+    for tile_idx in 0..tile_count {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &layer.normal,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: tile_idx },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(tile_resolution * 4),
+                rows_per_image: Some(tile_resolution),
+            },
+            wgpu::Extent3d {
+                width: tile_resolution,
+                height: tile_resolution,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn apply_as_single_channel(
+    queue: &wgpu::Queue,
+    asset: &TextureAsset,
+    texture: &wgpu::Texture,
+    tile_count: u32,
+    tile_resolution: u32,
+) -> Result<()> {
+    if tile_count == 0 {
+        return Err(anyhow!("layer has no tiles"));
+    }
+    let mut pixels = resize_rgba8(&asset.pixels, asset.width, asset.height, tile_resolution, tile_resolution);
+    flip_rows_rgba8(&mut pixels, tile_resolution, tile_resolution);
+    let mut r8 = vec![0u8; (tile_resolution * tile_resolution) as usize];
+    for (i, chunk) in pixels.chunks_exact(4).enumerate() {
+        let r = chunk[0] as f32;
+        let g = chunk[1] as f32;
+        let b = chunk[2] as f32;
+        r8[i] = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 255.0) as u8;
+    }
+    for tile_idx in 0..tile_count {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: tile_idx },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &r8,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(tile_resolution),
+                rows_per_image: Some(tile_resolution),
+            },
+            wgpu::Extent3d {
+                width: tile_resolution,
+                height: tile_resolution,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    Ok(())
+}
+
+pub fn apply_as_roughness(
+    queue: &wgpu::Queue,
+    asset: &TextureAsset,
+    layer: &Layer,
+    tile_count: u32,
+    tile_resolution: u32,
+) -> Result<()> {
+    apply_as_single_channel(queue, asset, &layer.roughness, tile_count, tile_resolution)
+}
+
+pub fn apply_as_metallic(
+    queue: &wgpu::Queue,
+    asset: &TextureAsset,
+    layer: &Layer,
+    tile_count: u32,
+    tile_resolution: u32,
+) -> Result<()> {
+    apply_as_single_channel(queue, asset, &layer.metallic, tile_count, tile_resolution)
+}
+
 /// Upload `asset` into the active layer's mask (single-channel R8). Takes
 /// the luminance of each pixel. Caller must ensure the layer has a mask.
 pub fn apply_as_mask(
