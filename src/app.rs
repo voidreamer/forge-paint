@@ -25,6 +25,12 @@ pub struct App {
     /// tool button; closed when the user picks a texture, imports a new
     /// one, or cancels.
     show_stencil_picker: bool,
+
+    /// First-frame flag — we scan `assets/stencils/` and
+    /// `assets/displacement/` once the wgpu renderer is ready and
+    /// auto-import everything there so the user doesn't have to click
+    /// "+ Import" for bundled assets.
+    asset_scan_done: bool,
 }
 
 impl App {
@@ -72,6 +78,15 @@ impl eframe::App for App {
         if self.viewport.is_some() {
             if let Some(path) = self.pending_open.take() {
                 self.load_usd(frame, path);
+            }
+        }
+
+        // First frame with a live viewport: import bundled stencils +
+        // displacement maps into the asset browser.
+        if !self.asset_scan_done && self.viewport.is_some() {
+            if let Some(rs) = frame.wgpu_render_state() {
+                self.asset_scan_done = true;
+                self.scan_bundled_assets(&rs);
             }
         }
 
@@ -843,7 +858,21 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
             }
         }
     });
-    ui.weak("Currently: world normal. Position / curvature / AO land in D.3+.");
+    ui.weak("World normal + position baked via MRT. Used by projection paint.");
+
+    ui.add_space(6.0);
+    ui.label("Tessellation (for displacement)");
+    let mut level = vp.subdivision_level;
+    // 4^3 = 64× triangles per level-3 vertex is the practical ceiling
+    // without introducing dedupe / GPU subdivision.
+    if ui
+        .add(egui::Slider::new(&mut level, 0..=3).text("subdivision"))
+        .changed()
+    {
+        if let Some(rs) = frame.wgpu_render_state() {
+            vp.set_subdivision(&rs.device, level);
+        }
+    }
 }
 
 fn brush_section(ui: &mut egui::Ui, vp: &mut Viewport) {
@@ -864,6 +893,7 @@ fn brush_section(ui: &mut egui::Ui, vp: &mut Viewport) {
             ui.radio_value(&mut vp.brush.channel, PaintChannel::BaseColor, "Color");
             ui.radio_value(&mut vp.brush.channel, PaintChannel::Roughness, "Rough");
             ui.radio_value(&mut vp.brush.channel, PaintChannel::Metallic, "Metal");
+            ui.radio_value(&mut vp.brush.channel, PaintChannel::Displacement, "Height");
         });
         match vp.brush.channel {
             PaintChannel::BaseColor => {
@@ -871,6 +901,11 @@ fn brush_section(ui: &mut egui::Ui, vp: &mut Viewport) {
                     ui.label("color");
                     ui.color_edit_button_rgb(&mut vp.brush.color_srgb);
                 });
+            }
+            PaintChannel::Displacement => {
+                // Signed height — negative values carve into the surface,
+                // positive values push out.
+                ui.add(egui::Slider::new(&mut vp.brush.value, -1.0..=1.0).text("height"));
             }
             PaintChannel::Roughness | PaintChannel::Metallic | PaintChannel::Mask => {
                 ui.add(egui::Slider::new(&mut vp.brush.value, 0.0..=1.0).text("value"));
@@ -963,6 +998,11 @@ fn material_factors_section(ui: &mut egui::Ui, vp: &mut Viewport) {
     ui.add(egui::Slider::new(&mut vp.metallic_factor, 0.0..=2.0).text("metallic ×"));
     ui.add(egui::Slider::new(&mut vp.roughness_factor, 0.0..=2.0).text("roughness ×"));
     ui.add(egui::Slider::new(&mut vp.normal_scale, 0.0..=2.0).text("normal scale"));
+    ui.add(
+        egui::Slider::new(&mut vp.displacement_scale, 0.0..=1.0)
+            .text("displacement scale")
+            .show_value(true),
+    );
 }
 
 fn light_section(ui: &mut egui::Ui, vp: &mut Viewport) {
@@ -1183,6 +1223,55 @@ impl App {
             format!("No sidecars at {}", dir.display())
         };
         log::info!("{}", self.status);
+    }
+
+    /// Walk `assets/stencils/` and `assets/displacement/` and import
+    /// every PNG / EXR we find into the asset browser so the user can
+    /// right-click → Project with stencil without first clicking
+    /// "+ Import" for bundled content.
+    fn scan_bundled_assets(&mut self, rs: &eframe::egui_wgpu::RenderState) {
+        // Resolve `assets/…` first relative to cwd, then fall back to
+        // the path baked at compile time so the scan still works when
+        // the binary is launched from an unexpected working directory.
+        let resolve = |rel: &str| -> std::path::PathBuf {
+            let cwd = std::path::PathBuf::from(rel);
+            if cwd.is_dir() {
+                return cwd;
+            }
+            let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+            manifest
+        };
+        let dirs = [
+            resolve("assets/stencils"),
+            resolve("assets/displacement"),
+        ];
+        let mut count = 0usize;
+        for dir in &dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            let mut paths: Vec<std::path::PathBuf> =
+                entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for path in paths {
+                let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                    continue;
+                };
+                let lower = ext.to_lowercase();
+                if lower != "png" && lower != "exr" {
+                    continue;
+                }
+                let mut renderer = rs.renderer.write();
+                match self.browser.import_texture(&path, &rs.device, &rs.queue, &mut renderer) {
+                    Ok(()) => count += 1,
+                    Err(e) => log::warn!("bundled asset {}: {e:#}", path.display()),
+                }
+            }
+        }
+        if count > 0 {
+            self.status = format!("Imported {count} bundled asset(s)");
+            log::info!("{}", self.status);
+        }
     }
 
     fn asset_browser_panel(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {

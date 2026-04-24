@@ -13,6 +13,13 @@
 /assets/default_mesh/*.usda
 /assets/default_mesh/*.usdc
 
+# Stencils + displacement library — bring your own (Poly Haven CC0 is
+# great). Auto-imported into the bottom asset browser on startup.
+/assets/stencils/*.png
+/assets/stencils/*.exr
+/assets/displacement/*.png
+/assets/displacement/*.exr
+
 # Editor
 .vscode/
 .idea/
