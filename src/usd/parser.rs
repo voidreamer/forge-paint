@@ -61,7 +61,16 @@ enum Tok {
     RParen,
     Comma,
     Eq,
-    At, // '@' for asset paths
+    /// Asset path `@...@` — consumed as one token including arbitrary
+    /// punctuation (dashes, parentheses, spaces) that would otherwise
+    /// trip the tokenizer. Triple-`@` paths (`@@@...@@@`) aren't
+    /// handled yet but are rare in flattened output.
+    Asset(String),
+    /// USD path literal inside `<...>` — e.g. `</World/foo>`. Stored
+    /// opaquely; the mesh parser ignores these (they appear inside
+    /// `rel` / `material:binding` / `inherits` / etc., which the mesh
+    /// extractor doesn't need).
+    Path(String),
 }
 
 fn tokenize(src: &str) -> Result<Vec<Tok>> {
@@ -160,12 +169,48 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
             b')' => Some(Tok::RParen),
             b',' => Some(Tok::Comma),
             b'=' => Some(Tok::Eq),
-            b'@' => Some(Tok::At),
             _ => None,
         };
         if let Some(t) = t {
             out.push(t);
             i += 1;
+            continue;
+        }
+
+        // Asset path `@...@` — single token, arbitrary content inside
+        // (paths frequently contain dashes, dots, spaces).
+        if c == b'@' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'@' {
+                i += 1;
+            }
+            let s = std::str::from_utf8(&bytes[start..i])
+                .with_context(|| "non-utf8 in asset path")?
+                .to_string();
+            if i < bytes.len() {
+                i += 1; // skip closing '@'
+            }
+            out.push(Tok::Asset(s));
+            continue;
+        }
+
+        // USD path literal: `<...>` — used by rel / material:binding /
+        // inherits / etc. We don't use the value (the mesh extractor
+        // ignores relationships) but we do need to consume it cleanly.
+        if c == b'<' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'>' {
+                i += 1;
+            }
+            let s = std::str::from_utf8(&bytes[start..i])
+                .with_context(|| "non-utf8 in path literal")?
+                .to_string();
+            if i < bytes.len() {
+                i += 1; // skip '>'
+            }
+            out.push(Tok::Path(s));
             continue;
         }
 
@@ -288,24 +333,12 @@ impl<'a> Parser<'a> {
                     unreachable!()
                 }
             }
-            Some(Tok::At) => {
-                // Asset path: @...@ (tokenizer already split — simplest: swallow tokens until the next @)
-                self.advance();
-                let mut s = String::new();
-                while let Some(t) = self.peek() {
-                    if matches!(t, Tok::At) {
-                        self.advance();
-                        break;
-                    }
-                    match self.advance() {
-                        Some(Tok::Ident(n)) => s.push_str(n),
-                        Some(Tok::Str(n)) => s.push_str(n),
-                        Some(Tok::Num(n)) => s.push_str(&n.to_string()),
-                        Some(_) => {}
-                        None => break,
-                    }
+            Some(Tok::Asset(_)) => {
+                if let Some(Tok::Asset(s)) = self.advance() {
+                    Ok(Value::Asset(s.clone()))
+                } else {
+                    unreachable!()
                 }
-                Ok(Value::Asset(s))
             }
             Some(Tok::Ident(s)) if s == "None" => {
                 self.advance();
@@ -347,6 +380,13 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Ok(Value::Array(elems))
+            }
+            Some(Tok::Path(_)) => {
+                // Opaque path literal — we don't actually use these
+                // (relationships / inherits / material:binding etc.
+                // aren't part of the geometry extraction path).
+                self.advance();
+                Ok(Value::None)
             }
             other => Err(anyhow!("parse_value: unexpected token {other:?}")),
         }
@@ -533,12 +573,11 @@ impl<'a> Parser<'a> {
                 None => break,
             }
         }
-        // Expect `=`
+        // Attribute declaration without `=` (bare output / connectable
+        // with no default) — skip it, there's nothing for the mesh
+        // extractor to consume.
         if !matches!(self.peek(), Some(Tok::Eq)) {
-            bail!(
-                "parse_attribute: expected `=` after tokens {collected:?} (at pos {})",
-                self.pos
-            );
+            return Ok(());
         }
         self.advance();
 
