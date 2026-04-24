@@ -1263,7 +1263,7 @@ impl App {
                     continue;
                 };
                 let lower = ext.to_lowercase();
-                if lower != "png" && lower != "exr" {
+                if !matches!(lower.as_str(), "png" | "jpg" | "jpeg" | "exr") {
                     continue;
                 }
                 let mut renderer = rs.renderer.write();
@@ -1476,12 +1476,11 @@ impl App {
     }
 
     fn import_texture_dialog(&mut self, frame: &eframe::Frame) {
-        // PNG + EXR are enabled via the image crate's feature flags in
-        // Cargo.toml. EXR loads as HDR floats; we tonemap/clamp to LDR
-        // on upload for now (HDR displacement channel is a follow-up —
-        // see the roadmap task).
+        // PNG + JPEG + EXR are enabled via the image crate's feature
+        // flags in Cargo.toml. EXR loads as HDR floats; we tonemap /
+        // clamp to LDR on upload for now.
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "exr"])
+            .add_filter("Image", &["png", "jpg", "jpeg", "exr"])
             .set_title("Import texture / stencil")
             .pick_file()
         else {
