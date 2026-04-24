@@ -540,6 +540,12 @@ impl Viewport {
         &self.paint_target
     }
 
+    /// Read-only access to the base (pre-subdivision) CPU mesh —
+    /// needed by the UV view to draw the mesh's UV wireframe.
+    pub fn cpu_mesh(&self) -> &CpuMesh {
+        &self.cpu_mesh
+    }
+
     /// Register (or reuse) an egui TextureId pointing at `idx`'s tile-0
     /// base_color view, for use as a layer thumbnail. Writes through to the
     /// live texture, so stamps update the thumbnail automatically.

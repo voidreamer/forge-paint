@@ -45,6 +45,8 @@ pub struct App {
     /// Cached egui TextureIds for the composited paint_target.base_color
     /// tiles, rebuilt when the tile count changes.
     uv_thumb_ids: Vec<Option<egui::TextureId>>,
+    /// Overlay the mesh's UV wireframe on top of the atlas.
+    uv_show_wireframe: bool,
 }
 
 /// Which channel a material-slot assignment should target on the
@@ -99,6 +101,7 @@ impl App {
             // Sane non-zero defaults for the UV view. bool/Vec2/Vec
             // defaults (false, (0,0), empty) are already what we want.
             uv_zoom: 400.0,
+            uv_show_wireframe: true,
             ..Default::default()
         }
     }
@@ -567,6 +570,7 @@ impl eframe::App for App {
                                     &mut self.uv_zoom,
                                     &mut self.uv_pan,
                                     &mut self.uv_thumb_ids,
+                                    &mut self.uv_show_wireframe,
                                 );
                             });
                     }
@@ -1159,7 +1163,14 @@ fn uv_view_body(
     zoom: &mut f32,
     pan: &mut egui::Vec2,
     thumb_ids: &mut Vec<Option<egui::TextureId>>,
+    show_wireframe: &mut bool,
 ) {
+    // Header row: toggles + hints.
+    ui.horizontal(|ui| {
+        ui.checkbox(show_wireframe, "UV wireframe");
+        ui.weak(" · RMB / MMB drag to pan · scroll to zoom");
+    });
+    ui.separator();
     // Ensure our cache matches the current tile count.
     let tiles = vp.paint_target().tiles.to_vec();
     if thumb_ids.len() != tiles.len() {
@@ -1270,6 +1281,34 @@ fn uv_view_body(
         let a = to_screen(egui::vec2(ix_min as f32, y as f32));
         let b = to_screen(egui::vec2(ix_max as f32, y as f32));
         painter.line_segment([a, b], grid_stroke);
+    }
+
+    // UV wireframe — draw every triangle's three edges at the mesh's
+    // UV coordinates. Dedup-free for simplicity; egui batches shapes
+    // internally. Clipped to the panel rect so off-screen edges cost
+    // nothing. Drawn under the paint cursor but over the tile images.
+    if *show_wireframe {
+        let mesh = vp.cpu_mesh();
+        let stroke = egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(100, 220, 255, 120),
+        );
+        let visible = rect.expand(8.0);
+        for &[i0, i1, i2] in &mesh.indices {
+            let uv0 = mesh.uvs[i0 as usize];
+            let uv1 = mesh.uvs[i1 as usize];
+            let uv2 = mesh.uvs[i2 as usize];
+            let a = to_screen(egui::vec2(uv0.x, uv0.y));
+            let b = to_screen(egui::vec2(uv1.x, uv1.y));
+            let c = to_screen(egui::vec2(uv2.x, uv2.y));
+            for (p0, p1) in [(a, b), (b, c), (c, a)] {
+                // Cheap AABB cull — skip segments entirely off-panel.
+                let seg = egui::Rect::from_two_pos(p0, p1);
+                if seg.intersects(visible) {
+                    painter.line_segment([p0, p1], stroke);
+                }
+            }
+        }
     }
 
     // Paint: map LMB position → atlas UV → tile + local_uv; stamp.
