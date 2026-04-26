@@ -7,12 +7,16 @@ struct Frame {
     camera_pos: vec4<f32>,
     light_dir: vec4<f32>,
     light_color: vec4<f32>,
+    fill_dir: vec4<f32>,
+    fill_color: vec4<f32>,
+    rim_dir: vec4<f32>,
+    rim_color: vec4<f32>,
     ambient_sky: vec4<f32>,
     ambient_ground: vec4<f32>,
     view_mode: u32,        // 0 Material, 1 BaseColor, 2 Rough, 3 Metal, 4 Normal, 5 Mask
-    tonemap_mode: u32,     // 0 None, 1 Reinhard, 2 ACES, 3 Filmic (UC2)
+    tonemap_mode: u32,     // 0 None, 1 Reinhard, 2 ACES, 3 Filmic, 4 Neutral, 5 AgX
     exposure: f32,         // pre-tonemap linear multiplier (= 2^stops)
-    _pad: u32,
+    ibl_scale: f32,        // multiplier on IBL contribution (rig dampens to ~0.4)
     inv_view_proj: mat4x4<f32>,
 }
 
@@ -180,6 +184,57 @@ fn filmic_uc2(x: vec3<f32>) -> vec3<f32> {
     return clamp(curr / white_scale, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+/// Khronos PBR Neutral (glTF 2024). Truer-to-color than ACES.
+fn khronos_pbr_neutral(color: vec3<f32>) -> vec3<f32> {
+    let start_compression = 0.8 - 0.04;
+    let desaturation = 0.15;
+    var c = color;
+    let mn = min(c.r, min(c.g, c.b));
+    var offset = 0.04;
+    if mn < 0.08 { offset = mn - 6.25 * mn * mn; }
+    c = c - vec3<f32>(offset);
+    let peak = max(c.r, max(c.g, c.b));
+    if peak < start_compression { return c; }
+    let d = 1.0 - start_compression;
+    let new_peak = 1.0 - d * d / (peak + d - start_compression);
+    c = c * (new_peak / peak);
+    let g = 1.0 - 1.0 / (desaturation * (peak - new_peak) + 1.0);
+    return mix(c, vec3<f32>(new_peak), vec3<f32>(g));
+}
+
+/// AgX default (Blender / Filament). Polynomial sigmoid fit.
+fn agx_default_contrast_approx(x: vec3<f32>) -> vec3<f32> {
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    return 15.5 * x4 * x2
+        - 40.14 * x4 * x
+        + 31.96 * x4
+        - 6.868 * x2 * x
+        + 0.4298 * x2
+        + 0.1191 * x
+        - vec3<f32>(0.00232);
+}
+
+fn agx(color: vec3<f32>) -> vec3<f32> {
+    let inset = mat3x3<f32>(
+        vec3<f32>(0.842479062253094, 0.0784335999999992, 0.0792237451477643),
+        vec3<f32>(0.0423282422610123, 0.878468636469772, 0.0791661274605434),
+        vec3<f32>(0.0423756549057051, 0.0784336, 0.879142973793104),
+    );
+    let outset = mat3x3<f32>(
+        vec3<f32>(1.19687900512017, -0.0980208811401368, -0.0990297440797205),
+        vec3<f32>(-0.0528968517574562, 1.15190312990417, -0.0989611768448433),
+        vec3<f32>(-0.0529716355144438, -0.0980434501171241, 1.15107367264116),
+    );
+    let min_ev = -12.47393;
+    let max_ev = 4.026069;
+    let v = inset * max(color, vec3<f32>(0.0));
+    let v_log = clamp(log2(v + vec3<f32>(1e-10)), vec3<f32>(min_ev), vec3<f32>(max_ev));
+    let v_norm = (v_log - vec3<f32>(min_ev)) / (max_ev - min_ev);
+    let curve = agx_default_contrast_approx(v_norm);
+    return clamp(outset * curve, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 fn apply_tonemap(x: vec3<f32>, mode: u32) -> vec3<f32> {
     switch mode {
         case 1u: {
@@ -190,6 +245,12 @@ fn apply_tonemap(x: vec3<f32>, mode: u32) -> vec3<f32> {
         }
         case 3u: {
             return filmic_uc2(x);
+        }
+        case 4u: {
+            return khronos_pbr_neutral(x);
+        }
+        case 5u: {
+            return agx(x);
         }
         default: {
             return clamp(x, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -259,28 +320,59 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     );
 
     let v = normalize(frame.camera_pos.xyz - in.world_pos);
-    let l = normalize(-frame.light_dir.xyz);
-    let h = normalize(v + l);
-
     let n_dot_v = max(dot(n, v), 0.0);
-    let n_dot_l = max(dot(n, l), 0.0);
-    let n_dot_h = max(dot(n, h), 0.0);
-    let v_dot_h = max(dot(v, h), 0.0);
 
     metallic = clamp(metallic, 0.0, 1.0);
     roughness = clamp(roughness, 0.04, 1.0);
-
     let f0 = mix(vec3<f32>(0.04), base_color, metallic);
-    let d = d_ggx(n_dot_h, roughness);
-    let g = v_smith_ggx(n_dot_v, n_dot_l, roughness);
-    let f = f_schlick(v_dot_h, f0);
-    let specular = (d * g) * f;
 
-    let ks = f;
-    let kd = (vec3<f32>(1.0) - ks) * (1.0 - metallic);
-    let diffuse = kd * base_color / PI;
-
-    let direct = (diffuse + specular) * frame.light_color.rgb * frame.light_color.w * n_dot_l;
+    // Per-light Cook-Torrance evaluation. Three lights (key + fill + rim)
+    // form a studio rig — fill/rim light_color.w can be zero to disable,
+    // which costs the cos(NdotL) clamp + a few mults but skips the BRDF
+    // entirely once all factors collapse.
+    var direct = vec3<f32>(0.0);
+    let key_l = normalize(-frame.light_dir.xyz);
+    let key_h = normalize(v + key_l);
+    let key_ndl = max(dot(n, key_l), 0.0);
+    if frame.light_color.w * key_ndl > 0.0 {
+        let ndh = max(dot(n, key_h), 0.0);
+        let vdh = max(dot(v, key_h), 0.0);
+        let d_ = d_ggx(ndh, roughness);
+        let g_ = v_smith_ggx(n_dot_v, key_ndl, roughness);
+        let f_ = f_schlick(vdh, f0);
+        let spec = (d_ * g_) * f_;
+        let kd = (vec3<f32>(1.0) - f_) * (1.0 - metallic);
+        let diff = kd * base_color / PI;
+        direct = direct + (diff + spec) * frame.light_color.rgb * frame.light_color.w * key_ndl;
+    }
+    let fill_l = normalize(-frame.fill_dir.xyz);
+    let fill_ndl = max(dot(n, fill_l), 0.0);
+    if frame.fill_color.w * fill_ndl > 0.0 {
+        let h_ = normalize(v + fill_l);
+        let ndh = max(dot(n, h_), 0.0);
+        let vdh = max(dot(v, h_), 0.0);
+        let d_ = d_ggx(ndh, roughness);
+        let g_ = v_smith_ggx(n_dot_v, fill_ndl, roughness);
+        let f_ = f_schlick(vdh, f0);
+        let spec = (d_ * g_) * f_;
+        let kd = (vec3<f32>(1.0) - f_) * (1.0 - metallic);
+        let diff = kd * base_color / PI;
+        direct = direct + (diff + spec) * frame.fill_color.rgb * frame.fill_color.w * fill_ndl;
+    }
+    let rim_l = normalize(-frame.rim_dir.xyz);
+    let rim_ndl = max(dot(n, rim_l), 0.0);
+    if frame.rim_color.w * rim_ndl > 0.0 {
+        let h_ = normalize(v + rim_l);
+        let ndh = max(dot(n, h_), 0.0);
+        let vdh = max(dot(v, h_), 0.0);
+        let d_ = d_ggx(ndh, roughness);
+        let g_ = v_smith_ggx(n_dot_v, rim_ndl, roughness);
+        let f_ = f_schlick(vdh, f0);
+        let spec = (d_ * g_) * f_;
+        let kd = (vec3<f32>(1.0) - f_) * (1.0 - metallic);
+        let diff = kd * base_color / PI;
+        direct = direct + (diff + spec) * frame.rim_color.rgb * frame.rim_color.w * rim_ndl;
+    }
 
     // Karis split-sum IBL with the closed-form LUT approximation (task #45
     // blocks the baked LUT path). `env_brdf_approx` returns (scale, bias)
@@ -313,7 +405,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ibl_diffuse = (kd_ibl * base_color) * ibl_diffuse_raw;
     let ibl_specular = ibl_spec_raw * (f_ss + fms);
 
-    let lit = direct + ibl_diffuse + ibl_specular;
+    let lit = direct + (ibl_diffuse + ibl_specular) * frame.ibl_scale;
 
     // View-mode override — isolate a channel for inspection. The PBR pass
     // writes to an HDR Rgba16Float buffer; the post pass handles exposure

@@ -7,12 +7,16 @@ struct Frame {
     camera_pos: vec4<f32>,
     light_dir: vec4<f32>,
     light_color: vec4<f32>,
+    fill_dir: vec4<f32>,
+    fill_color: vec4<f32>,
+    rim_dir: vec4<f32>,
+    rim_color: vec4<f32>,
     ambient_sky: vec4<f32>,
     ambient_ground: vec4<f32>,
     view_mode: u32,
     tonemap_mode: u32,
     exposure: f32,
-    _pad: u32,
+    ibl_scale: f32,
     inv_view_proj: mat4x4<f32>,
 };
 

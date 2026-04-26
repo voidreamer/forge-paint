@@ -1139,11 +1139,44 @@ fn env_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
     );
 
     ui.add_space(6.0);
+    ui.label("Grading (post-tonemap)");
+    ui.add(
+        egui::Slider::new(&mut vp.grading_contrast, 0.5..=2.0)
+            .text("contrast")
+            .show_value(true),
+    );
+    ui.add(
+        egui::Slider::new(&mut vp.grading_saturation, 0.0..=2.0)
+            .text("saturation")
+            .show_value(true),
+    );
+    ui.add(
+        egui::Slider::new(&mut vp.grading_clarity, 0.0..=1.0)
+            .text("clarity")
+            .show_value(true),
+    );
+    if ui.button("Reset grading").clicked() {
+        vp.grading_contrast = 1.10;
+        vp.grading_saturation = 1.10;
+        vp.grading_clarity = 0.15;
+    }
+
+    ui.add_space(6.0);
     ui.label("Display");
     ui.horizontal(|ui| {
         ui.checkbox(&mut vp.fxaa.enabled, "FXAA");
         ui.checkbox(&mut vp.wireframe.visible, "wireframe");
     });
+    ui.add(
+        egui::Slider::new(&mut vp.fxaa.sharpen, 0.0..=1.0)
+            .text("sharpen (CAS)")
+            .show_value(true),
+    );
+    ui.add(
+        egui::Slider::new(&mut vp.fxaa.dither, 0.0..=2.0)
+            .text("dither")
+            .show_value(true),
+    );
 
     if let Some(render_state) = frame.wgpu_render_state() {
         if load_procedural {
@@ -1639,12 +1672,32 @@ fn material_factors_section(ui: &mut egui::Ui, vp: &mut Viewport) {
 }
 
 fn light_section(ui: &mut egui::Ui, vp: &mut Viewport) {
+    ui.label("Key light");
     ui.add(egui::Slider::new(&mut vp.light_intensity, 0.0..=10.0).text("intensity"));
     ui.horizontal(|ui| {
         ui.label("dir");
         ui.add(egui::DragValue::new(&mut vp.light_dir[0]).speed(0.02).prefix("x:"));
         ui.add(egui::DragValue::new(&mut vp.light_dir[1]).speed(0.02).prefix("y:"));
         ui.add(egui::DragValue::new(&mut vp.light_dir[2]).speed(0.02).prefix("z:"));
+    });
+    ui.add_space(6.0);
+    ui.checkbox(&mut vp.studio_rig_enabled, "Studio rig (key + fill + rim)");
+    ui.add_enabled_ui(vp.studio_rig_enabled, |ui| {
+        ui.add(
+            egui::Slider::new(&mut vp.studio_fill_ratio, 0.0..=1.0)
+                .text("fill (× key)")
+                .show_value(true),
+        );
+        ui.add(
+            egui::Slider::new(&mut vp.studio_rim_ratio, 0.0..=1.5)
+                .text("rim (× key)")
+                .show_value(true),
+        );
+        ui.add(
+            egui::Slider::new(&mut vp.studio_ibl_scale, 0.0..=1.0)
+                .text("IBL scale")
+                .show_value(true),
+        );
     });
 }
 

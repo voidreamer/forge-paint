@@ -1,6 +1,9 @@
 // Post-process pass: reads the HDR linear color from the PBR pass, applies
-// exposure + tonemap (only in Material view mode; inspection modes pass
-// through), writes to the Bgra8UnormSrgb viewport texture that egui samples.
+// exposure → tonemap → grading (saturation / contrast / clarity), writes to
+// the Bgra8UnormSrgb viewport texture that egui samples.
+//
+// Inspection view modes pass through with no tonemap or grade — they're
+// looking at raw channel values that any curve would misrepresent.
 
 struct PostUniforms {
     /// `2^exposure_stops` — already precomputed on the CPU side.
@@ -9,7 +12,17 @@ struct PostUniforms {
     view_mode: u32,
     /// See TonemapMode::as_u32 in render.rs.
     tonemap_mode: u32,
-    _pad: u32,
+    /// 1.0 = neutral. Pivots around luminance 0.5 — moves the curve
+    /// shoulder, not the colors themselves.
+    contrast: f32,
+    /// 1.0 = identity, 0 = monochrome, > 1 = boosted. Per-pixel mix toward
+    /// Rec.709 luminance.
+    saturation: f32,
+    /// 0 = off. Unsharp-mask amount; small values (0.1..0.3) read as
+    /// "sharpness / micro-contrast" without ringing.
+    clarity: f32,
+    /// (1/width, 1/height) of the HDR source texture.
+    texel_size: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> post: PostUniforms;
@@ -33,7 +46,7 @@ fn vs_post(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
-// --- Tonemap curves (identical to pbr.wgsl's — kept in sync manually) ---
+// --- Tonemap curves (kept in lockstep with pbr.wgsl + env/skybox.wgsl) ---
 
 fn aces_narkowicz(x: vec3<f32>) -> vec3<f32> {
     let a = 2.51;
@@ -60,6 +73,73 @@ fn filmic_uc2(x: vec3<f32>) -> vec3<f32> {
     return clamp(curr / white_scale, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+/// Khronos PBR Neutral (glTF 2024). Preserves saturated colors better
+/// than ACES while still rolling off highlights. Reference impl from
+/// modelviewer.dev/examples/tone-mapping.
+fn khronos_pbr_neutral(color: vec3<f32>) -> vec3<f32> {
+    let start_compression = 0.8 - 0.04;
+    let desaturation = 0.15;
+
+    var c = color;
+    let mn = min(c.r, min(c.g, c.b));
+    var offset = 0.04;
+    if mn < 0.08 {
+        offset = mn - 6.25 * mn * mn;
+    }
+    c = c - vec3<f32>(offset);
+
+    let peak = max(c.r, max(c.g, c.b));
+    if peak < start_compression {
+        return c;
+    }
+
+    let d = 1.0 - start_compression;
+    let new_peak = 1.0 - d * d / (peak + d - start_compression);
+    c = c * (new_peak / peak);
+
+    let g = 1.0 - 1.0 / (desaturation * (peak - new_peak) + 1.0);
+    return mix(c, vec3<f32>(new_peak), vec3<f32>(g));
+}
+
+/// AgX (Blender / Filament default). Polynomial fit of the AgX default
+/// contrast sigmoid. Inset matrix → log2 → sigmoid → outset matrix.
+/// "Default" base look — punchier than Filmic, less yellow-shift than
+/// ACES. Reference: github.com/MrLixm/AgXc.
+fn agx_default_contrast_approx(x: vec3<f32>) -> vec3<f32> {
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    return 15.5 * x4 * x2
+        - 40.14 * x4 * x
+        + 31.96 * x4
+        - 6.868 * x2 * x
+        + 0.4298 * x2
+        + 0.1191 * x
+        - vec3<f32>(0.00232);
+}
+
+fn agx(color: vec3<f32>) -> vec3<f32> {
+    // sRGB → AgX inset
+    let inset = mat3x3<f32>(
+        vec3<f32>(0.842479062253094, 0.0784335999999992, 0.0792237451477643),
+        vec3<f32>(0.0423282422610123, 0.878468636469772, 0.0791661274605434),
+        vec3<f32>(0.0423756549057051, 0.0784336, 0.879142973793104),
+    );
+    // AgX → sRGB outset (default base)
+    let outset = mat3x3<f32>(
+        vec3<f32>(1.19687900512017, -0.0980208811401368, -0.0990297440797205),
+        vec3<f32>(-0.0528968517574562, 1.15190312990417, -0.0989611768448433),
+        vec3<f32>(-0.0529716355144438, -0.0980434501171241, 1.15107367264116),
+    );
+    let min_ev = -12.47393;
+    let max_ev = 4.026069;
+
+    let v = inset * max(color, vec3<f32>(0.0));
+    let v_log = clamp(log2(v + vec3<f32>(1e-10)), vec3<f32>(min_ev), vec3<f32>(max_ev));
+    let v_norm = (v_log - vec3<f32>(min_ev)) / (max_ev - min_ev);
+    let curve = agx_default_contrast_approx(v_norm);
+    return clamp(outset * curve, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 fn apply_tonemap(x: vec3<f32>, mode: u32) -> vec3<f32> {
     switch mode {
         case 1u: {
@@ -71,21 +151,67 @@ fn apply_tonemap(x: vec3<f32>, mode: u32) -> vec3<f32> {
         case 3u: {
             return filmic_uc2(x);
         }
+        case 4u: {
+            return khronos_pbr_neutral(x);
+        }
+        case 5u: {
+            return agx(x);
+        }
         default: {
             return clamp(x, vec3<f32>(0.0), vec3<f32>(1.0));
         }
     }
 }
 
+// --- Grading ----------------------------------------------------------------
+
+fn luminance(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+/// Per-pixel saturation around its own luminance. Cheaper and more
+/// faithful than RGB-pivoted saturation.
+fn apply_saturation(c: vec3<f32>, s: f32) -> vec3<f32> {
+    let g = vec3<f32>(luminance(c));
+    return mix(g, c, s);
+}
+
+/// Symmetric contrast around mid-gray (0.5). 1.0 = identity. Negative
+/// not supported — clamps to 0.
+fn apply_contrast(c: vec3<f32>, k: f32) -> vec3<f32> {
+    return clamp((c - vec3<f32>(0.5)) * max(k, 0.0) + vec3<f32>(0.5),
+                 vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @fragment
 fn fs_post(in: VsOut) -> @location(0) vec4<f32> {
-    let hdr = textureSample(hdr_tex, hdr_sampler, in.uv).rgb;
+    let center = textureSample(hdr_tex, hdr_sampler, in.uv).rgb;
+
     // Inspection views: pass the channel value through directly. Tonemap
-    // and AO would both misrepresent e.g. a stored roughness of 0.5.
+    // and grading would both misrepresent e.g. a stored roughness of 0.5.
     if post.view_mode != 0u {
-        return vec4<f32>(hdr, 1.0);
+        return vec4<f32>(center, 1.0);
     }
-    let exposed = hdr * post.exposure;
+
+    // Optional unsharp-mask "clarity": sample the cross neighbors of the
+    // HDR input, average them, and lift the center away from that average
+    // by `clarity`. Done in HDR linear so the sharpening tracks intensity
+    // (bright highlights get more lift than dark midtones). Skipped when
+    // `clarity` is zero so we don't pay the four extra samples.
+    var lit = center;
+    if post.clarity > 0.0 {
+        let off = post.texel_size;
+        let n0 = textureSample(hdr_tex, hdr_sampler, in.uv + vec2<f32>(-off.x, 0.0)).rgb;
+        let n1 = textureSample(hdr_tex, hdr_sampler, in.uv + vec2<f32>( off.x, 0.0)).rgb;
+        let n2 = textureSample(hdr_tex, hdr_sampler, in.uv + vec2<f32>(0.0, -off.y)).rgb;
+        let n3 = textureSample(hdr_tex, hdr_sampler, in.uv + vec2<f32>(0.0,  off.y)).rgb;
+        let blur = (n0 + n1 + n2 + n3) * 0.25;
+        lit = center + (center - blur) * post.clarity;
+    }
+
+    let exposed = lit * post.exposure;
     let tonemapped = apply_tonemap(exposed, post.tonemap_mode);
-    return vec4<f32>(tonemapped, 1.0);
+    let saturated = apply_saturation(tonemapped, post.saturation);
+    let contrasted = apply_contrast(saturated, post.contrast);
+    return vec4<f32>(contrasted, 1.0);
 }

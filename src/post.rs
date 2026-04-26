@@ -11,7 +11,20 @@ pub struct PostUniforms {
     pub exposure: f32,
     pub view_mode: u32,
     pub tonemap_mode: u32,
-    pub _pad: u32,
+    /// Post-tonemap multiplier on the deviation from mid-gray (luminance
+    /// pivot 0.5). 1.0 = identity. Drives the "punchy vs flat" knob — most
+    /// of the perceived "Marmoset crispness" lives here.
+    pub contrast: f32,
+    /// Post-tonemap saturation around per-pixel luminance. 1.0 = identity,
+    /// 0 = grayscale, > 1 boosts color. Cheap & high-impact.
+    pub saturation: f32,
+    /// "Clarity" / unsharp mask amount. 0 = off; small positive values
+    /// (0.1..0.3) sharpen edges via a 5-tap box blur and add to the
+    /// center sample. Reads as micro-contrast / "sharpness".
+    pub clarity: f32,
+    /// Pixel size (1/width, 1/height) — needed by the clarity unsharp
+    /// kernel to sample neighbors at exact texel offsets.
+    pub texel_size: [f32; 2],
 }
 
 pub struct PostPipeline {

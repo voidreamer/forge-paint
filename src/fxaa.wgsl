@@ -7,9 +7,15 @@ struct FxaaUniforms {
     /// Enable/disable toggle — 0 passes the center texel through
     /// untouched so the shader is always safe to include in the chain.
     enabled: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    /// CAS-style adaptive sharpen strength applied after AA. 0 = off.
+    /// 0.4 ≈ FidelityFX default. Constrained unsharp mask — clamps the
+    /// sharpened sample to the local min/max so it can't ring.
+    sharpen: f32,
+    /// Strength of the IGN (interleaved gradient noise) dither applied
+    /// before the swapchain's sRGB encode. 1.0 = full ±0.5/255 jitter,
+    /// 0 = off. Kills 8-bit gradient banding.
+    dither: f32,
+    _pad0: f32,
 };
 
 @group(0) @binding(0) var<uniform> fxaa: FxaaUniforms;
@@ -43,6 +49,47 @@ const QUALITY_STEPS: array<f32, 12> = array<f32, 12>(
     1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0,
 );
 
+/// Constrained unsharp-mask sharpen, FidelityFX-CAS-flavored. Samples the
+/// 4 cross neighbors, computes the average (the "blur"), boosts the
+/// center pixel away from the blur, then clamps the result to the local
+/// min/max so we get the crispness without the ringing of a naive
+/// unsharp. ~5 extra texture samples per fragment.
+fn cas_sharpen(uv: vec2<f32>, px: vec2<f32>, c: vec3<f32>, amt: f32) -> vec3<f32> {
+    let n = textureSample(src_tex, src_sampler, uv + vec2<f32>(0.0, -px.y)).rgb;
+    let s = textureSample(src_tex, src_sampler, uv + vec2<f32>(0.0,  px.y)).rgb;
+    let e = textureSample(src_tex, src_sampler, uv + vec2<f32>( px.x, 0.0)).rgb;
+    let w = textureSample(src_tex, src_sampler, uv + vec2<f32>(-px.x, 0.0)).rgb;
+    let blur = (n + s + e + w) * 0.25;
+    let sharp = c + (c - blur) * amt;
+    let mn = min(min(min(min(n, s), e), w), c);
+    let mx = max(max(max(max(n, s), e), w), c);
+    return clamp(sharp, mn, mx);
+}
+
+/// Interleaved Gradient Noise (Jimenez 2014) — pseudo blue-noise that
+/// fits in one line. Returns ~uniform [0, 1) given screen-space pixel
+/// position. We feed in `frag_coord.xy` (the fullscreen-pixel value) so
+/// the noise pattern is screen-locked, not UV-locked.
+fn ig_noise(p: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y));
+}
+
+/// Apply CAS sharpen + IGN dither to a finalised pixel. Sharpen is
+/// constrained so it never overshoots; dither is ±0.5 / 255 in linear,
+/// which lands as roughly 1 LSB in the swapchain's sRGB output and kills
+/// 8-bit gradient banding without showing as visible grain.
+fn finalize(color: vec3<f32>, uv: vec2<f32>, frag_coord: vec2<f32>, px: vec2<f32>) -> vec3<f32> {
+    var c = color;
+    if fxaa.sharpen > 0.0 {
+        c = cas_sharpen(uv, px, c, fxaa.sharpen);
+    }
+    if fxaa.dither > 0.0 {
+        let n = ig_noise(frag_coord) - 0.5;
+        c = c + vec3<f32>(n / 255.0 * fxaa.dither);
+    }
+    return c;
+}
+
 @fragment
 fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
     let tex_size = vec2<f32>(textureDimensions(src_tex));
@@ -50,7 +97,7 @@ fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
 
     let center = textureSample(src_tex, src_sampler, in.uv);
     if fxaa.enabled == 0u {
-        return center;
+        return vec4<f32>(finalize(center.rgb, in.uv, in.pos.xy, px), center.a);
     }
 
     // Luminance at cross neighbors.
@@ -66,7 +113,7 @@ fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
 
     // Early-out for low-contrast pixels — not an edge, pass through.
     if l_range < max(EDGE_THRESHOLD_MIN, l_max * EDGE_THRESHOLD) {
-        return center;
+        return vec4<f32>(finalize(center.rgb, in.uv, in.pos.xy, px), center.a);
     }
 
     // Diagonal neighbors for richer edge orientation detection.
@@ -189,5 +236,6 @@ fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
     } else {
         final_uv.x = final_uv.x + offset * step_size * select(1.0, -1.0, is_1_steeper);
     }
-    return textureSample(src_tex, src_sampler, final_uv);
+    let aa = textureSample(src_tex, src_sampler, final_uv);
+    return vec4<f32>(finalize(aa.rgb, in.uv, in.pos.xy, px), aa.a);
 }

@@ -8,8 +8,19 @@ use crate::mesh::Vertex;
 pub struct FrameUniforms {
     pub view_proj: [[f32; 4]; 4],
     pub camera_pos: [f32; 4],
+    /// Key light — primary direction + (rgb, intensity in w). Always
+    /// active. Defaults to a slightly elevated front-quarter angle.
     pub light_dir: [f32; 4],
     pub light_color: [f32; 4],
+    /// Fill light — opposite key, ~50% intensity, slightly cooler.
+    /// Set color.w = 0 to disable.
+    pub fill_dir: [f32; 4],
+    pub fill_color: [f32; 4],
+    /// Rim / back light — behind the model, slightly above. Provides
+    /// the highlight silhouette that reads as "product shot crispness".
+    /// Set color.w = 0 to disable.
+    pub rim_dir: [f32; 4],
+    pub rim_color: [f32; 4],
     pub ambient_sky: [f32; 4],
     pub ambient_ground: [f32; 4],
     /// Picks what the fragment shader visualises. See `ViewMode::as_u32`.
@@ -18,7 +29,9 @@ pub struct FrameUniforms {
     pub tonemap_mode: u32,
     /// Pre-tonemap linear multiplier (= 2^exposure_stops).
     pub exposure: f32,
-    pub _pad: u32,
+    /// Multiplier on the IBL contribution. Three-point studio rigs
+    /// dampen this (~0.4) so the analytic lights dominate.
+    pub ibl_scale: f32,
     /// Inverse of `view_proj` — used by the skybox vertex shader to
     /// reconstruct a world-space ray direction from clip-space NDC.
     pub inv_view_proj: [[f32; 4]; 4],
@@ -30,6 +43,13 @@ pub enum TonemapMode {
     Reinhard,
     Aces,
     Filmic,
+    /// Khronos PBR Neutral — true-to-color glTF 2024 standard. Best for
+    /// material-look judgement (no saturated-blue → cyan shift like ACES).
+    Neutral,
+    /// AgX — Blender / Filament 2024 default. Filmic shoulder + log
+    /// encoding, ships with a default-contrast sigmoid that reads as
+    /// "crisp + saturated" without crushing highlights.
+    AgX,
 }
 
 impl TonemapMode {
@@ -39,6 +59,8 @@ impl TonemapMode {
             TonemapMode::Reinhard => 1,
             TonemapMode::Aces => 2,
             TonemapMode::Filmic => 3,
+            TonemapMode::Neutral => 4,
+            TonemapMode::AgX => 5,
         }
     }
     pub fn label(self) -> &'static str {
@@ -47,6 +69,8 @@ impl TonemapMode {
             TonemapMode::Reinhard => "Reinhard",
             TonemapMode::Aces => "ACES filmic",
             TonemapMode::Filmic => "Filmic (UC2)",
+            TonemapMode::Neutral => "Khronos PBR Neutral",
+            TonemapMode::AgX => "AgX",
         }
     }
     pub const ALL: &'static [TonemapMode] = &[
@@ -54,6 +78,8 @@ impl TonemapMode {
         TonemapMode::Reinhard,
         TonemapMode::Aces,
         TonemapMode::Filmic,
+        TonemapMode::Neutral,
+        TonemapMode::AgX,
     ];
 }
 

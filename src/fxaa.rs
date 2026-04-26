@@ -8,9 +8,15 @@ use egui_wgpu::wgpu;
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct FxaaUniforms {
     pub enabled: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    /// CAS-style adaptive sharpen amount applied after FXAA. 0 = off,
+    /// 0.4 ≈ FidelityFX default. Keeps tight specular highlights crisp
+    /// without the ringing of a naive unsharp mask.
+    pub sharpen: f32,
+    /// 1-LSB dither amount applied before the sRGB encode in the
+    /// swapchain. Kills 8-bit gradient banding which reads as "fog" or
+    /// "washed" — set 1.0 for full dither, 0 to disable.
+    pub dither: f32,
+    pub _pad0: f32,
 }
 
 pub struct FxaaPipeline {
@@ -19,6 +25,8 @@ pub struct FxaaPipeline {
     pub uniform_buf: wgpu::Buffer,
     pub sampler: wgpu::Sampler,
     pub enabled: bool,
+    pub sharpen: f32,
+    pub dither: f32,
 }
 
 impl FxaaPipeline {
@@ -120,6 +128,8 @@ impl FxaaPipeline {
             uniform_buf,
             sampler,
             enabled: true,
+            sharpen: 0.40,
+            dither: 1.0,
         }
     }
 
@@ -151,7 +161,9 @@ impl FxaaPipeline {
     pub fn write_uniforms(&self, queue: &wgpu::Queue) {
         let u = FxaaUniforms {
             enabled: if self.enabled { 1 } else { 0 },
-            ..Default::default()
+            sharpen: self.sharpen,
+            dither: self.dither,
+            _pad0: 0.0,
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
     }
