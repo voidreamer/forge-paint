@@ -156,15 +156,20 @@ fn build_intermediate(m: &rust_usd::Mesh) -> Result<UsdMesh> {
     } else {
         let st_idx = m.st_indices_u32();
         let indices = if st_idx.is_empty() { None } else { Some(st_idx) };
-        // primvars:st's interpolation isn't directly exposed on Mesh
-        // (only `normals_interpolation`). UsdGeomPrimvarsAPI defaults
-        // to faceVarying for st — assume that. Vertex-interpolated UVs
-        // would need a `primvar(name).interpolation()` lookup via the
-        // Primvar handle.
+        // Query the Primvar handle for the actual interpolation token.
+        // FaceVarying is the typical authored value but rust-usd surfaces
+        // whatever was set via UsdGeomPrimvarsAPI — vertex-interpolated
+        // UVs (common on subdivision-friendly meshes) get routed through
+        // the Vertex branch in `expand_to_corners` correctly when we
+        // pull the live string instead of hardcoding it.
+        let interp = m
+            .primvar("st")
+            .map(|pv| Interpolation::parse(&pv.interpolation()))
+            .unwrap_or(Interpolation::FaceVarying);
         Some(StPrimvar {
             data: st_data,
             indices,
-            interpolation: Interpolation::FaceVarying,
+            interpolation: interp,
         })
     };
 
