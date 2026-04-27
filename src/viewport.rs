@@ -1739,6 +1739,36 @@ impl Viewport {
             }
         }
 
+        // Renderer badge — top-left corner of the viewport canvas.
+        // Confirms which path is actually drawing the frame; the wgpu
+        // painter owns 100% of rendering today, with the Hydra wrapper
+        // sitting unwired in src/hydra_view.rs. Drawn AFTER the mesh
+        // image so it always lands on top.
+        let badge_text = "▶ renderer: wgpu painter";
+        let badge_anchor = egui::pos2(rect.left() + 12.0, rect.top() + 12.0);
+        // Use the parent ui's painter — `painter_at(rect)` clips and
+        // can swallow the badge against certain scene fills.
+        let approx_size = egui::vec2(7.5 * badge_text.chars().count() as f32 + 16.0, 22.0);
+        let badge_rect = egui::Rect::from_min_size(badge_anchor, approx_size);
+        ui.painter().rect_filled(
+            badge_rect,
+            6.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+        );
+        ui.painter().rect_stroke(
+            badge_rect,
+            6.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 220, 100)),
+            egui::StrokeKind::Outside,
+        );
+        ui.painter().text(
+            badge_rect.left_center() + egui::vec2(8.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            badge_text,
+            egui::FontId::monospace(13.0),
+            egui::Color32::from_rgb(255, 220, 100),
+        );
+
         // Default brush-shortcut hint — shown at the bottom of the
         // viewport whenever the stencil-transform hint isn't taking the
         // slot. Mirrors the stencil hint's style so the bottom line is
