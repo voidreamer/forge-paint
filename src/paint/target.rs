@@ -14,8 +14,14 @@ pub const MAX_TILES: usize = 32;
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct MaterialUniforms {
     pub base_color_factor: [f32; 4],
-    /// x=metallic, y=roughness, z=normal_scale, w=_
+    /// x=metallic, y=roughness, z=normal_scale, w=displacement_scale
     pub params: [f32; 4],
+    /// x = baked-normal blend (0 = painted only, 1 = baked only).
+    /// y = AO intensity (0 = no occlusion / pass-through, 1 = full
+    /// baked AO, > 1 = exaggerated darkening). Mirrors Substance /
+    /// Marmoset's "Ambient occlusion strength" knob.
+    /// z/w reserved.
+    pub params2: [f32; 4],
     pub tile_count: u32,
     pub _pad0: [u32; 3],
     /// 32 tile ids packed into 8 vec4<u32> to satisfy uniform array stride.
@@ -27,6 +33,10 @@ impl Default for MaterialUniforms {
         Self {
             base_color_factor: [1.0, 1.0, 1.0, 1.0],
             params: [0.0, 0.5, 1.0, 0.0],
+            // AO intensity defaults to 1.0 so a fresh bake takes
+            // effect immediately; baked-normal blend defaults to 0
+            // (painted only, like before AO was wired up).
+            params2: [0.0, 1.0, 0.0, 0.0],
             tile_count: 0,
             _pad0: [0; 3],
             tile_ids: [[0; 4]; 8],
@@ -368,10 +378,13 @@ impl PaintTarget {
         roughness: f32,
         normal_scale: f32,
         displacement_scale: f32,
+        baked_normal_blend: f32,
+        ao_intensity: f32,
     ) -> MaterialUniforms {
         let mut u = MaterialUniforms::default();
         u.base_color_factor = base_color_factor;
         u.params = [metallic, roughness, normal_scale, displacement_scale];
+        u.params2 = [baked_normal_blend, ao_intensity, 0.0, 0.0];
         u.tile_count = self.tiles.len() as u32;
         for (i, &tid) in self.tiles.iter().enumerate() {
             u.tile_ids[i / 4][i % 4] = tid;

@@ -292,7 +292,7 @@ impl eframe::App for App {
             });
         });
 
-        // Open URI modal — string entry for forge:// or any path usdcat accepts.
+        // Open URI modal — string entry for forge:// URIs or filesystem paths.
         if self.show_uri_dialog {
             let mut open = true;
             let mut load_requested: Option<String> = None;
@@ -301,7 +301,7 @@ impl eframe::App for App {
                 .resizable(false)
                 .default_width(460.0)
                 .show(ctx, |ui| {
-                    ui.label("USD URI or path (forge://…, file path, or anything usdcat can resolve):");
+                    ui.label("USD URI or path (forge://… or a filesystem path):");
                     ui.add(egui::TextEdit::singleline(&mut self.uri_buffer).desired_width(f32::INFINITY));
                     ui.horizontal(|ui| {
                         let ok = ui.button("Load").clicked();
@@ -1014,6 +1014,10 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
     let mut add_requested = false;
     let mut mask_add: Option<usize> = None;
     let mut mask_remove: Option<usize> = None;
+    // Layers whose smart-mask params changed this frame and need a GPU
+    // re-bake. Drained after the per-layer iteration so the borrow
+    // checker doesn't complain about double-mutating `vp`.
+    let mut smart_regen_request: Vec<usize> = Vec::new();
 
     // Top-down list — index 0 is bottom of stack, so iterate reversed so the
     // topmost (last to composite) is drawn first in the panel.
@@ -1142,6 +1146,13 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
                             mask_add = Some(i);
                         }
                     });
+                    // Smart-mask sub-block. Shown for any layer that
+                    // has a mask. The block renders inside an indented
+                    // group so the layer row stays compact when the
+                    // mask is purely manual.
+                    if vp.layer_stack.layers[i].mask.is_some() {
+                        smart_mask_subpanel(ui, vp, i, frame, &mut smart_regen_request);
+                    }
                 });
                 if activate {
                     vp.layer_stack.active = i;
@@ -1151,6 +1162,7 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
 
     ui.add_space(4.0);
     let mut add_fill_requested = false;
+    let mut preset_request: Option<crate::paint::SmartMaterialPreset> = None;
     ui.horizontal(|ui| {
         if ui.button("+ Paint").clicked() {
             add_requested = true;
@@ -1159,6 +1171,37 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
             add_fill_requested = true;
         }
         ui.weak(format!("{n} layer{}", if n == 1 { "" } else { "s" }));
+    });
+
+    // Smart-material presets — one click adds a fill layer + smart
+    // mask wired to the right baked-map source. Each button is gated
+    // on the source bake being available, with a tooltip saying
+    // which one to bake when it isn't.
+    ui.add_space(4.0);
+    ui.weak("Smart materials");
+    ui.horizontal_wrapped(|ui| {
+        for &preset in crate::paint::SmartMaterialPreset::ALL {
+            let required = preset.smart_mask().source;
+            let available = source_is_baked(vp, required);
+            let tooltip = if available {
+                format!("Adds a {} layer with a smart mask.", preset.label())
+            } else {
+                format!(
+                    "Bake {} on the Bake tab first (this preset uses {} as its source).",
+                    required.required_map().label(),
+                    required.label()
+                )
+            };
+            let resp = ui
+                .add_enabled(
+                    available,
+                    egui::Button::new(format!("+ {}", preset.label())),
+                )
+                .on_hover_text(tooltip);
+            if resp.clicked() {
+                preset_request = Some(preset);
+            }
+        }
     });
 
     // Apply GPU-affecting actions after UI traversal.
@@ -1190,6 +1233,28 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
                 vp.brush.mask_edit = false;
             }
             vp.recomposite(&render_state.device, &render_state.queue);
+        }
+        // Run any smart-mask regenerations queued during this frame's
+        // panel traversal. Errors (missing source bake) are logged and
+        // surfaced via the panel on the next frame.
+        for idx in &smart_regen_request {
+            if let Err(e) =
+                vp.regenerate_smart_mask(&render_state.device, &render_state.queue, *idx)
+            {
+                log::warn!("smart-mask regen failed on layer {idx}: {e}");
+            }
+        }
+
+        // Smart-material preset → new layer with mask + smart config.
+        if let Some(preset) = preset_request {
+            match vp.apply_smart_material_preset(
+                &render_state.device,
+                &render_state.queue,
+                preset,
+            ) {
+                Ok(idx) => log::info!("applied {} preset as layer {idx}", preset.label()),
+                Err(e) => log::warn!("preset {} regen failed: {e}", preset.label()),
+            }
         }
         if needs_recomposite {
             vp.recomposite(&render_state.device, &render_state.queue);
@@ -1364,6 +1429,30 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
     ui.add_space(8.0);
     ui.label("Texture-baker maps");
 
+    // Last-bake status strip. The bake call is sync (UI freezes for
+    // its duration) — this is the post-hoc receipt so the user knows
+    // it actually finished and how long it took. Threaded mid-bake
+    // progress is a follow-up.
+    if let Some(s) = vp.last_bake_status.clone() {
+        let secs = s.duration_ms as f32 / 1000.0;
+        let txt = match s.error {
+            None => format!(
+                "✓ {} baked in {secs:.2}s · {}×{} · {} tiles",
+                s.kind.label(),
+                s.resolution,
+                s.resolution,
+                s.tile_count
+            ),
+            Some(ref err) => format!("✗ {} bake failed: {err}", s.kind.label()),
+        };
+        let color = if s.error.is_none() {
+            egui::Color32::from_rgb(120, 220, 140)
+        } else {
+            egui::Color32::from_rgb(255, 140, 120)
+        };
+        ui.colored_label(color, txt);
+    }
+
     // Source meshes — optional high-poly + cage that drive low→high
     // projection bakes (normal / AO with HP detail / curvature / etc).
     // Both default to None (self-bakes from the low-poly).
@@ -1395,6 +1484,7 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
                         );
                         vp.bake_high_poly = Some(m);
                         vp.bake_high_poly_label = Some(format!("{stem} · {tri} tris"));
+                        vp.bake_high_poly_path = Some(path);
                     }
                     Err(e) => log::error!("HP load failed: {e}"),
                 }
@@ -1406,6 +1496,7 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
         {
             vp.bake_high_poly = None;
             vp.bake_high_poly_label = None;
+            vp.bake_high_poly_path = None;
         }
     });
 
@@ -1451,6 +1542,7 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
                             );
                             vp.bake_cage = Some(m);
                             vp.bake_cage_label = Some(format!("{stem} · {lp_vert_count} verts"));
+                            vp.bake_cage_path = Some(path);
                         }
                     }
                     Err(e) => log::error!("cage load failed: {e}"),
@@ -1463,6 +1555,7 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
         {
             vp.bake_cage = None;
             vp.bake_cage_label = None;
+            vp.bake_cage_path = None;
         }
     });
 
@@ -1596,7 +1689,8 @@ fn run_bake(
     let cpu_mesh = vp.cpu_mesh().clone();
     let hp_ref = vp.bake_high_poly.as_ref();
     let cage_ref = vp.bake_cage.as_ref();
-    match crate::bake::integration::bake_map(
+    let started = std::time::Instant::now();
+    let result = crate::bake::integration::bake_map(
         device,
         queue,
         &cpu_mesh,
@@ -1606,16 +1700,155 @@ fn run_bake(
         resolution,
         kind,
         &vp.bake_settings,
-    ) {
+    );
+    let duration_ms = started.elapsed().as_millis();
+    match result {
         Ok(baked) => {
+            log::info!(
+                "baked {:?} at {}×{} for {} tiles in {} ms",
+                kind,
+                resolution,
+                resolution,
+                tiles.len(),
+                duration_ms
+            );
             vp.mesh_maps.set(kind, baked);
-            // Mirror the live revision so the panel reads "fresh".
             vp.mesh_maps.baked_at_revision = vp.mesh_revision;
-            log::info!("baked {:?} at {}×{} for {} tiles", kind, resolution, resolution, tiles.len());
+            vp.last_bake_status = Some(crate::viewport::BakeStatus {
+                kind,
+                duration_ms,
+                tile_count: tiles.len() as u32,
+                resolution,
+                error: None,
+            });
         }
         Err(e) => {
             log::error!("bake {:?} failed: {e}", kind);
+            vp.last_bake_status = Some(crate::viewport::BakeStatus {
+                kind,
+                duration_ms,
+                tile_count: tiles.len() as u32,
+                resolution,
+                error: Some(e),
+            });
         }
+    }
+}
+
+/// Per-layer smart-mask sub-block. Renders below the mask row of any
+/// layer that has a mask. Toggling `Smart` writes / clears
+/// `Mask::smart`; param changes queue a regenerate request that the
+/// caller drains after the panel traversal completes.
+fn smart_mask_subpanel(
+    ui: &mut egui::Ui,
+    vp: &mut Viewport,
+    layer_idx: usize,
+    _frame: &eframe::Frame,
+    regen_request: &mut Vec<usize>,
+) {
+    use crate::paint::smart_mask::{SmartMaskParams, SmartMaskSource};
+
+    // Snapshot which sources are currently bakeable before taking the
+    // mutable borrow on `mask` — the borrow checker rejects accessing
+    // `vp.mesh_maps` from inside the source-picker closure once we've
+    // already aliased `vp.layer_stack.layers[…].mask`.
+    let availability: Vec<(SmartMaskSource, bool)> = SmartMaskSource::ALL
+        .iter()
+        .map(|&src| (src, source_is_baked(vp, src)))
+        .collect();
+
+    let Some(mask) = vp.layer_stack.layers[layer_idx].mask.as_mut() else {
+        return;
+    };
+
+    ui.indent(("smart_mask_indent", layer_idx), |ui| {
+        // Smart-mask toggle — small icon button (sparkle = "auto-
+        // generated"). Filled blue when on, neutral when off, mirrors
+        // the Properties tab strip's selection style. Reads cleaner
+        // than a plain checkbox in the dense layer row.
+        let is_smart_before = mask.smart.is_some();
+        let fill = if is_smart_before {
+            egui::Color32::from_rgb(46, 92, 148)
+        } else {
+            ui.style().visuals.widgets.inactive.bg_fill
+        };
+        let toggle = ui.add(
+            egui::Button::new(
+                egui::RichText::new(format!(
+                    "{}  Smart mask",
+                    egui_phosphor::regular::SPARKLE
+                ))
+                .size(14.0),
+            )
+            .fill(fill)
+            .min_size(egui::vec2(140.0, 22.0)),
+        );
+        if toggle.clicked() {
+            if is_smart_before {
+                mask.smart = None;
+                // Don't recompose — the existing texture stays as a
+                // starting point the user can paint over.
+            } else {
+                mask.smart = Some(SmartMaskParams::default());
+                regen_request.push(layer_idx);
+            }
+        }
+
+        let Some(params) = mask.smart.as_mut() else {
+            return;
+        };
+
+        let prev = *params;
+
+        ui.horizontal(|ui| {
+            ui.label("Source");
+            let cur = params.source;
+            egui::ComboBox::from_id_salt(("smart_mask_source", layer_idx))
+                .selected_text(cur.label())
+                .show_ui(ui, |ui| {
+                    for &(src, available) in &availability {
+                        let label = if available {
+                            src.label().to_string()
+                        } else {
+                            format!("{} (no bake)", src.label())
+                        };
+                        ui.add_enabled_ui(available, |ui| {
+                            ui.selectable_value(&mut params.source, src, label);
+                        });
+                    }
+                });
+        });
+
+        ui.add(egui::Slider::new(&mut params.low, 0.0..=1.0).text("low"));
+        ui.add(egui::Slider::new(&mut params.high, 0.0..=1.0).text("high"));
+        ui.add(egui::Slider::new(&mut params.contrast, 0.1..=4.0).text("contrast"));
+        ui.checkbox(&mut params.invert, "Invert");
+        if ui.button("Refresh").clicked() {
+            regen_request.push(layer_idx);
+        }
+
+        if *params != prev {
+            // Keep low < high so the smoothstep curve never collapses
+            // to a 1-LSB step that artists can't see.
+            if params.low > params.high {
+                std::mem::swap(&mut params.low, &mut params.high);
+            }
+            regen_request.push(layer_idx);
+        }
+    });
+}
+
+fn source_is_baked(vp: &Viewport, src: crate::paint::smart_mask::SmartMaskSource) -> bool {
+    use crate::paint::smart_mask::SmartMaskSource as S;
+    match src {
+        S::AoCrevice => vp.mesh_maps.ao.is_some(),
+        S::CurvatureConvex | S::CurvatureConcave => vp.mesh_maps.curvature.is_some(),
+        S::Thickness => vp.mesh_maps.thickness.is_some(),
+        // World-Y up reads world_normal which always lives on
+        // MeshMaps (1×1 dummy until the user runs the world-maps
+        // bake). Treat it as always available — the UX is "click
+        // Bake on world maps" rather than gating the row.
+        S::WorldYUp => true,
     }
 }
 
@@ -2042,6 +2275,41 @@ fn material_factors_section(ui: &mut egui::Ui, vp: &mut Viewport) {
             .text("displacement scale")
             .show_value(true),
     );
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.label(egui::RichText::new("Bake effects").strong());
+    ui.weak("Multipliers / blends on the baked mesh maps from the Bake tab.");
+
+    // Baked-normal blend — mixes the painted tangent-space normal
+    // toward the baked map from `MeshMaps::normal`. 0 = painted only,
+    // 1 = baked only. Disabled until the user actually bakes Normal,
+    // because the dummy is flat (0,0,1) and would just kill detail.
+    let has_baked_normal = vp.mesh_maps.normal.is_some();
+    ui.add_enabled(
+        has_baked_normal,
+        egui::Slider::new(&mut vp.baked_normal_blend, 0.0..=1.0)
+            .text("baked normal blend")
+            .show_value(true),
+    );
+    if !has_baked_normal {
+        ui.weak("(bake the Normal map on the Bake tab to enable)");
+    }
+
+    // AO intensity — Substance / Marmoset call this "Ambient occlusion
+    // strength". 0 = disabled (pass-through), 1 = full baked AO,
+    // > 1 = exaggerated. Always interactable: when no AO is baked the
+    // shader's source dummy is 1.0, so `mix(1.0, 1.0, k) = 1.0` and
+    // the slider is harmless until a real bake lands.
+    let has_baked_ao = vp.mesh_maps.ao.is_some();
+    ui.add(
+        egui::Slider::new(&mut vp.ao_intensity, 0.0..=2.0)
+            .text("AO intensity")
+            .show_value(true),
+    );
+    if !has_baked_ao {
+        ui.weak("(bake AO on the Bake tab to see it on the model)");
+    }
 }
 
 fn light_section(ui: &mut egui::Ui, vp: &mut Viewport) {
@@ -2171,6 +2439,61 @@ impl App {
                     vp.recomposite(&render_state.device, &render_state.queue);
                 }
 
+                // Project sidecar (JSON) — apply bake settings,
+                // material factors, smart-mask params. HP / cage are
+                // re-loaded from disk if their paths still exist.
+                match crate::project::load_sidecar(&work_dir) {
+                    Ok(Some(side)) => {
+                        // Re-load HP / cage by replaying the same
+                        // routine the panel buttons run, so the in-
+                        // memory caches and labels stay coherent.
+                        if let Some(ref hp_path) = side.bake.high_poly_path {
+                            match crate::bake::integration::load_high_poly(hp_path) {
+                                Ok(m) => {
+                                    let stem = hp_path
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "hp".into());
+                                    let tri = m.indices.len();
+                                    vp.bake_high_poly = Some(m);
+                                    vp.bake_high_poly_label = Some(format!("{stem} · {tri} tris"));
+                                    vp.bake_high_poly_path = Some(hp_path.clone());
+                                }
+                                Err(e) => {
+                                    log::warn!("sidecar HP load failed: {e}");
+                                }
+                            }
+                        }
+                        if let Some(ref cage_path) = side.bake.cage_path {
+                            match crate::bake::integration::load_cage(cage_path) {
+                                Ok(m) => {
+                                    let stem = cage_path
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "cage".into());
+                                    let lp_vert_count = vp.cpu_mesh().positions.len();
+                                    if m.positions.len() == lp_vert_count {
+                                        vp.bake_cage = Some(m);
+                                        vp.bake_cage_label =
+                                            Some(format!("{stem} · {lp_vert_count} verts"));
+                                        vp.bake_cage_path = Some(cage_path.clone());
+                                    } else {
+                                        log::warn!(
+                                            "sidecar cage vertex mismatch: cage={} vs low-poly={}",
+                                            m.positions.len(),
+                                            lp_vert_count
+                                        );
+                                    }
+                                }
+                                Err(e) => log::warn!("sidecar cage load failed: {e}"),
+                            }
+                        }
+                        vp.apply_sidecar(&render_state.device, &render_state.queue, &side);
+                    }
+                    Ok(None) => {}
+                    Err(e) => log::warn!("project sidecar parse failed: {e:#}"),
+                }
+
                 self.current_usd_path = Some(path.clone());
                 let sidecar_msg = if loaded_n > 0 {
                     format!(" — loaded {loaded_n} sidecar(s) from {}", work_dir.display())
@@ -2213,6 +2536,13 @@ impl App {
             &dir,
         ) {
             Ok(exports) => {
+                // Project sidecar — JSON metadata that travels next to
+                // the PNGs (HP / cage paths, bake settings, smart-mask
+                // params, material factors).
+                let sidecar = vp.build_sidecar();
+                if let Err(e) = crate::project::save_sidecar(&dir, &sidecar) {
+                    log::warn!("project sidecar save failed: {e:#}");
+                }
                 let hook_msg = run_post_export_hook(&dir);
                 self.status = format!(
                     "Saved {} files to {}{hook_msg}",

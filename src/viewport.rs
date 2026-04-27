@@ -81,6 +81,7 @@ pub struct Viewport {
     pub wireframe: WireframePipeline,
     brush_pipeline: BrushPipeline,
     projection_brush: ProjectionBrushPipeline,
+    pub smart_mask_pipeline: crate::paint::SmartMaskPipeline,
 
     /// Index into `AssetBrowser.textures` for the stencil currently
     /// routed through the projection brush. `None` = regular painting.
@@ -128,11 +129,21 @@ pub struct Viewport {
     pub bake_high_poly: Option<texture_baker::mesh::Mesh>,
     /// Display name (file stem) of the high-poly currently loaded.
     pub bake_high_poly_label: Option<String>,
+    /// Source path on disk — persisted into the project sidecar so the
+    /// HP gets re-loaded automatically next session.
+    pub bake_high_poly_path: Option<std::path::PathBuf>,
     /// Optional cage mesh — shares the low-poly's vertex count + index
     /// layout. The integration adapter slices it per-tile in lockstep
     /// with the low-poly extractor.
     pub bake_cage: Option<CpuMesh>,
     pub bake_cage_label: Option<String>,
+    pub bake_cage_path: Option<std::path::PathBuf>,
+    /// Most-recent bake outcome, surfaced as a status strip in the
+    /// Bake tab. Persists across frames until the next bake replaces
+    /// it. Threading the bake itself is a separate phase — for now
+    /// the strip just reports duration / failure after the sync call
+    /// returns. None = no bake has run since startup.
+    pub last_bake_status: Option<BakeStatus>,
     baker: Baker,
 
     pub camera: OrbitCamera,
@@ -148,6 +159,15 @@ pub struct Viewport {
     /// Multiplier applied to the painted height when vertex-displacing
     /// the mesh. 0 = display disabled (paint data still persists).
     pub displacement_scale: f32,
+    /// 0 = painted normal only (default). 1 = baked normal fully
+    /// replaces the painted layer. Mid values mix tangent-space then
+    /// renormalise — the standard "use HP detail" knob.
+    pub baked_normal_blend: f32,
+    /// Multiplier on the baked AO contribution. 0 = AO disabled (no
+    /// occlusion at all), 1 = full strength (default), > 1 = stronger.
+    /// Maps onto Marmoset's "AO strength" / Substance Painter's
+    /// "Ambient Occlusion intensity".
+    pub ao_intensity: f32,
     /// How many midpoint subdivisions to apply to the display mesh.
     /// Picking + paint UV still use the *base* mesh; this only changes
     /// the rendered geometry so vertex displacement has fine enough
@@ -207,6 +227,20 @@ pub struct Viewport {
     pub layer_thumb_cache: Vec<Option<egui::TextureId>>,
 }
 
+/// One-shot record of the last completed bake. The Bake tab renders
+/// this as a small strip so the user gets feedback after the bake
+/// returns (the call is sync and freezes the UI for the duration —
+/// this is the post-hoc receipt). `tile_count` reports how many
+/// non-empty tiles actually got texels.
+#[derive(Debug, Clone)]
+pub struct BakeStatus {
+    pub kind: crate::bake::integration::MapKind,
+    pub duration_ms: u128,
+    pub tile_count: u32,
+    pub resolution: u32,
+    pub error: Option<String>,
+}
+
 pub struct BrushState {
     pub channel: PaintChannel,
     /// Single-source color for the brush. Drives base color directly, and
@@ -246,6 +280,7 @@ impl Viewport {
         let background = BackgroundPipeline::new(device);
         let wireframe = WireframePipeline::new(device, &renderer.frame_bgl);
         let brush_pipeline = BrushPipeline::new(device);
+        let smart_mask_pipeline = crate::paint::SmartMaskPipeline::new(device);
         let projection_brush = ProjectionBrushPipeline::new(device);
         let compositor = Compositor::new(device, queue);
         let gpu = GpuMesh::from_cpu(device, cpu);
@@ -310,6 +345,7 @@ impl Viewport {
             fxaa,
             wireframe,
             brush_pipeline,
+            smart_mask_pipeline,
             projection_brush,
             active_stencil: None,
             stencil_transform: StencilTransform::default(),
@@ -335,8 +371,11 @@ impl Viewport {
             mesh_revision: 0,
             bake_high_poly: None,
             bake_high_poly_label: None,
+            bake_high_poly_path: None,
             bake_cage: None,
             bake_cage_label: None,
+            bake_cage_path: None,
+            last_bake_status: None,
             baker,
             camera,
             brush: BrushState::default(),
@@ -346,6 +385,8 @@ impl Viewport {
             roughness_factor: 1.0,
             normal_scale: 1.0,
             displacement_scale: 0.0,
+            baked_normal_blend: 0.0,
+            ao_intensity: 1.0,
             subdivision_level: 0,
             light_intensity: 3.0,
             light_dir: [-0.4, -1.0, -0.3],
@@ -567,6 +608,154 @@ impl Viewport {
         self.layer_stack.add_fill_layer(device, queue);
         self.layer_thumb_cache.push(None);
         self.recomposite(device, queue);
+    }
+
+    /// Snapshot the bake / material / smart-mask state into a project
+    /// sidecar suitable for `forge-project.json` round-tripping. Heavy
+    /// data (paint layers, baked GPU textures) lives next to the JSON
+    /// as separate binaries — this struct is metadata only.
+    pub fn build_sidecar(&self) -> crate::project::ProjectSidecar {
+        let layers = self
+            .layer_stack
+            .layers
+            .iter()
+            .map(|l| crate::project::LayerSection {
+                smart_mask: l.mask.as_ref().and_then(|m| m.smart),
+            })
+            .collect();
+        crate::project::ProjectSidecar {
+            version: 1,
+            bake: crate::project::BakeSection {
+                high_poly_path: self.bake_high_poly_path.clone(),
+                cage_path: self.bake_cage_path.clone(),
+                settings: Some(self.bake_settings),
+            },
+            material: crate::project::MaterialSection {
+                base_color_factor: self.base_color_factor,
+                metallic: self.metallic_factor,
+                roughness: self.roughness_factor,
+                normal_scale: self.normal_scale,
+                displacement_scale: self.displacement_scale,
+                baked_normal_blend: self.baked_normal_blend,
+                ao_intensity: self.ao_intensity,
+            },
+            layers,
+        }
+    }
+
+    /// Apply a smart-material preset: add a fill layer with the
+    /// preset's colour / roughness / metalness, attach a mask with the
+    /// preset's smart-mask config, and run a regen so the visible
+    /// reveal pattern shows up immediately. Returns the new layer's
+    /// index, or Err if the required source bake is missing — the
+    /// caller surfaces that to the user.
+    pub fn apply_smart_material_preset(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        preset: crate::paint::SmartMaterialPreset,
+    ) -> Result<usize, String> {
+        // 1. Add the fill layer + push its params.
+        self.add_fill_layer(device, queue);
+        let idx = self.layer_stack.layers.len() - 1;
+        self.layer_stack.layers[idx].set_fill_params(queue, preset.fill_params());
+
+        // 2. Add a mask + stamp the smart-mask config.
+        self.layer_stack.add_mask_to(idx, device, queue);
+        if let Some(mask) = self.layer_stack.layers[idx].mask.as_mut() {
+            mask.smart = Some(preset.smart_mask());
+        }
+
+        // 3. Activate the new layer so the user can immediately tweak
+        //    the smart-mask params from the layer panel.
+        self.layer_stack.active = idx;
+
+        // 4. Best-effort regen. If the source bake is missing the
+        //    error bubbles up; the layer is already added either way
+        //    so the user can bake then refresh.
+        let regen_result = self.regenerate_smart_mask(device, queue, idx);
+        // Recomposite regardless — the new fill layer needs to land
+        // even if the smart-mask regen errored out.
+        self.recomposite(device, queue);
+        regen_result.map(|_| idx)
+    }
+
+    /// Apply a previously-saved sidecar to this viewport. Bake textures
+    /// aren't restored in v1 — caller re-bakes after load. Smart-mask
+    /// params are stamped onto each layer's mask (creating one if the
+    /// layer didn't have a mask), then `regenerate_smart_mask` runs to
+    /// repopulate the texture from the freshly baked maps (when the
+    /// required source map is available).
+    pub fn apply_sidecar(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sidecar: &crate::project::ProjectSidecar,
+    ) {
+        // Material factors.
+        self.base_color_factor = sidecar.material.base_color_factor;
+        self.metallic_factor = sidecar.material.metallic;
+        self.roughness_factor = sidecar.material.roughness;
+        self.normal_scale = sidecar.material.normal_scale;
+        self.displacement_scale = sidecar.material.displacement_scale;
+        self.baked_normal_blend = sidecar.material.baked_normal_blend;
+        self.ao_intensity = sidecar.material.ao_intensity;
+
+        if let Some(s) = sidecar.bake.settings {
+            self.bake_settings = s;
+        }
+
+        // Per-layer smart-mask params. Iterate up to the smaller of
+        // the two — adding new layers from the sidecar is out of
+        // scope for v1 (the layer stack itself isn't persisted yet).
+        let n = self.layer_stack.layers.len().min(sidecar.layers.len());
+        for i in 0..n {
+            let Some(params) = sidecar.layers[i].smart_mask else {
+                continue;
+            };
+            // Auto-create a mask if the layer doesn't have one — the
+            // smart-mask sub-block needs a mask to live on.
+            if self.layer_stack.layers[i].mask.is_none() {
+                self.layer_stack.add_mask_to(i, device, queue);
+            }
+            if let Some(mask) = self.layer_stack.layers[i].mask.as_mut() {
+                mask.smart = Some(params);
+            }
+            // Best-effort regen — silently skip if the source bake
+            // isn't available (the user will see "(no bake)" in the
+            // picker and can re-bake).
+            let _ = self.regenerate_smart_mask(device, queue, i);
+        }
+    }
+
+    /// Regenerate the smart mask on layer `idx` from the current
+    /// `MeshMaps`. Returns Err with a user-readable hint when the
+    /// required source bake is missing (e.g. "bake AO first"); the
+    /// caller surfaces it to the layer panel as a status string.
+    pub fn regenerate_smart_mask(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        idx: usize,
+    ) -> Result<(), String> {
+        let layer = self
+            .layer_stack
+            .layers
+            .get(idx)
+            .ok_or_else(|| "layer index out of range".to_string())?;
+        let mask = layer
+            .mask
+            .as_ref()
+            .ok_or_else(|| "layer has no mask".to_string())?;
+        let params = mask
+            .smart
+            .as_ref()
+            .ok_or_else(|| "mask isn't smart".to_string())?;
+        self.smart_mask_pipeline
+            .regenerate(device, queue, mask, &self.mesh_maps, params)?;
+        // Mask atlas changed → recomposite the affected layer.
+        self.recomposite(device, queue);
+        Ok(())
     }
 
     /// Delete a layer. Always keeps at least one.
@@ -840,6 +1029,8 @@ impl Viewport {
                 self.roughness_factor,
                 self.normal_scale,
                 self.displacement_scale,
+                self.baked_normal_blend,
+                self.ao_intensity,
             );
             render_state.queue.write_buffer(
                 &self.material_buf,
@@ -926,6 +1117,12 @@ impl Viewport {
                                 binding: 9,
                                 resource: wgpu::BindingResource::TextureView(
                                     self.mesh_maps.ao_view(),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 10,
+                                resource: wgpu::BindingResource::TextureView(
+                                    self.mesh_maps.baked_normal_view(),
                                 ),
                             },
                         ],

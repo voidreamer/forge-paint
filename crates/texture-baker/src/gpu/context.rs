@@ -36,16 +36,29 @@ impl GpuContext {
             adapter.get_info().backend
         );
 
+        // Texture-baker's GPU paths need fat storage buffers — at 8K
+        // resolution the AO texel buffer alone is ~2 GB. Pull whatever
+        // the adapter actually advertises rather than hard-coding 512
+        // MB; on Apple Silicon / RTX this gets us into the multi-GB
+        // range. The defaults stay at wgpu::Limits::default() for every
+        // other knob.
+        let adapter_limits = adapter.limits();
+        let mut limits = wgpu::Limits::default();
+        limits.max_buffer_size = adapter_limits.max_buffer_size;
+        limits.max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size;
+
+        log::info!(
+            "GPU buffer limits: max_buffer={} MB, max_storage_binding={} MB",
+            limits.max_buffer_size / (1024 * 1024),
+            limits.max_storage_buffer_binding_size / (1024 * 1024),
+        );
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("texture-baker"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits {
-                        max_storage_buffer_binding_size: 512 * 1024 * 1024,
-                        max_buffer_size: 512 * 1024 * 1024,
-                        ..wgpu::Limits::default()
-                    },
+                    required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,

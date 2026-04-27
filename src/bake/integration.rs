@@ -101,7 +101,7 @@ impl MapKind {
 /// the standalone CLI's defaults so headless and in-app behaviour stays
 /// the same. Per-map ray counts are exposed because AO / thickness /
 /// bent normal are the slow paths most users actually want to tune.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct BakeSettings {
     pub ao_rays: u32,
     pub thickness_rays: u32,
@@ -113,7 +113,7 @@ pub struct BakeSettings {
     pub normal_format: NormalConvention,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NormalConvention {
     /// Y+ green (Substance / Marmoset / glTF default).
     DirectX,

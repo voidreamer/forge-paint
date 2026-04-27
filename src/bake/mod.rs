@@ -44,6 +44,11 @@ pub struct MeshMaps {
     pub r8_ones_view: wgpu::TextureView,
     /// Keeps the texture alive for the lifetime of the view above.
     _r8_ones_tex: wgpu::Texture,
+    /// 1×1 Rgba8Unorm array encoding flat tangent-space normal
+    /// (0.5, 0.5, 1.0, 1.0) so the baked-normal blend stays a no-op
+    /// until the user bakes the real one.
+    pub flat_normal_view: wgpu::TextureView,
+    _flat_normal_tex: wgpu::Texture,
     /// Monotonic revision the mesh was at when these maps were baked.
     /// Bumped on the viewport whenever the mesh / subdivision / tile
     /// resolution changes; UI compares against this to flag stale maps.
@@ -198,6 +203,44 @@ impl MeshMaps {
             ..Default::default()
         });
 
+        // Dummy flat tangent-space normal — encoded (0.5, 0.5, 1.0).
+        let flat_normal_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mesh_maps.flat_normal"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: tile_count,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for layer in 0..tile_count {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &flat_normal_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &[128u8, 128, 255, 255],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            );
+        }
+        let flat_normal_view = flat_normal_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("mesh_maps.flat_normal.array_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+
         Self {
             world_normal,
             world_normal_view,
@@ -214,6 +257,8 @@ impl MeshMaps {
             id: None,
             r8_ones_view,
             _r8_ones_tex: r8_ones_tex,
+            flat_normal_view,
+            _flat_normal_tex: flat_normal_tex,
             baked_at_revision: 0,
         }
     }
@@ -225,6 +270,15 @@ impl MeshMaps {
             .as_ref()
             .map(|b| &b.view)
             .unwrap_or(&self.r8_ones_view)
+    }
+
+    /// View to bind for the baked tangent-space normal at slot 10 —
+    /// falls back to the flat-normal dummy when not yet baked.
+    pub fn baked_normal_view(&self) -> &wgpu::TextureView {
+        self.normal
+            .as_ref()
+            .map(|b| &b.view)
+            .unwrap_or(&self.flat_normal_view)
     }
 
     /// Run the world-normal bake, producing a full-resolution texture per

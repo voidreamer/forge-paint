@@ -22,7 +22,10 @@ struct Frame {
 
 struct Material {
     base_color_factor: vec4<f32>,
-    params: vec4<f32>,              // x=metallic, y=roughness, z=normal_scale, w=_
+    params: vec4<f32>,              // x=metallic, y=roughness, z=normal_scale, w=displacement_scale
+    /// x = baked-normal blend (0 = painted only, 1 = baked only).
+    /// y/z/w reserved for future bake-driven knobs.
+    params2: vec4<f32>,
     tile_count: u32,
     // 12 bytes of implicit padding here; matches Rust's `_pad0: [u32; 3]`
     // and the 16-byte alignment requirement of the array member below.
@@ -52,6 +55,10 @@ struct Env {
 /// the user hasn't baked it — multiplying by 1.0 is a no-op so the
 /// shader can sample unconditionally without a feature flag.
 @group(1) @binding(9) var ao_tex: texture_2d_array<f32>;
+/// Baked tangent-space normal (Rgba8Unorm D2Array). 1×1 dummy
+/// encoded as flat (0.5, 0.5, 1.0) when the user hasn't baked it —
+/// keeps the blend a no-op until they slide the knob away from 0.
+@group(1) @binding(10) var baked_normal_tex: texture_2d_array<f32>;
 @group(2) @binding(0) var<uniform> env: Env;
 @group(2) @binding(1) var env_tex: texture_2d<f32>;
 @group(2) @binding(2) var irradiance_tex: texture_2d<f32>;
@@ -310,7 +317,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             * material.params.x;
 
         let nn = textureSample(normal_tex, texset_sampler, local_uv, layer).rgb * 2.0 - 1.0;
-        n_tangent_space = normalize(nn);
+        let painted_n = normalize(nn);
+        // Blend with the baked normal (HP→LP projected detail). When
+        // `params2.x == 0` the dummy is flat (0,0,1) anyway so the mix
+        // is a no-op; when 1 the painted normal is fully replaced. We
+        // mix in tangent space and renormalise — fine for low blend
+        // values; for art-quality blending RNM / Reoriented Normal
+        // Mapping is the upgrade path.
+        let baked_n_raw = textureSample(baked_normal_tex, texset_sampler, local_uv, layer).rgb * 2.0 - 1.0;
+        let baked_n = normalize(baked_n_raw);
+        let blend = clamp(material.params2.x, 0.0, 1.0);
+        n_tangent_space = normalize(mix(painted_n, baked_n, blend));
     }
 
     let n_geom = normalize(in.world_normal);
@@ -413,8 +430,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // light still reaches every facing texel. R8 returns the AO factor
     // in r; the unbaked dummy is 1.0 so this is a pass-through until
     // the user runs a bake.
+    //
+    // `params2.y` is the AO intensity slider (0 = no occlusion / pass
+    // through, 1 = full baked AO, > 1 = exaggerated). Mix toward 1.0
+    // so 0 disables AO without forcing the dummy.
     let ao_uv = fract(in.uv);
-    let ao = textureSample(ao_tex, texset_sampler, ao_uv, layer).r;
+    let ao_raw = textureSample(ao_tex, texset_sampler, ao_uv, layer).r;
+    let ao = mix(1.0, ao_raw, material.params2.y);
     let lit = direct + (ibl_diffuse + ibl_specular) * frame.ibl_scale * ao;
 
     // View-mode override — isolate a channel for inspection. The PBR pass

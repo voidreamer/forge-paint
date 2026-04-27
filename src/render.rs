@@ -299,6 +299,19 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // 10: baked tangent-space normal map (Rgba8Unorm D2Array).
+                // 1×1 dummy encoded as flat (0.5, 0.5, 1.0, 1.0) so the
+                // blend in the shader is a no-op until the user bakes it.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 

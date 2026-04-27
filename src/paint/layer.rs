@@ -90,6 +90,12 @@ pub struct Mask {
     pub texture: wgpu::Texture,
     pub array_view: wgpu::TextureView,
     pub layer_views: Vec<wgpu::TextureView>,
+    /// `None` = manually painted via the brush. `Some` = the texture
+    /// is regenerated from baked mesh maps each time the params
+    /// change. Switching from manual → smart overwrites the painted
+    /// content; switching from smart → manual preserves whatever was
+    /// generated last (the user can keep painting on top).
+    pub smart: Option<crate::paint::smart_mask::SmartMaskParams>,
 }
 
 impl Mask {
@@ -164,7 +170,27 @@ impl Mask {
             texture,
             array_view,
             layer_views,
+            smart: None,
         }
+    }
+
+    /// Mark this mask as smart-generated and store the regen params.
+    /// The texture content is unchanged here — Phase B's regenerator
+    /// is what actually turns it into a generated mask.
+    pub fn set_smart(&mut self, params: crate::paint::smart_mask::SmartMaskParams) {
+        self.smart = Some(params);
+    }
+
+    /// Drop the smart-generation flag — leaves the texture as-is so
+    /// the user can keep painting on top of whatever was last
+    /// regenerated. Use `clear_smart_and_reset()` to also reset to
+    /// fully visible (the manual default).
+    pub fn clear_smart(&mut self) {
+        self.smart = None;
+    }
+
+    pub fn is_smart(&self) -> bool {
+        self.smart.is_some()
     }
 }
 
