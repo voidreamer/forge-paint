@@ -2,8 +2,9 @@ name: forge-paint
 version: "0.1.0"
 description: "USD-centric Rust painter — prototype Substance Painter replacement for the forge/anvil pipeline. Runs standalone; picks up pipeline state from env vars when present."
 
-# Pulls in USD + the ForgeResolver so `usdcat --flatten` can resolve
-# forge:// URIs transparently when forge-paint is launched through `pipe`.
+# Pulls in USD + the ForgeResolver. forge-paint links rust-usd into the
+# process at build time, so USD's URI scheme dispatch routes forge:// to
+# the C++ ForgeResolver via PXR_PLUGINPATH_NAME.
 requires:
   - usd
   - resolver-0.26.5
@@ -11,6 +12,14 @@ requires:
 environment:
   # Point at the locally-built binary. Adjust if the project lives elsewhere.
   PATH: ~/projects/forge-paint/target/release:${PATH}
+  # rust-usd's build.rs reads these to compile + link the cxx bridge.
+  # Mirrors the ~/USD layout managed by the `usd` package above.
+  USD_INSTALL_DIR: ~/USD
+  USD_LIB_PREFIX: usd_
+  USD_LINK_PYTHON: framework
+  USD_PYTHON_FRAMEWORK: Python
+  USD_PYTHON_FRAMEWORK_DIR: /opt/homebrew/opt/python@3.14/Frameworks
+  USD_PYTHON_INCLUDE_DIR: /opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/include/python3.14
 
 commands:
   forge-paint: forge-paint

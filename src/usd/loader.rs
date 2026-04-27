@@ -1,10 +1,14 @@
-use anyhow::{anyhow, bail, Context, Result};
+//! Stage loader. Uses `rust_usd` to open a USD stage in-process; the C++
+//! ForgeResolver registered via PXR_PLUGINPATH_NAME handles `forge://`
+//! URIs through USD's URI-scheme dispatch — rust-usd's own
+//! `ForgeAwareResolver` becomes the no-op primary, our resolver wins for
+//! `forge://`.
+
+use anyhow::{anyhow, bail, Result};
 use glam::{Mat3, Mat4, Vec2, Vec3};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use crate::mesh::CpuMesh;
-use crate::usd::parser::{parse_usda, Interpolation, StPrimvar, UsdMesh};
 
 #[derive(Debug, Clone)]
 pub struct LoadedMesh {
@@ -12,68 +16,24 @@ pub struct LoadedMesh {
     pub mesh: CpuMesh,
 }
 
-/// Locate the `usdcat` binary. Prefer $HOME/USD/bin/usdcat (the anvil-managed
-/// install), fall back to PATH.
-fn locate_usdcat() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = PathBuf::from(&home).join("USD/bin/usdcat");
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-    // PATH lookup via `which`
-    let out = Command::new("which")
-        .arg("usdcat")
-        .output()
-        .context("failed to run `which usdcat`")?;
-    if out.status.success() {
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !s.is_empty() {
-            return Ok(PathBuf::from(s));
-        }
-    }
-    Err(anyhow!(
-        "usdcat not found. Install USD or source the anvil pipeline environment."
-    ))
-}
-
-fn flatten_to_usda(input: &Path) -> Result<String> {
-    let usdcat = locate_usdcat()?;
-    let out_path = std::env::temp_dir().join(format!(
-        "forge-paint-flat-{}.usda",
-        std::process::id()
-    ));
-    let status = Command::new(&usdcat)
-        .arg("--flatten")
-        .arg(input)
-        .arg("-o")
-        .arg(&out_path)
-        .status()
-        .with_context(|| format!("failed to execute {}", usdcat.display()))?;
-    if !status.success() {
-        bail!("usdcat --flatten exited with {status}");
-    }
-    let text = std::fs::read_to_string(&out_path)
-        .with_context(|| format!("failed to read flattened output at {}", out_path.display()))?;
-    let _ = std::fs::remove_file(&out_path);
-    Ok(text)
-}
-
-/// Load a USD stage by flattening it and parsing the resulting .usda text.
-/// Returns one `LoadedMesh` per `UsdGeomMesh` prim, with xforms baked into
-/// positions and UVs unwelded to per-face-vert.
+/// Load a USD stage by path or `forge://` URI. Returns one `LoadedMesh`
+/// per `UsdGeomMesh` prim, with xforms baked into positions and UVs
+/// unwelded to per-face-vert.
 pub fn load_stage(path: &Path) -> Result<Vec<LoadedMesh>> {
-    let text = flatten_to_usda(path)?;
-    let usd_meshes = parse_usda(&text).with_context(|| "parsing flattened .usda")?;
-    if usd_meshes.is_empty() {
-        bail!("stage contains no UsdGeomMesh prims");
+    let stage = rust_usd::Stage::open(path)
+        .map_err(|e| anyhow!("Stage::open({}) failed: {}", path.display(), e.what()))?;
+
+    let pxr_meshes = stage.meshes();
+    if pxr_meshes.is_empty() {
+        bail!("stage at {} contains no UsdGeomMesh prims", path.display());
     }
 
-    let mut loaded = Vec::with_capacity(usd_meshes.len());
-    for m in usd_meshes {
-        let mesh = triangulate(&m)?;
+    let mut loaded = Vec::with_capacity(pxr_meshes.len());
+    for m in pxr_meshes {
+        let intermediate = build_intermediate(&m)?;
+        let mesh = triangulate(&intermediate)?;
         loaded.push(LoadedMesh {
-            path: m.path,
+            path: intermediate.path,
             mesh,
         });
     }
@@ -106,7 +66,124 @@ pub fn load_stage_merged(path: &Path) -> Result<CpuMesh> {
     Ok(out)
 }
 
-/// Fan-triangulate n-gons with per-face-vert output (UVs unwelded).
+// ---------------------------------------------------------------------------
+// Intermediate representation + rust-usd → IR conversion
+//
+// We keep a small struct here rather than handing rust_usd::Mesh directly
+// to triangulate() because:
+//   * rust-usd flattens points/normals/uvs to Vec<f32>; chunking into
+//     [f32; N] arrays once at the boundary keeps the inner loops clean.
+//   * Interpolation comes through as a String in rust-usd; we convert
+//     it to a Rust enum so the match arms in triangulate stay typed.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interpolation {
+    Vertex,
+    FaceVarying,
+    Uniform,
+    Constant,
+    Unknown,
+}
+
+impl Interpolation {
+    fn parse(s: &str) -> Self {
+        match s {
+            "vertex" => Self::Vertex,
+            "faceVarying" => Self::FaceVarying,
+            "uniform" => Self::Uniform,
+            "constant" => Self::Constant,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StPrimvar {
+    data: Vec<[f32; 2]>,
+    indices: Option<Vec<u32>>,
+    interpolation: Interpolation,
+}
+
+#[derive(Debug, Clone)]
+struct NormalPrimvar {
+    data: Vec<[f32; 3]>,
+    indices: Option<Vec<u32>>,
+    interpolation: Interpolation,
+}
+
+#[derive(Debug, Clone)]
+struct UsdMesh {
+    path: String,
+    points: Vec<[f32; 3]>,
+    face_vertex_counts: Vec<u32>,
+    face_vertex_indices: Vec<u32>,
+    st: Option<StPrimvar>,
+    normals: Option<NormalPrimvar>,
+    world_xform: Mat4,
+}
+
+fn build_intermediate(m: &rust_usd::Mesh) -> Result<UsdMesh> {
+    let path = m.prim_path();
+
+    // USD authors `local_to_world` as row-major; rust-usd hands it back
+    // as [[f32;4];4] in the same convention. glam::Mat4 is column-major.
+    let lt_w = m.local_to_world();
+    let world_xform = Mat4::from_cols_array_2d(&[
+        [lt_w[0][0], lt_w[1][0], lt_w[2][0], lt_w[3][0]],
+        [lt_w[0][1], lt_w[1][1], lt_w[2][1], lt_w[3][1]],
+        [lt_w[0][2], lt_w[1][2], lt_w[2][2], lt_w[3][2]],
+        [lt_w[0][3], lt_w[1][3], lt_w[2][3], lt_w[3][3]],
+    ]);
+
+    let normals_data = m.normals_xyz();
+    let normals = if normals_data.is_empty() {
+        None
+    } else {
+        Some(NormalPrimvar {
+            data: normals_data,
+            // rust-usd's Mesh API doesn't surface normals_indices yet;
+            // we never relied on them anyway. The dispatch in the old
+            // .usda parser silently dropped `normals:indices`.
+            indices: None,
+            interpolation: Interpolation::parse(&m.normals_interpolation()),
+        })
+    };
+
+    let st_data = m.st_uv();
+    let st = if st_data.is_empty() {
+        None
+    } else {
+        let st_idx = m.st_indices_u32();
+        let indices = if st_idx.is_empty() { None } else { Some(st_idx) };
+        // primvars:st's interpolation isn't directly exposed on Mesh
+        // (only `normals_interpolation`). UsdGeomPrimvarsAPI defaults
+        // to faceVarying for st — assume that. Vertex-interpolated UVs
+        // would need a `primvar(name).interpolation()` lookup via the
+        // Primvar handle.
+        Some(StPrimvar {
+            data: st_data,
+            indices,
+            interpolation: Interpolation::FaceVarying,
+        })
+    };
+
+    Ok(UsdMesh {
+        path,
+        points: m.points_xyz(),
+        face_vertex_counts: m.face_vertex_counts_u32(),
+        face_vertex_indices: m.face_vertex_indices_u32(),
+        st,
+        normals,
+        world_xform,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Triangulation (unchanged from the previous .usda-text-driven path —
+// this is mesh logic, not USD I/O).
+// ---------------------------------------------------------------------------
+
 fn triangulate(m: &UsdMesh) -> Result<CpuMesh> {
     let total_fvi: u32 = m.face_vertex_counts.iter().sum();
     if total_fvi as usize != m.face_vertex_indices.len() {

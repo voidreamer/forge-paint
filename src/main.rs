@@ -15,6 +15,7 @@ mod paint;
 mod persist;
 mod pick;
 mod post;
+mod project;
 mod render;
 mod tangents;
 mod wireframe;
@@ -38,8 +39,8 @@ use std::path::PathBuf;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// USD / mesh file to open on startup (GUI mode only). Plain paths
-    /// or `forge://` URIs (resolved by usdcat when its env is active)
-    /// are both accepted.
+    /// or `forge://` URIs are both accepted; URIs resolve through the
+    /// C++ ForgeResolver loaded via PXR_PLUGINPATH_NAME (set by anvil).
     path: Option<PathBuf>,
 
     #[command(subcommand)]
