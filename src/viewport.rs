@@ -114,6 +114,25 @@ pub struct Viewport {
     pub prefilter_baker: PrefilterBaker,
     skybox: SkyboxPipeline,
     pub mesh_maps: MeshMaps,
+    /// User-tunable bake settings forwarded to texture-baker. Persists
+    /// across bakes so each kind doesn't reset its ray count after one
+    /// click. Mutated by the Mesh maps panel.
+    pub bake_settings: crate::bake::integration::BakeSettings,
+    /// Monotonic mesh revision. Bumped whenever the mesh / subdivision
+    /// changes; compared against `MeshMaps::baked_at_revision` so the
+    /// panel can mark maps stale.
+    pub mesh_revision: u64,
+    /// Optional high-poly source for low→high projection bakes. Loaded
+    /// from disk via the Mesh maps panel; pre-converted to texture-
+    /// baker's `Mesh` once so the per-tile loop can share the BVH input.
+    pub bake_high_poly: Option<texture_baker::mesh::Mesh>,
+    /// Display name (file stem) of the high-poly currently loaded.
+    pub bake_high_poly_label: Option<String>,
+    /// Optional cage mesh — shares the low-poly's vertex count + index
+    /// layout. The integration adapter slices it per-tile in lockstep
+    /// with the low-poly extractor.
+    pub bake_cage: Option<CpuMesh>,
+    pub bake_cage_label: Option<String>,
     baker: Baker,
 
     pub camera: OrbitCamera,
@@ -312,6 +331,12 @@ impl Viewport {
             prefilter_baker,
             skybox,
             mesh_maps,
+            bake_settings: crate::bake::integration::BakeSettings::default(),
+            mesh_revision: 0,
+            bake_high_poly: None,
+            bake_high_poly_label: None,
+            bake_cage: None,
+            bake_cage_label: None,
             baker,
             camera,
             brush: BrushState::default(),
@@ -379,6 +404,9 @@ impl Viewport {
         // Thumbnail TextureIds from the old stack point to textures that have
         // been dropped — we leak the egui slots here (rare enough to ignore).
         self.layer_thumb_cache.clear();
+        // Bumping the revision invalidates any prior baked maps — the
+        // Mesh maps panel will mark them stale until the user rebakes.
+        self.mesh_revision = self.mesh_revision.wrapping_add(1);
     }
 
     /// Rebuild the display GpuMesh by midpoint-subdividing the base
@@ -387,6 +415,9 @@ impl Viewport {
     /// resolution to work with.
     pub fn set_subdivision(&mut self, device: &wgpu::Device, level: u32) {
         let level = level.min(5);
+        if level == self.subdivision_level {
+            return;
+        }
         self.subdivision_level = level;
         let subdivided = if level == 0 {
             self.cpu_mesh.clone()
@@ -394,6 +425,8 @@ impl Viewport {
             crate::mesh::subdivide(&self.cpu_mesh, level)
         };
         self.mesh = GpuMesh::from_cpu(device, &subdivided);
+        // Subdivision changes the geometry the bakers see → maps go stale.
+        self.mesh_revision = self.mesh_revision.wrapping_add(1);
     }
 
     /// Bake mesh maps (currently: world normal) for the loaded mesh.
@@ -887,6 +920,12 @@ impl Viewport {
                                 binding: 8,
                                 resource: wgpu::BindingResource::TextureView(
                                     &self.paint_target.displacement_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 9,
+                                resource: wgpu::BindingResource::TextureView(
+                                    self.mesh_maps.ao_view(),
                                 ),
                             },
                         ],

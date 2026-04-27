@@ -3,6 +3,8 @@
 //! `texture_2d_array` D2Array layers matching the asset's UDIM tiles so the
 //! PBR shader can index them with the same layer math as painted content.
 
+pub mod integration;
+
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
 
@@ -10,6 +12,13 @@ use crate::mesh::{GpuMesh, Vertex};
 
 /// One-shot baked data. Textures live at full resolution once baked; prior
 /// to the first bake they're 1×1 so the bind group stays valid.
+///
+/// world_normal + world_position are baked together by the in-tree
+/// `worldnormal.wgsl` MRT pass — they're cheap and the projection brush
+/// needs them to be in lockstep. Everything else (`ao`, `curvature`, …)
+/// is baked on demand via the vendored texture-baker through
+/// `integration::bake_map`, lives as `Option<BakedMap>`, and is `None`
+/// until the user clicks the relevant button in the Mesh maps panel.
 pub struct MeshMaps {
     pub world_normal: wgpu::Texture,
     pub world_normal_view: wgpu::TextureView,
@@ -20,6 +29,72 @@ pub struct MeshMaps {
     pub world_position_view: wgpu::TextureView,
     pub sampler: wgpu::Sampler,
     pub baked: bool,
+
+    pub ao: Option<integration::BakedMap>,
+    pub curvature: Option<integration::BakedMap>,
+    pub thickness: Option<integration::BakedMap>,
+    pub height: Option<integration::BakedMap>,
+    pub normal: Option<integration::BakedMap>,
+    pub bent_normal: Option<integration::BakedMap>,
+    pub id: Option<integration::BakedMap>,
+    /// 1×1 R8 array of value 1.0, one layer per tile. Bound at slots
+    /// expecting a scalar mesh-map (AO) when the user hasn't baked the
+    /// real one yet — multiplying by 1.0 in the shader is a no-op so we
+    /// avoid feature flags in the PBR pass.
+    pub r8_ones_view: wgpu::TextureView,
+    /// Keeps the texture alive for the lifetime of the view above.
+    _r8_ones_tex: wgpu::Texture,
+    /// Monotonic revision the mesh was at when these maps were baked.
+    /// Bumped on the viewport whenever the mesh / subdivision / tile
+    /// resolution changes; UI compares against this to flag stale maps.
+    pub baked_at_revision: u64,
+}
+
+impl MeshMaps {
+    /// Slot-aware setter — drop the previously baked texture (if any)
+    /// and stash the new one. Used by the Mesh maps panel after a
+    /// successful bake.
+    pub fn set(&mut self, slot: integration::MapKind, baked: integration::BakedMap) {
+        match slot {
+            integration::MapKind::AmbientOcclusion => self.ao = Some(baked),
+            integration::MapKind::Curvature => self.curvature = Some(baked),
+            integration::MapKind::Thickness => self.thickness = Some(baked),
+            integration::MapKind::Height => self.height = Some(baked),
+            integration::MapKind::Normal => self.normal = Some(baked),
+            integration::MapKind::BentNormal => self.bent_normal = Some(baked),
+            integration::MapKind::Id => self.id = Some(baked),
+            // World normal / world position go through the MRT bake
+            // path, not the texture-baker integration. Silently ignore
+            // here so the panel can use one slot enum across all maps.
+            integration::MapKind::WorldNormal | integration::MapKind::Position => {}
+        }
+    }
+
+    pub fn clear(&mut self, slot: integration::MapKind) {
+        match slot {
+            integration::MapKind::AmbientOcclusion => self.ao = None,
+            integration::MapKind::Curvature => self.curvature = None,
+            integration::MapKind::Thickness => self.thickness = None,
+            integration::MapKind::Height => self.height = None,
+            integration::MapKind::Normal => self.normal = None,
+            integration::MapKind::BentNormal => self.bent_normal = None,
+            integration::MapKind::Id => self.id = None,
+            integration::MapKind::WorldNormal | integration::MapKind::Position => {}
+        }
+    }
+
+    pub fn slot(&self, slot: integration::MapKind) -> Option<&integration::BakedMap> {
+        match slot {
+            integration::MapKind::AmbientOcclusion => self.ao.as_ref(),
+            integration::MapKind::Curvature => self.curvature.as_ref(),
+            integration::MapKind::Thickness => self.thickness.as_ref(),
+            integration::MapKind::Height => self.height.as_ref(),
+            integration::MapKind::Normal => self.normal.as_ref(),
+            integration::MapKind::BentNormal => self.bent_normal.as_ref(),
+            integration::MapKind::Id => self.id.as_ref(),
+            integration::MapKind::WorldNormal | integration::MapKind::Position => None,
+        }
+    }
 }
 
 impl MeshMaps {
@@ -84,6 +159,45 @@ impl MeshMaps {
             ..Default::default()
         });
 
+        // Dummy R8 array of value 1.0 — bound by the PBR shader at slot 9
+        // until the user bakes a real AO map. Tiny (tile_count bytes total).
+        let r8_ones_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mesh_maps.r8_ones"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: tile_count,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for layer in 0..tile_count {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &r8_ones_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &[255u8],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(1),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            );
+        }
+        let r8_ones_view = r8_ones_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("mesh_maps.r8_ones.array_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+
         Self {
             world_normal,
             world_normal_view,
@@ -91,7 +205,26 @@ impl MeshMaps {
             world_position_view,
             sampler,
             baked: false,
+            ao: None,
+            curvature: None,
+            thickness: None,
+            height: None,
+            normal: None,
+            bent_normal: None,
+            id: None,
+            r8_ones_view,
+            _r8_ones_tex: r8_ones_tex,
+            baked_at_revision: 0,
         }
+    }
+
+    /// View to bind for AO at slot 9 — falls back to the all-ones dummy
+    /// when the user hasn't baked it yet.
+    pub fn ao_view(&self) -> &wgpu::TextureView {
+        self.ao
+            .as_ref()
+            .map(|b| &b.view)
+            .unwrap_or(&self.r8_ones_view)
     }
 
     /// Run the world-normal bake, producing a full-resolution texture per

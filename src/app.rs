@@ -67,6 +67,54 @@ pub struct App {
     /// fast drags with interpolated stamps, same pattern as the 3D
     /// viewport's `last_paint_pos`. None between strokes.
     uv_last_paint_atlas_uv: Option<egui::Vec2>,
+    /// Which page of the right Properties panel is currently visible.
+    /// Mirrors how the left tool column works — one focused view at a
+    /// time, switched via the icon strip on the right edge.
+    props_tab: PropertiesTab,
+}
+
+/// Pages of the right Properties panel. Default = Layers (the active
+/// painting context). Mirrored visually by a phosphor-icon strip on the
+/// right edge of the window so left + right read as a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PropertiesTab {
+    #[default]
+    Layers,
+    Lighting,
+    Bake,
+    Material,
+    Project,
+}
+
+impl PropertiesTab {
+    fn label(self) -> &'static str {
+        match self {
+            PropertiesTab::Layers => "Layers",
+            PropertiesTab::Lighting => "Lighting",
+            PropertiesTab::Bake => "Bake",
+            PropertiesTab::Material => "Material",
+            PropertiesTab::Project => "Project",
+        }
+    }
+
+    fn glyph(self) -> &'static str {
+        // Phosphor icons — same family the left tool column uses.
+        match self {
+            PropertiesTab::Layers => egui_phosphor::regular::STACK,
+            PropertiesTab::Lighting => egui_phosphor::regular::SUN,
+            PropertiesTab::Bake => egui_phosphor::regular::MAGIC_WAND,
+            PropertiesTab::Material => egui_phosphor::regular::PALETTE,
+            PropertiesTab::Project => egui_phosphor::regular::GEAR,
+        }
+    }
+
+    const ALL: &'static [PropertiesTab] = &[
+        PropertiesTab::Layers,
+        PropertiesTab::Lighting,
+        PropertiesTab::Bake,
+        PropertiesTab::Material,
+        PropertiesTab::Project,
+    ];
 }
 
 /// Which channel a material-slot assignment should target on the
@@ -458,45 +506,52 @@ impl eframe::App for App {
             self.switch_tool(t, frame);
         }
 
+        // Outer tab strip (right-most) — fixed width icon column, same
+        // styling as the left tool column so the window reads as a pair
+        // of icon strips bracketing the viewport.
+        egui::SidePanel::right("props_tabs")
+            .resizable(false)
+            .exact_width(48.0)
+            .show(ctx, |ui| {
+                tab_strip(ui, &mut self.props_tab);
+            });
+
+        // Inner panel — the active tab's body. One header per tab so
+        // each page has room to breathe; the `CollapsingHeader` stack
+        // is gone in favour of subsection headings inside each tab.
         let mut slot_clicked: Option<MaterialSlot> = None;
         egui::SidePanel::right("props")
             .resizable(true)
             .default_width(320.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("right_panel_scroll")
-                    .show(ui, |ui| {
-                        if let Some(vp) = &mut self.viewport {
-                            egui::CollapsingHeader::new("Color")
-                                .default_open(true)
-                                .show(ui, |ui| color_section(ui, vp));
-                            egui::CollapsingHeader::new("Layers")
-                                .default_open(true)
-                                .show(ui, |ui| layer_panel(ui, vp, frame));
-                            egui::CollapsingHeader::new("Environment")
-                                .default_open(true)
-                                .show(ui, |ui| env_panel(ui, vp, frame));
-                            egui::CollapsingHeader::new("Mesh maps")
-                                .default_open(false)
-                                .show(ui, |ui| mesh_maps_panel(ui, vp, frame));
-                            egui::CollapsingHeader::new("Paint target")
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    paint_target_section(ui, vp, frame, &mut self.status)
-                                });
-                            egui::CollapsingHeader::new("Material")
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    slot_clicked = material_slots_section(ui, vp);
-                                });
-                            egui::CollapsingHeader::new("Material factors")
-                                .default_open(false)
-                                .show(ui, |ui| material_factors_section(ui, vp));
-                            egui::CollapsingHeader::new("Light")
-                                .default_open(false)
-                                .show(ui, |ui| light_section(ui, vp));
-                        }
-                    });
+                if let Some(vp) = &mut self.viewport {
+                    // Tab title block.
+                    ui.heading(self.props_tab.label());
+                    ui.separator();
+                    // Uniform slider width — keeps every page's controls
+                    // aligned regardless of label length.
+                    ui.style_mut().spacing.slider_width = 140.0;
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("right_panel_scroll")
+                        .show(ui, |ui| match self.props_tab {
+                            PropertiesTab::Layers => {
+                                layers_tab(ui, vp, frame);
+                            }
+                            PropertiesTab::Lighting => {
+                                lighting_tab(ui, vp, frame);
+                            }
+                            PropertiesTab::Bake => {
+                                bake_tab(ui, vp, frame);
+                            }
+                            PropertiesTab::Material => {
+                                slot_clicked = material_tab(ui, vp);
+                            }
+                            PropertiesTab::Project => {
+                                project_tab(ui, vp, frame, &mut self.status);
+                            }
+                        });
+                }
             });
         // If the user clicked a slot's "Assign…" button, queue the
         // picker modal to open next frame. (The modal lives near the
@@ -729,6 +784,77 @@ fn apply_uv_channel_to_brush(vm: crate::render::ViewMode, vp: &mut Viewport) {
         }
         None => {}
     }
+}
+
+/// Vertical icon column for the right Properties panel — picks which
+/// tab's body the inner panel renders. Mirrors `tool_strip` so left and
+/// right edges of the window read as a pair of icon strips.
+fn tab_strip(ui: &mut egui::Ui, current: &mut PropertiesTab) {
+    ui.add_space(4.0);
+    ui.vertical_centered(|ui| {
+        for &tab in PropertiesTab::ALL {
+            let selected = *current == tab;
+            let fill = if selected {
+                egui::Color32::from_rgb(46, 92, 148)
+            } else {
+                ui.style().visuals.widgets.inactive.bg_fill
+            };
+            let btn = egui::Button::new(egui::RichText::new(tab.glyph()).size(22.0))
+                .min_size(egui::vec2(36.0, 36.0))
+                .fill(fill);
+            if ui.add(btn).on_hover_text(tab.label()).clicked() {
+                *current = tab;
+            }
+            ui.add_space(2.0);
+        }
+    });
+}
+
+// --- Tab bodies. Each composes existing section helpers; reparenting
+//     into tabs keeps content per-page focused without duplicating the
+//     existing logic. Subsection labels use `ui.heading` rather than
+//     CollapsingHeader so the page reads top-to-bottom in one glance.
+
+fn layers_tab(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
+    color_section(ui, vp);
+    ui.add_space(10.0);
+    ui.separator();
+    ui.label(egui::RichText::new("Layers").strong());
+    layer_panel(ui, vp, frame);
+}
+
+fn lighting_tab(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
+    // Environment carries the HDRI + tonemap + grading + display
+    // controls; light_section adds the analytic key/fill/rim rig. They
+    // belong on the same page because changing any of them is a "how
+    // does the scene look?" decision.
+    env_panel(ui, vp, frame);
+    ui.add_space(10.0);
+    ui.separator();
+    ui.label(egui::RichText::new("Light").strong());
+    light_section(ui, vp);
+}
+
+fn bake_tab(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
+    mesh_maps_panel(ui, vp, frame);
+}
+
+fn material_tab(ui: &mut egui::Ui, vp: &mut Viewport) -> Option<MaterialSlot> {
+    let clicked = material_slots_section(ui, vp);
+    ui.add_space(10.0);
+    ui.separator();
+    ui.label(egui::RichText::new("Material factors").strong());
+    material_factors_section(ui, vp);
+    clicked
+}
+
+fn project_tab(
+    ui: &mut egui::Ui,
+    vp: &mut Viewport,
+    frame: &eframe::Frame,
+    status: &mut String,
+) {
+    paint_target_section(ui, vp, frame, status);
 }
 
 fn tool_strip(ui: &mut egui::Ui, vp: &Viewport) -> Option<Tool> {
@@ -1215,12 +1341,17 @@ fn env_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
 }
 
 fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
+    use crate::bake::integration::MapKind;
+
+    // Built-in MRT bake (world normal + position) — kept separate
+    // because the projection brush relies on it being in lockstep with
+    // the renderer's own pipeline, not the texture-baker path.
     ui.horizontal(|ui| {
         let baked = vp.mesh_maps.baked;
         ui.weak(if baked {
-            "status: baked"
+            "world maps: baked"
         } else {
-            "status: not baked"
+            "world maps: not baked"
         });
         if ui.button("Bake").clicked() {
             if let Some(rs) = frame.wgpu_render_state() {
@@ -1229,6 +1360,211 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
         }
     });
     ui.weak("World normal + position baked via MRT. Used by projection paint.");
+
+    ui.add_space(8.0);
+    ui.label("Texture-baker maps");
+
+    // Source meshes — optional high-poly + cage that drive low→high
+    // projection bakes (normal / AO with HP detail / curvature / etc).
+    // Both default to None (self-bakes from the low-poly).
+    let lp_vert_count = vp.cpu_mesh().positions.len();
+    ui.horizontal(|ui| {
+        ui.label("HP");
+        let label = vp
+            .bake_high_poly_label
+            .clone()
+            .unwrap_or_else(|| "(none)".into());
+        ui.weak(label);
+    });
+    ui.horizontal(|ui| {
+        if ui.button("Load HP…").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Mesh", &["obj", "gltf", "glb"])
+                .pick_file()
+            {
+                match crate::bake::integration::load_high_poly(&path) {
+                    Ok(m) => {
+                        let stem = path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "hp".into());
+                        let tri = m.indices.len();
+                        log::info!(
+                            "loaded high-poly {} ({tri} triangles)",
+                            path.display()
+                        );
+                        vp.bake_high_poly = Some(m);
+                        vp.bake_high_poly_label = Some(format!("{stem} · {tri} tris"));
+                    }
+                    Err(e) => log::error!("HP load failed: {e}"),
+                }
+            }
+        }
+        if ui
+            .add_enabled(vp.bake_high_poly.is_some(), egui::Button::new("Clear HP"))
+            .clicked()
+        {
+            vp.bake_high_poly = None;
+            vp.bake_high_poly_label = None;
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Cage");
+        let label = vp
+            .bake_cage_label
+            .clone()
+            .unwrap_or_else(|| "(none)".into());
+        ui.weak(label);
+    });
+    ui.horizontal(|ui| {
+        if ui
+            .button("Load cage…")
+            .on_hover_text(format!(
+                "Cage must share the low-poly's vertex count ({lp_vert_count})"
+            ))
+            .clicked()
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Mesh", &["obj", "gltf", "glb"])
+                .pick_file()
+            {
+                match crate::bake::integration::load_cage(&path) {
+                    Ok(m) => {
+                        let stem = path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "cage".into());
+                        if m.positions.len() != lp_vert_count {
+                            log::error!(
+                                "cage vertex count mismatch: cage={} vs low-poly={}",
+                                m.positions.len(),
+                                lp_vert_count
+                            );
+                            vp.bake_cage_label =
+                                Some(format!("⚠ {} verts ≠ {} (low-poly)", m.positions.len(), lp_vert_count));
+                        } else {
+                            log::info!(
+                                "loaded cage {} ({} verts)",
+                                path.display(),
+                                m.positions.len()
+                            );
+                            vp.bake_cage = Some(m);
+                            vp.bake_cage_label = Some(format!("{stem} · {lp_vert_count} verts"));
+                        }
+                    }
+                    Err(e) => log::error!("cage load failed: {e}"),
+                }
+            }
+        }
+        if ui
+            .add_enabled(vp.bake_cage.is_some(), egui::Button::new("Clear cage"))
+            .clicked()
+        {
+            vp.bake_cage = None;
+            vp.bake_cage_label = None;
+        }
+    });
+
+    ui.add_space(4.0);
+
+    // Bake settings — apply to every per-kind bake below. Kept compact;
+    // power users can dial individual ray counts, defaults are sensible.
+    egui::CollapsingHeader::new("Bake settings")
+        .default_open(false)
+        .show(ui, |ui| {
+            let s = &mut vp.bake_settings;
+            ui.add(
+                egui::Slider::new(&mut s.ao_rays, 8..=512)
+                    .logarithmic(true)
+                    .text("AO rays"),
+            );
+            ui.add(
+                egui::Slider::new(&mut s.thickness_rays, 8..=512)
+                    .logarithmic(true)
+                    .text("Thickness rays"),
+            );
+            ui.add(
+                egui::Slider::new(&mut s.bent_rays, 8..=512)
+                    .logarithmic(true)
+                    .text("Bent normal rays"),
+            );
+            ui.add(egui::Slider::new(&mut s.spread_angle_deg, 0.0..=180.0).text("Spread°"));
+            ui.add(egui::Slider::new(&mut s.max_distance, 0.0..=10.0).text("Max distance"));
+            ui.add(egui::Slider::new(&mut s.aa_factor, 1..=8).text("AA factor"));
+            ui.checkbox(&mut s.use_gpu, "Use GPU acceleration");
+        });
+
+    // Per-kind row: status + bake/clear buttons. Stale if the slot is
+    // populated but its baked-at-revision lags the live mesh revision.
+    let kinds: &[MapKind] = &[
+        MapKind::AmbientOcclusion,
+        MapKind::Curvature,
+        MapKind::Thickness,
+        MapKind::Height,
+        MapKind::Normal,
+        MapKind::BentNormal,
+        MapKind::Id,
+    ];
+
+    let live_rev = vp.mesh_revision;
+
+    let mut bake_request: Option<MapKind> = None;
+    let mut clear_request: Option<MapKind> = None;
+    let mut bake_all_request = false;
+
+    ui.horizontal(|ui| {
+        if ui.button("Bake all").on_hover_text("Bake every map at the current resolution").clicked() {
+            bake_all_request = true;
+        }
+    });
+
+    egui::Grid::new("mesh_maps_grid")
+        .num_columns(4)
+        .spacing(egui::vec2(6.0, 4.0))
+        .show(ui, |ui| {
+            for &k in kinds {
+                ui.label(k.label());
+                let slot = vp.mesh_maps.slot(k);
+                let (status, color) = match slot {
+                    None => ("·", egui::Color32::from_gray(120)),
+                    Some(b) if b.tile_count != vp.tiles().len() as u32 => {
+                        ("⚠ tiles", egui::Color32::from_rgb(255, 180, 100))
+                    }
+                    Some(_) if vp.mesh_maps.baked_at_revision != live_rev => {
+                        ("⚠ stale", egui::Color32::from_rgb(255, 180, 100))
+                    }
+                    Some(_) => ("✓", egui::Color32::from_rgb(120, 220, 140)),
+                };
+                ui.colored_label(color, status);
+                if ui.button("Bake").clicked() {
+                    bake_request = Some(k);
+                }
+                if ui
+                    .add_enabled(slot.is_some(), egui::Button::new("Clear"))
+                    .clicked()
+                {
+                    clear_request = Some(k);
+                }
+                ui.end_row();
+            }
+        });
+
+    // Drive bakes after the grid — borrows `vp` mutably and the closure
+    // above borrowed it through `slot()`/`baked_at_revision`. Splitting
+    // the read and write phases keeps the borrow checker happy.
+    if let Some(rs) = frame.wgpu_render_state() {
+        if bake_all_request {
+            for &k in kinds {
+                run_bake(vp, &rs.device, &rs.queue, k);
+            }
+        } else if let Some(k) = bake_request {
+            run_bake(vp, &rs.device, &rs.queue, k);
+        }
+    }
+    if let Some(k) = clear_request {
+        vp.mesh_maps.clear(k);
+    }
 
     ui.add_space(6.0);
     ui.label("Tessellation (for displacement)");
@@ -1242,6 +1578,43 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
     {
         if let Some(rs) = frame.wgpu_render_state() {
             vp.set_subdivision(&rs.device, level);
+        }
+    }
+}
+
+/// Run a single per-kind bake using the viewport's current mesh, tile
+/// layout, paint-target resolution, and bake settings. Stamps the
+/// resulting `BakedMap` into the matching `MeshMaps` slot.
+fn run_bake(
+    vp: &mut Viewport,
+    device: &eframe::wgpu::Device,
+    queue: &eframe::wgpu::Queue,
+    kind: crate::bake::integration::MapKind,
+) {
+    let tiles: Vec<u32> = vp.paint_target().tiles.iter().copied().collect();
+    let resolution = vp.tile_resolution();
+    let cpu_mesh = vp.cpu_mesh().clone();
+    let hp_ref = vp.bake_high_poly.as_ref();
+    let cage_ref = vp.bake_cage.as_ref();
+    match crate::bake::integration::bake_map(
+        device,
+        queue,
+        &cpu_mesh,
+        hp_ref,
+        cage_ref,
+        &tiles,
+        resolution,
+        kind,
+        &vp.bake_settings,
+    ) {
+        Ok(baked) => {
+            vp.mesh_maps.set(kind, baked);
+            // Mirror the live revision so the panel reads "fresh".
+            vp.mesh_maps.baked_at_revision = vp.mesh_revision;
+            log::info!("baked {:?} at {}×{} for {} tiles", kind, resolution, resolution, tiles.len());
+        }
+        Err(e) => {
+            log::error!("bake {:?} failed: {e}", kind);
         }
     }
 }

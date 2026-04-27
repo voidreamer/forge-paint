@@ -1,0 +1,37 @@
+[package]
+name = "texture-baker"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "texture_baker"
+path = "src/lib.rs"
+
+# bin / gui targets stripped — this crate ships as a library only inside
+# the forge-paint workspace. The standalone CLI / GUI live in the
+# upstream repo (~/projects/texture-baker).
+
+[dependencies]
+glam = "0.29"
+
+tobj = "4"
+gltf = "1"
+
+bvh = "0.9"
+nalgebra = "0.32"
+
+bevy_mikktspace = "1"
+
+image = { version = "0.25", features = ["png", "tga"] }
+exr = "1"
+
+rayon = "1.10"
+
+# GPU compute — pinned to wgpu 24 to match egui-wgpu 0.31 in the
+# workspace root. Upstream texture-baker is on wgpu 25; the small API
+# delta gets patched here.
+wgpu = "24"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+log = "0.4"

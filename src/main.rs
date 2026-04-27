@@ -5,6 +5,7 @@ mod app;
 mod assets;
 mod background;
 mod bake;
+mod bake_cli;
 mod camera;
 mod env;
 mod export;
@@ -21,10 +22,14 @@ mod undo;
 mod usd;
 mod viewport;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 /// forge-paint — USD-centric Rust painter (standalone / anvil-aware).
+///
+/// Run with no subcommand (and an optional path) to launch the GUI;
+/// run `forge-paint bake …` to bake mesh maps headlessly via the
+/// vendored texture-baker crate.
 ///
 /// Env vars respected when present (all optional):
 ///   FORGE_PAINT_WORK_DIR   — base dir for sidecar save/load (default: next to USD)
@@ -32,9 +37,20 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// USD file to open on startup (optional). Plain paths or `forge://` URIs
-    /// (resolved by usdcat when its env is active) are both accepted.
+    /// USD / mesh file to open on startup (GUI mode only). Plain paths
+    /// or `forge://` URIs (resolved by usdcat when its env is active)
+    /// are both accepted.
     path: Option<PathBuf>,
+
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Bake mesh maps (AO, normal, curvature, position, …) headlessly.
+    /// Drop-in compatible with the standalone `texture-baker` CLI.
+    Bake(bake_cli::BakeArgs),
 }
 
 fn main() -> eframe::Result<()> {
@@ -44,6 +60,10 @@ fn main() -> eframe::Result<()> {
     .init();
 
     let args = Args::parse();
+
+    if let Some(Cmd::Bake(b)) = args.cmd {
+        std::process::exit(bake_cli::run(b));
+    }
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

@@ -286,6 +286,19 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // 9: AO mesh map (R8Unorm D2Array). 1×1 dummy of value
+                // 1.0 when the user hasn't baked AO yet — multiplying by
+                // 1.0 is a no-op so the shader doesn't need a branch.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 

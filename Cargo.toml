@@ -1,9 +1,17 @@
+[workspace]
+members = ["crates/texture-baker"]
+
 [package]
 name = "forge-paint"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# texture-baker lives at crates/texture-baker — vendored from the
+# standalone ~/projects/texture-baker, stripped of its bin/gui targets,
+# and pinned to wgpu 24 to share the version egui-wgpu 0.31 uses.
+texture-baker = { path = "crates/texture-baker" }
+
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu"] }
 egui = "0.31"
 egui-wgpu = "0.31"

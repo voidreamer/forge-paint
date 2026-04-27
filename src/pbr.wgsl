@@ -48,6 +48,10 @@ struct Env {
 /// Displacement (Rg16Float D2Array). R = height × coverage, G = coverage.
 /// Final height = R / max(G, eps). Vertex shader reads to offset geometry.
 @group(1) @binding(8) var displacement_tex: texture_2d_array<f32>;
+/// Baked ambient occlusion (R8 D2Array). 1×1 dummy of value 1.0 when
+/// the user hasn't baked it — multiplying by 1.0 is a no-op so the
+/// shader can sample unconditionally without a feature flag.
+@group(1) @binding(9) var ao_tex: texture_2d_array<f32>;
 @group(2) @binding(0) var<uniform> env: Env;
 @group(2) @binding(1) var env_tex: texture_2d<f32>;
 @group(2) @binding(2) var irradiance_tex: texture_2d<f32>;
@@ -405,7 +409,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ibl_diffuse = (kd_ibl * base_color) * ibl_diffuse_raw;
     let ibl_specular = ibl_spec_raw * (f_ss + fms);
 
-    let lit = direct + (ibl_diffuse + ibl_specular) * frame.ibl_scale;
+    // Baked ambient-occlusion attenuates *only* the IBL term — direct
+    // light still reaches every facing texel. R8 returns the AO factor
+    // in r; the unbaked dummy is 1.0 so this is a pass-through until
+    // the user runs a bake.
+    let ao_uv = fract(in.uv);
+    let ao = textureSample(ao_tex, texset_sampler, ao_uv, layer).r;
+    let lit = direct + (ibl_diffuse + ibl_specular) * frame.ibl_scale * ao;
 
     // View-mode override — isolate a channel for inspection. The PBR pass
     // writes to an HDR Rgba16Float buffer; the post pass handles exposure
