@@ -1,0 +1,146 @@
+name: windows-build
+
+# Hand-off build for sharing forge-paint with Windows testers. Triggered
+# manually from the Actions tab, or automatically when a `v*` tag is
+# pushed (which also attaches the resulting zip to the GitHub Release).
+#
+# First run is slow (~30-60 min) because OpenUSD has to compile from
+# source. Subsequent runs reuse the cached USD install and finish in
+# under 10 min — bump the cache key suffix below to invalidate.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+env:
+  # rust-usd 0.0.3 (forge-paint's pinned binding) is verified against
+  # upstream OpenUSD 25.05. Bump together if forge-paint upgrades the
+  # crate, otherwise the ABI may not match.
+  USD_VERSION: v25.05
+  # build_usd.py installs into this prefix; rust-usd's build.rs reads it.
+  USD_INSTALL_DIR: ${{ github.workspace }}\usd-install
+  USD_LIB_PREFIX: usd_
+  # USD is built --no-python, so its headers don't pull Python.h and
+  # rust-usd doesn't need a CPython at link time. Without this var
+  # rust-usd would default to the macOS framework path and fail.
+  USD_LINK_PYTHON: none
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout forge-paint
+        uses: actions/checkout@v4
+
+      # build_usd.py is a Python script. We don't need Python at link
+      # time (USD itself is built --no-python), only as a build driver.
+      - name: Setup Python (build_usd.py driver)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache OpenUSD install
+        id: cache-usd
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.USD_INSTALL_DIR }}
+          # Bump the trailing -vN any time the build flags below change.
+          key: openusd-${{ env.USD_VERSION }}-windows-msvc-no-python-no-imaging-v1
+
+      - name: Checkout OpenUSD source
+        if: steps.cache-usd.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: PixarAnimationStudios/OpenUSD
+          ref: ${{ env.USD_VERSION }}
+          path: openusd-src
+
+      - name: Build OpenUSD
+        if: steps.cache-usd.outputs.cache-hit != 'true'
+        shell: pwsh
+        # build_usd.py vendors boost + tbb itself. With --no-imaging /
+        # --no-python / --no-usdview we skip Hydra, the Python bindings,
+        # and the Qt-based viewer — none of which forge-paint links.
+        # rust-usd only needs the core libs (usd, usdGeom, usdShade,
+        # sdf, ar, pcp, plug, kind, vt, gf, tf, work, trace, js, arch,
+        # ts), all of which live under pxr/usd/.
+        run: |
+          python openusd-src/build_scripts/build_usd.py `
+            --no-python --no-imaging --no-tests `
+            --no-examples --no-tutorials --no-docs --no-usdview `
+            "$env:USD_INSTALL_DIR"
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build forge-paint (release)
+        shell: pwsh
+        # rust-usd's build.rs emits `-Wl,-rpath,...` link args that are
+        # macOS/Linux syntax. On Windows they reach link.exe, which
+        # ignores them with LNK4044 warnings; the binary still links.
+        # If a future MSVC tightens that to a hard error, we'll need
+        # a [patch.crates-io] override of rust-usd to gate the rpath
+        # emission on cfg(unix).
+        run: cargo build --release
+
+      - name: Stage Windows zip
+        shell: pwsh
+        run: |
+          $stage = "$env:GITHUB_WORKSPACE\dist\forge-paint-windows"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          Copy-Item target\release\forge-paint.exe $stage
+
+          # USD on Windows lays runtime DLLs alongside the import .libs
+          # in `lib/`, but some configurations route them to `bin/`.
+          # Glob both so we don't depend on the layout.
+          if (Test-Path "$env:USD_INSTALL_DIR\lib") {
+            Copy-Item "$env:USD_INSTALL_DIR\lib\*.dll" $stage -ErrorAction SilentlyContinue
+          }
+          if (Test-Path "$env:USD_INSTALL_DIR\bin") {
+            Copy-Item "$env:USD_INSTALL_DIR\bin\*.dll" $stage -ErrorAction SilentlyContinue
+          }
+
+          # Bundled brushes, stencils, env maps. The asset browser starts
+          # empty without these.
+          Copy-Item -Recurse assets $stage
+          if (Test-Path test_assets) {
+            Copy-Item -Recurse test_assets $stage
+          }
+
+          @'
+          forge-paint Windows test build.
+
+          Run forge-paint.exe from this directory. The .dll files MUST
+          stay alongside the .exe — Windows resolves dynamic libraries
+          from the executable's folder.
+
+          If the app fails to start with "VCRUNTIME140.dll" or
+          "MSVCP140.dll" missing, install the Microsoft Visual C++
+          Redistributable from
+          https://aka.ms/vs/17/release/vc_redist.x64.exe.
+
+          Opening files: drag-and-drop a .usda/.usdc/.usdz onto the
+          window, or use File > Open. forge:// URIs only resolve when
+          launched through anvil; standalone runs are filesystem-only.
+          '@ | Out-File "$stage\README.txt" -Encoding utf8
+
+          Compress-Archive -Path "$stage\*" `
+            -DestinationPath "$env:GITHUB_WORKSPACE\dist\forge-paint-windows.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-paint-windows
+          path: dist\forge-paint-windows.zip
+          retention-days: 30
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist\forge-paint-windows.zip
