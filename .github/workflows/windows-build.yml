@@ -80,15 +80,35 @@ jobs:
       - name: Build forge-paint (release)
         shell: pwsh
         env:
-          # rust-usd 0.0.3 sets flag_if_supported("-std=c++17") in its
-          # build.rs — that's GCC/Clang syntax. MSVC silently skips it
-          # and the cxx bridge then tries to compile USD's C++17-only
-          # headers (std::any, std::optional, std::nullopt) under the
-          # MSVC default of C++14, which fails. Force the standard from
-          # the env so cc-rs forwards it to cl.exe. /Zc:__cplusplus is
-          # needed because MSVC otherwise reports __cplusplus=199711L
-          # even with /std:c++17, breaking USD's feature probes.
-          CXXFLAGS: /std:c++17 /Zc:__cplusplus /EHsc
+          # rust-usd 0.0.3's build.rs targets only the macOS/Linux
+          # toolchain conventions, so the cxx bridge needs MSVC-flavored
+          # flags fed through CXXFLAGS:
+          #
+          #  /std:c++17           USD 25.05 requires C++17. rust-usd
+          #                        passes -std=c++17 (GCC syntax) which
+          #                        cl.exe ignores; MSVC then defaults
+          #                        to C++14 and the std::any /
+          #                        std::optional / std::nullopt uses in
+          #                        pxr/base/tf/diagnosticBase.h,
+          #                        pxr/usd/sdf/listOp.h, etc. fail.
+          #  /Zc:__cplusplus      MSVC otherwise reports __cplusplus =
+          #                        199711L even under /std:c++17,
+          #                        defeating USD's feature probes.
+          #  /EHsc                Standard C++ exception model — USD
+          #                        and TBB throw across the bridge.
+          #  /DNOMINMAX           windows.h (pulled in by TBB) #defines
+          #                        min and max as macros, which then
+          #                        clobber std::numeric_limits<T>::max()
+          #                        in pxrTslRobinMap headers ("illegal
+          #                        token on right side of ::"). USD's
+          #                        own CMake sets this globally; cc-rs
+          #                        doesn't inherit it.
+          #  /DWIN32_LEAN_AND_MEAN  Trim windows.h to reduce the chance
+          #                        of further macro collisions (also
+          #                        what USD's CMake does).
+          #  /D_USE_MATH_DEFINES  Enable M_PI and friends in <cmath>;
+          #                        USD code expects them.
+          CXXFLAGS: /std:c++17 /Zc:__cplusplus /EHsc /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_USE_MATH_DEFINES
         # rust-usd's build.rs also emits `-Wl,-rpath,...` link args
         # that are macOS/Linux syntax. On Windows they reach link.exe,
         # which ignores them with LNK4044 warnings; the binary still
