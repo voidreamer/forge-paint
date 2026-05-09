@@ -79,12 +79,22 @@ jobs:
 
       - name: Build forge-paint (release)
         shell: pwsh
-        # rust-usd's build.rs emits `-Wl,-rpath,...` link args that are
-        # macOS/Linux syntax. On Windows they reach link.exe, which
-        # ignores them with LNK4044 warnings; the binary still links.
-        # If a future MSVC tightens that to a hard error, we'll need
-        # a [patch.crates-io] override of rust-usd to gate the rpath
-        # emission on cfg(unix).
+        env:
+          # rust-usd 0.0.3 sets flag_if_supported("-std=c++17") in its
+          # build.rs — that's GCC/Clang syntax. MSVC silently skips it
+          # and the cxx bridge then tries to compile USD's C++17-only
+          # headers (std::any, std::optional, std::nullopt) under the
+          # MSVC default of C++14, which fails. Force the standard from
+          # the env so cc-rs forwards it to cl.exe. /Zc:__cplusplus is
+          # needed because MSVC otherwise reports __cplusplus=199711L
+          # even with /std:c++17, breaking USD's feature probes.
+          CXXFLAGS: /std:c++17 /Zc:__cplusplus /EHsc
+        # rust-usd's build.rs also emits `-Wl,-rpath,...` link args
+        # that are macOS/Linux syntax. On Windows they reach link.exe,
+        # which ignores them with LNK4044 warnings; the binary still
+        # links. If a future MSVC tightens that to a hard error, we'll
+        # need a [patch.crates-io] override of rust-usd to gate the
+        # rpath emission on cfg(unix).
         run: cargo build --release
 
       - name: Stage Windows zip
