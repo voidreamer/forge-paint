@@ -145,26 +145,39 @@ jobs:
           # returns null on every file. The plugInfo.json files use
           # LibraryPath references relative to themselves, so the tree
           # has to be copied wholesale to keep them resolvable.
-          # `include/` and `*.lib` files are runtime-irrelevant — strip
-          # them after the copy to keep the zip smaller.
+          # forge-paint's main() detects this layout at startup and
+          # sets PXR_PLUGINPATH_NAME + PATH itself, so no launcher
+          # batch file is needed.
           Copy-Item -Recurse "$env:USD_INSTALL_DIR" "$stage\usd"
-          Remove-Item -Recurse -Force "$stage\usd\include" -ErrorAction SilentlyContinue
-          Get-ChildItem -Path "$stage\usd" -Recurse -Filter *.lib `
-            | Remove-Item -Force -ErrorAction SilentlyContinue
 
-          # forge-paint.bat — the launcher the friend actually runs.
-          # USD reads PXR_PLUGINPATH_NAME ONCE, the first time any USD
-          # library loads; setting it here (before the EXE starts)
-          # gets it picked up. Putting `usd\lib` and `usd\bin` on PATH
-          # gives Windows the dynamic loader's search paths for the
-          # USD + TBB runtime DLLs.
-          @'
-          @echo off
-          setlocal
-          set "PATH=%~dp0usd\lib;%~dp0usd\bin;%PATH%"
-          set "PXR_PLUGINPATH_NAME=%~dp0usd\plugin\usd;%~dp0usd\lib\usd"
-          "%~dp0forge-paint.exe" %*
-          '@ | Out-File "$stage\forge-paint.bat" -Encoding ascii
+          # Strip non-runtime artifacts. build_usd.py builds
+          # RelWithDebInfo by default and produces a .pdb next to every
+          # .dll — those alone account for several hundred MB.
+          # bin/*.exe are the USD CLI tools (usdcat, usdedit,
+          # usdresolve, ...) we never invoke. cmake/, share/, *.cmake
+          # are dev-time exports. Headers and import .libs are
+          # link-time only.
+          $stripDirs = @('include', 'share', 'python')
+          foreach ($d in $stripDirs) {
+            Remove-Item -Recurse -Force "$stage\usd\$d" -ErrorAction SilentlyContinue
+          }
+          foreach ($pat in '*.pdb','*.lib','*.cmake') {
+            Get-ChildItem -Path "$stage\usd" -Recurse -Filter $pat -ErrorAction SilentlyContinue `
+              | Remove-Item -Force -ErrorAction SilentlyContinue
+          }
+          Get-ChildItem -Path "$stage\usd" -Recurse -Directory -ErrorAction SilentlyContinue `
+            | Where-Object { $_.Name -eq 'cmake' } `
+            | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          if (Test-Path "$stage\usd\bin") {
+            Get-ChildItem -Path "$stage\usd\bin" -Filter *.exe -ErrorAction SilentlyContinue `
+              | Remove-Item -Force -ErrorAction SilentlyContinue
+          }
+
+          # Report final bundle size so future runs can sanity-check
+          # whether new bloat has crept in.
+          $usdSize = (Get-ChildItem -Path "$stage\usd" -Recurse -File `
+            | Measure-Object -Property Length -Sum).Sum
+          "Bundled usd/ size: {0:N0} MB" -f ($usdSize / 1MB) | Write-Host
 
           # Bundled brushes, stencils, env maps. The asset browser
           # starts empty without these.
@@ -176,11 +189,9 @@ jobs:
           @'
           forge-paint Windows test build.
 
-          IMPORTANT: launch via forge-paint.bat — NOT forge-paint.exe
-          directly. The .bat sets PXR_PLUGINPATH_NAME and PATH so USD
-          can find its file-format plugins and runtime DLLs. Running
-          the .exe directly will leave Stage::open returning null on
-          every file.
+          Run forge-paint.exe directly — at startup it self-locates
+          the bundled `usd/` directory next to itself and configures
+          USD's plugin discovery, so no wrapper script is needed.
 
           If the app fails to start with "VCRUNTIME140.dll" or
           "MSVCP140.dll" missing, install the Microsoft Visual C++

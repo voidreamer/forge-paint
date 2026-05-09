@@ -55,6 +55,8 @@ enum Cmd {
 }
 
 fn main() -> eframe::Result<()> {
+    setup_bundled_usd_env();
+
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn"),
     )
@@ -84,4 +86,70 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app::App::new(args.path)))
         }),
     )
+}
+
+/// Self-locating env setup for the Windows / macOS hand-off bundles.
+///
+/// USD's plugin discovery reads `PXR_PLUGINPATH_NAME` lazily, the
+/// first time any USD library function runs. Without it, none of the
+/// file-format readers (usda, usdc, usdz) register and `Stage::open`
+/// returns null for every input. Anvil and locally-built dev runs set
+/// the variable via the surrounding shell; the hand-off zips ship the
+/// entire USD install as a sibling `usd/` directory next to the EXE
+/// and rely on this function to point USD at it instead.
+///
+/// On Windows we additionally prepend `usd/lib` and `usd/bin` to PATH
+/// so the dynamic loader resolves the USD + TBB DLLs. On macOS the
+/// equivalent — making the loader find `libusd_*.dylib` — is handled
+/// by `install_name_tool -add_rpath @executable_path/usd/lib` in the
+/// CI workflow, so no env-var work is needed at runtime here.
+fn setup_bundled_usd_env() {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(dir) = exe.parent() else {
+            return;
+        };
+        let usd = dir.join("usd");
+        if !usd.is_dir() {
+            return;
+        }
+        #[cfg(windows)]
+        let sep = ";";
+        #[cfg(not(windows))]
+        let sep = ":";
+        let plugin_path = format!(
+            "{}{sep}{}",
+            usd.join("plugin").join("usd").display(),
+            usd.join("lib").join("usd").display(),
+        );
+        // SAFETY: called from main before any threads spawn — eframe's
+        // render thread only starts inside run_native(). Edition 2024
+        // marks env::set_var unsafe because of cross-thread races; we
+        // have none here.
+        unsafe {
+            std::env::set_var("PXR_PLUGINPATH_NAME", plugin_path);
+        }
+        #[cfg(windows)]
+        {
+            let new_path = match std::env::var("PATH") {
+                Ok(p) => format!(
+                    "{};{};{}",
+                    usd.join("lib").display(),
+                    usd.join("bin").display(),
+                    p,
+                ),
+                Err(_) => format!(
+                    "{};{}",
+                    usd.join("lib").display(),
+                    usd.join("bin").display(),
+                ),
+            };
+            unsafe {
+                std::env::set_var("PATH", new_path);
+            }
+        }
+    }
 }
