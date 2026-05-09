@@ -43,9 +43,15 @@ jobs:
       - name: Setup Rust (stable, MSVC)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache OpenUSD install
+      # Cache is split into restore + save (instead of one actions/cache
+       # step) so the USD install is persisted as soon as the build
+       # finishes, regardless of whether later steps fail. The unified
+       # action only saves on full-job success, which means a failure
+       # in the cargo build or the staging step would silently throw
+       # away the 30-min OpenUSD compile.
+      - name: Restore OpenUSD install
         id: cache-usd
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.USD_INSTALL_DIR }}
           # Bump the trailing -vN any time the build flags below change.
@@ -73,6 +79,13 @@ jobs:
             --no-python --no-imaging --no-tests `
             --no-examples --no-tutorials --no-docs --no-usdview `
             "$env:USD_INSTALL_DIR"
+
+      - name: Save OpenUSD install
+        if: steps.cache-usd.outputs.cache-hit != 'true' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.USD_INSTALL_DIR }}
+          key: openusd-${{ env.USD_VERSION }}-windows-msvc-no-python-no-imaging-v1
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -125,18 +138,36 @@ jobs:
 
           Copy-Item target\release\forge-paint.exe $stage
 
-          # USD on Windows lays runtime DLLs alongside the import .libs
-          # in `lib/`, but some configurations route them to `bin/`.
-          # Glob both so we don't depend on the layout.
-          if (Test-Path "$env:USD_INSTALL_DIR\lib") {
-            Copy-Item "$env:USD_INSTALL_DIR\lib\*.dll" $stage -ErrorAction SilentlyContinue
-          }
-          if (Test-Path "$env:USD_INSTALL_DIR\bin") {
-            Copy-Item "$env:USD_INSTALL_DIR\bin\*.dll" $stage -ErrorAction SilentlyContinue
-          }
+          # Bundle the entire USD install as a sibling `usd/` directory.
+          # USD's plugin discovery walks `lib/usd/` and `plugin/usd/`
+          # for plugInfo.json files; without them the file-format
+          # readers (usda, usdc, usdz) never register and Stage::open
+          # returns null on every file. The plugInfo.json files use
+          # LibraryPath references relative to themselves, so the tree
+          # has to be copied wholesale to keep them resolvable.
+          # `include/` and `*.lib` files are runtime-irrelevant — strip
+          # them after the copy to keep the zip smaller.
+          Copy-Item -Recurse "$env:USD_INSTALL_DIR" "$stage\usd"
+          Remove-Item -Recurse -Force "$stage\usd\include" -ErrorAction SilentlyContinue
+          Get-ChildItem -Path "$stage\usd" -Recurse -Filter *.lib `
+            | Remove-Item -Force -ErrorAction SilentlyContinue
 
-          # Bundled brushes, stencils, env maps. The asset browser starts
-          # empty without these.
+          # forge-paint.bat — the launcher the friend actually runs.
+          # USD reads PXR_PLUGINPATH_NAME ONCE, the first time any USD
+          # library loads; setting it here (before the EXE starts)
+          # gets it picked up. Putting `usd\lib` and `usd\bin` on PATH
+          # gives Windows the dynamic loader's search paths for the
+          # USD + TBB runtime DLLs.
+          @'
+          @echo off
+          setlocal
+          set "PATH=%~dp0usd\lib;%~dp0usd\bin;%PATH%"
+          set "PXR_PLUGINPATH_NAME=%~dp0usd\plugin\usd;%~dp0usd\lib\usd"
+          "%~dp0forge-paint.exe" %*
+          '@ | Out-File "$stage\forge-paint.bat" -Encoding ascii
+
+          # Bundled brushes, stencils, env maps. The asset browser
+          # starts empty without these.
           Copy-Item -Recurse assets $stage
           if (Test-Path test_assets) {
             Copy-Item -Recurse test_assets $stage
@@ -145,9 +176,11 @@ jobs:
           @'
           forge-paint Windows test build.
 
-          Run forge-paint.exe from this directory. The .dll files MUST
-          stay alongside the .exe — Windows resolves dynamic libraries
-          from the executable's folder.
+          IMPORTANT: launch via forge-paint.bat — NOT forge-paint.exe
+          directly. The .bat sets PXR_PLUGINPATH_NAME and PATH so USD
+          can find its file-format plugins and runtime DLLs. Running
+          the .exe directly will leave Stage::open returning null on
+          every file.
 
           If the app fails to start with "VCRUNTIME140.dll" or
           "MSVCP140.dll" missing, install the Microsoft Visual C++
