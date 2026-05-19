@@ -3255,8 +3255,6 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 [[package]]
 name = "rust-usd"
 version = "0.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "300ffed7fed1109a0d583d89669a3ff93756910731d0bda26cec0199864a2543"
 dependencies = [
  "cxx",
  "cxx-build",
