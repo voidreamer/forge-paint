@@ -19,6 +19,12 @@ texture-baker = { path = "crates/texture-baker" }
 # anvil). See anvil/forge-paint.yaml for the build env vars rust-usd's
 # own build.rs reads.
 rust-usd = "0.0.3"
+# hydra-rs is the sibling Hydra (Storm) binding from the same repo.
+# Path dep while 0.0.3 is unpublished — it carries the AOV row-flip
+# fix and the set_scene_ambient setter we need for the dual-panel
+# preview. Swap back to `hydra-rs = "0.0.3"` from crates.io once the
+# bump ships there.
+hydra-rs = { path = "../rust-usd/hydra-rs" }
 
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu"] }
 egui = "0.31"

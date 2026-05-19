@@ -38,6 +38,16 @@ pub struct App {
 
     /// Docked 2D UV painting view. Splits the central area when on.
     show_uv_view: bool,
+    /// Right-docked Hydra (Storm) preview panel. Renders the loaded
+    /// stage through `hydra_rs::Renderer` from the same orbit camera
+    /// the wgpu painter uses. The painter stays the source of truth
+    /// for painting; Hydra is the production-reference second view.
+    /// Lazily constructed on first open (needs a USD stage path).
+    show_hydra_view: bool,
+    hydra: Option<crate::hydra_view::HydraView>,
+    /// egui texture handle for the Hydra render result. Cached so the
+    /// previous frame's pixels don't disappear during a re-render.
+    hydra_egui_tex: Option<egui::TextureHandle>,
     /// Pixels-per-UV-unit for the UV atlas. Modified by scroll.
     uv_zoom: f32,
     /// Screen-pixel offset applied to the atlas (drag to pan).
@@ -273,6 +283,12 @@ impl eframe::App for App {
                 ui.menu_button("View", |ui| {
                     if ui
                         .checkbox(&mut self.show_uv_view, "UV view")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                    }
+                    if ui
+                        .checkbox(&mut self.show_hydra_view, "Hydra preview")
                         .clicked()
                     {
                         ui.close_menu();
@@ -558,6 +574,18 @@ impl eframe::App for App {
         // URI dialog block above; see show_slot_picker below.)
         if let Some(slot) = slot_clicked {
             self.show_slot_picker = Some(slot);
+        }
+
+        // Hydra preview SidePanel — must declare BEFORE the
+        // CentralPanel (so CentralPanel correctly reserves space
+        // around it) AND before the stencil-view borrow below (the
+        // borrow checker rejects `&mut self` here while
+        // `stencil_view: &Asset` is alive across the central panel
+        // closure). SidePanel doesn't absorb drag input the way
+        // floating windows do, so the wgpu painter under the central
+        // area still receives orbit/zoom drags.
+        if self.show_hydra_view {
+            self.show_hydra_window(ctx, frame);
         }
 
         // Resolve the active stencil's GPU view + metadata up front,
@@ -2556,6 +2584,179 @@ impl App {
                 log::error!("{}", self.status);
             }
         }
+    }
+
+    /// Right-docked Hydra preview panel. Owns `self.hydra` (the
+    /// `HydraView` wrapper) lazily: constructed on first open if a
+    /// USD path is loaded, dropped if the user closes the panel.
+    /// Each frame:
+    ///   1. Resolve camera matrices from `Viewport::camera`, convert
+    ///      glam's column-vector storage to Hydra's row-vector
+    ///      convention, and synth a GL-style projection (GfCamera
+    ///      rejects wgpu's [0, 1] clip-Z).
+    ///   2. Resize the renderer to the panel's content area.
+    ///   3. Mirror the wgpu studio rig into Hydra each frame so
+    ///      changing key/fill/rim on the wgpu side updates here too.
+    ///   4. Call `render()` for an RGBA8 buffer, hand it to egui as a
+    ///      `ColorImage` → `TextureHandle`, paint the texture into
+    ///      the panel with `painter.image()`.
+    ///   5. Stamp a "▶ Hydra Storm" badge on top so the panel reads
+    ///      at a glance as Hydra rather than the wgpu painter.
+    fn show_hydra_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let stage_path = self.current_usd_path.clone();
+        let mut open = true;
+        // Continuous repaint while the panel is open so wgpu-side
+        // orbit input lands in the Hydra render immediately.
+        ctx.request_repaint();
+        let response = egui::SidePanel::right("hydra_preview")
+            .resizable(true)
+            .default_width(360.0)
+            .min_width(200.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Hydra preview").strong());
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("✕").on_hover_text("Close").clicked() {
+                                open = false;
+                            }
+                        },
+                    );
+                });
+                ui.separator();
+                let Some(ref path) = stage_path else {
+                    ui.label("Open a USD stage first — Hydra needs a stage path.");
+                    return;
+                };
+
+                // Snapshot the camera + rig + size state up front.
+                // Once we touch `self.hydra` mutably below, holding
+                // any other borrow into `self` (like `self.viewport`)
+                // trips the borrow checker — disjoint-field borrows
+                // aren't reliable across a closure capture.
+                let avail = ui.available_size();
+                let w = (avail.x as u32).max(64);
+                let h = (avail.y as u32).max(64);
+                let aspect = w as f32 / h as f32;
+                let (view_row, proj_row, rig) = match self.viewport.as_ref() {
+                    Some(vp) => {
+                        let view = vp.camera.view().to_cols_array_2d();
+                        let view_row = crate::hydra_view::glam_to_hydra(&view);
+                        let proj_row = crate::hydra_view::perspective_for_hydra(
+                            vp.camera.fov_y_deg.to_radians(),
+                            aspect,
+                            vp.camera.z_near,
+                            vp.camera.z_far,
+                        );
+                        let rig = crate::hydra_view::StudioRig {
+                            key_dir: vp.light_dir,
+                            key_intensity: vp.light_intensity,
+                            fill_ratio: vp.studio_fill_ratio,
+                            rim_ratio: vp.studio_rim_ratio,
+                            enabled: vp.studio_rig_enabled,
+                        };
+                        (view_row, proj_row, rig)
+                    }
+                    None => {
+                        ui.label("Viewport not initialised yet.");
+                        return;
+                    }
+                };
+
+                if self.hydra.is_none() {
+                    log::info!("Hydra: opening stage {}", path.display());
+                    match crate::hydra_view::HydraView::new(path) {
+                        Ok(v) => {
+                            log::info!("Hydra: stage opened OK, size {}x{}", w, h);
+                            self.hydra = Some(v);
+                        }
+                        Err(e) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 140, 120),
+                                format!("Hydra init failed: {e:#}"),
+                            );
+                            return;
+                        }
+                    }
+                }
+                let hydra = self.hydra.as_mut().unwrap();
+                hydra.resize(w, h);
+                hydra.set_rig(rig);
+
+                match hydra.render(&view_row, &proj_row) {
+                    Ok(pixels) => {
+                        let img = egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            &pixels,
+                        );
+                        let handle = ui.ctx().load_texture(
+                            "hydra_frame",
+                            img,
+                            egui::TextureOptions::default(),
+                        );
+                        let (rect, _resp) = ui.allocate_exact_size(
+                            egui::vec2(w as f32, h as f32),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().image(
+                            handle.id(),
+                            rect,
+                            egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(1.0, 1.0),
+                            ),
+                            egui::Color32::WHITE,
+                        );
+                        self.hydra_egui_tex = Some(handle);
+
+                        // Hydra badge — green ring + ▶ glyph, mirrors
+                        // the wgpu badge style so the two panels read
+                        // as a matching pair.
+                        let badge_size = egui::vec2(160.0, 28.0);
+                        let badge_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.left() + 12.0, rect.top() + 12.0),
+                            badge_size,
+                        );
+                        ui.painter().rect_filled(
+                            badge_rect,
+                            6.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+                        );
+                        ui.painter().rect_stroke(
+                            badge_rect,
+                            6.0,
+                            egui::Stroke::new(
+                                1.5,
+                                egui::Color32::from_rgb(120, 220, 140),
+                            ),
+                            egui::StrokeKind::Outside,
+                        );
+                        ui.painter().text(
+                            badge_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "▶ Hydra Storm",
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::from_rgb(120, 220, 140),
+                        );
+                    }
+                    Err(e) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 140, 120),
+                            format!("Hydra render failed: {e:#}"),
+                        );
+                    }
+                }
+                let _ = frame;
+            });
+        // The user closed the panel via its [×]. Drop the renderer so
+        // re-opening starts fresh on the current stage path.
+        if !open {
+            self.show_hydra_view = false;
+            self.hydra = None;
+            self.hydra_egui_tex = None;
+        }
+        let _ = response;
     }
 
     fn do_undo(&mut self, frame: &eframe::Frame) {

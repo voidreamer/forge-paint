@@ -10,6 +10,7 @@ mod camera;
 mod env;
 mod export;
 mod fxaa;
+mod hydra_view;
 mod mesh;
 mod paint;
 mod persist;

@@ -1740,10 +1740,10 @@ impl Viewport {
         }
 
         // Renderer badge — top-left of the viewport canvas. Names the
-        // path drawing the frame. The wgpu painter is the only renderer
-        // in the build today (the Hydra wrapper is parked under
-        // `attic/hydra_view.rs`); the badge stays as a hook for when a
-        // second renderer comes back online.
+        // path drawing the frame. The wgpu painter owns the central
+        // viewport; the Hydra preview side panel stamps its own
+        // "▶ Hydra Storm" badge so the two reads at a glance as
+        // distinct renderers.
         let badge_text = "▶ wgpu painter";
         let badge_size = egui::vec2(160.0, 28.0);
         let badge_rect = egui::Rect::from_min_size(

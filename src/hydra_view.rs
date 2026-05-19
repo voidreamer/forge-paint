@@ -1,24 +1,4 @@
-//! PARKED — not compiled. See `attic/README.md` for the full rationale.
-//!
-//! This module is the in-progress Hydra (Storm) preview viewport. It
-//! was wired into the app once (View → "Hydra preview" toggle, side
-//! panel rendering an RGBA8 frame from `hydra_rs::Renderer`) but the
-//! integration was unreliable in practice and complicated app state,
-//! so it was lifted out of `src/`. The previous call sites in
-//! `src/app.rs` (fields, View-menu checkbox, lazy constructor,
-//! `show_hydra_window`) and the `hydra-rs = "0.0.2"` dependency in
-//! `Cargo.toml` were removed in the same change.
-//!
-//! Reviving it (rough recipe):
-//!   1. Add `hydra-rs = "0.0.2"` back to `[dependencies]`.
-//!   2. Move this file back to `src/hydra_view.rs` and re-add
-//!      `mod hydra_view;` in `src/main.rs`.
-//!   3. Re-introduce the App fields (`show_hydra_view`, `hydra`,
-//!      `hydra_egui_tex`), the View-menu checkbox, and the
-//!      `show_hydra_window` side panel.
-//!   4. Re-evaluate the caveats below before exposing it again.
-//!
-//! Original module description follows.
+//! Hydra (Storm) preview viewport.
 //!
 //! A second viewport panel that renders the active USD stage through
 //! `hydra_rs::Renderer`, in parallel with the wgpu painter. The
@@ -31,8 +11,10 @@
 //! RGBA8 buffer that gets uploaded into an egui texture for display.
 //!
 //! Caveats (per upstream notes):
-//!   - Authored scene lights aren't routed yet — we mirror them from
-//!     Rust via `add_distant_light` until upstream lands the bridge.
+//!   - Authored UsdLux scene lights aren't routed through hydra-rs
+//!     yet — we mirror the wgpu studio rig from Rust via
+//!     `add_distant_light`. Materials still flow through:
+//!     `enableSceneMaterials = true` in the C++ bridge.
 //!   - Color AOV only; no depth or primId, so picking has to fall
 //!     back to forge-paint's existing CPU pick on the wgpu side.
 //!   - Single-threaded; never share a `Renderer` across threads.
@@ -41,6 +23,25 @@
 use anyhow::Result;
 use hydra_rs::Renderer;
 use std::path::Path;
+
+/// Snapshot of the wgpu side's three-point studio rig. Each frame the
+/// caller copies these from `Viewport` and hands them to
+/// `HydraView::set_rig` so Hydra mirrors the same key/fill/rim that
+/// wgpu's shader uses. Convention matches `Viewport::light_dir`:
+/// `key_dir` is the direction the key light TRAVELS, not the direction
+/// TO the light — `set_rig` negates internally to fit Hydra's
+/// `GlfSimpleLight` (position with w=0 is the direction from origin
+/// to the light source).
+#[derive(Debug, Clone, Copy)]
+pub struct StudioRig {
+    pub key_dir: [f32; 3],
+    pub key_intensity: f32,
+    pub fill_ratio: f32,
+    pub rim_ratio: f32,
+    /// Studio rig off → just the key light, no fill/rim. Matches the
+    /// wgpu side's `studio_rig_enabled` toggle.
+    pub enabled: bool,
+}
 
 /// Per-panel Hydra renderer. Held alongside the wgpu viewport — the
 /// caller decides which panel(s) to surface in the UI.
@@ -51,10 +52,13 @@ pub struct HydraView {
 }
 
 impl HydraView {
-    /// Open a stage path through Hydra and seed a sensible default
-    /// 3-point lighting rig. Caller passes the same `&Path` they'd
-    /// pass to `rust_usd::Stage::open` — `forge://…` URIs work
+    /// Open a stage path through Hydra. Caller passes the same `&Path`
+    /// they'd pass to `rust_usd::Stage::open` — `forge://…` URIs work
     /// because the resolver is already registered process-wide.
+    ///
+    /// Lighting is left empty here; the caller is expected to call
+    /// `set_rig` before the first `render()` so the wgpu studio rig
+    /// drives Hydra too.
     pub fn new(stage_path: &Path) -> Result<Self> {
         // Diagnostic override: setting HYDRA_TEST_STAGE points the
         // renderer at any USDA you supply (e.g. the bundled
@@ -70,26 +74,18 @@ impl HydraView {
         let mut renderer = Renderer::new(path)?;
         renderer.set_size(1280, 720);
 
-        // hydra-rs lighting model (verified by reading the C++ bridge):
-        //   - `clear_lights()` sets `enableLighting = false` AND wipes
-        //     the light list. Anything you add afterwards lives on the
-        //     Rust-side vector but the engine still renders unlit
-        //     because the gating bool is off.
-        //   - `use_default_light()` clears the list AND turns the
-        //     bool back on, then injects the default headlight.
-        //   - `add_distant_light` / `add_positional_light` populate
-        //     the legacy GlfSimpleLight pipeline. Authored UsdLux
-        //     lights in the stage are NOT routed (enableSceneLights
-        //     is hard-coded false in the bridge).
-        //
-        // Default headlight = correct PBR lighting of the camera-
-        // facing surfaces, no convention guessing required.
-        renderer.use_default_light();
         // Diagnostic magenta clear so empty-frustum / black-shading
-        // are visually distinguishable. Once we have lighting working
-        // we'll go back to a neutral grey or pull from forge-paint's
-        // background.
+        // are visually distinguishable from an unlit-but-rendered
+        // model. Easy to spot in a side-by-side with the wgpu panel.
         renderer.set_clear_color([1.0, 0.0, 1.0, 1.0]);
+
+        // Hydra has no IBL, so without an ambient lift the shadow
+        // side of the model crushes to black and the panel reads
+        // dramatically darker than the wgpu side. Pull a single
+        // additive ambient from the same sky-tint colour the wgpu
+        // shader uses for its sky/ground ambient term, scaled down
+        // since Storm only takes one ambient (no separate ground).
+        renderer.set_scene_ambient([0.20, 0.24, 0.30, 1.0]);
 
         Ok(Self {
             renderer,
@@ -107,30 +103,68 @@ impl HydraView {
         self.renderer.set_size(w, h);
     }
 
+    /// Mirror the wgpu studio rig in Hydra. Cheap enough to call every
+    /// frame: clears the C++-side light vector and re-adds 1-3 lights.
+    /// `key_dir` is in wgpu convention (direction the light travels),
+    /// negated here before being passed to `add_distant_light` because
+    /// `GlfSimpleLight` reads position(w=0) as the direction from the
+    /// shaded surface TO the light source.
+    ///
+    /// Mirrors the wgpu fill/rim derivation:
+    ///   fill = (-key.x,  key.y,             -key.z)
+    ///   rim  = (-key.x,  max(key.y, 0.2),   -key.z)
+    /// and the studio color tints + intensity ratios — see
+    /// `viewport::Viewport::show` for the canonical values.
+    pub fn set_rig(&mut self, rig: StudioRig) {
+        // clear_lights() drops the explicit list AND turns off the
+        // default-headlight gating bool. That's fine — Storm's
+        // render path computes `enableLighting = !lights.empty() ||
+        // use_default_lighting`, so the moment we push a single
+        // explicit light below the rig becomes active.
+        self.renderer.clear_lights();
+
+        // wgpu's key/fill/rim derivation — kept verbatim so the two
+        // viewports light the same surfaces from the same angles.
+        let key = rig.key_dir;
+        let key_color = [1.0, 0.98, 0.95];
+        // Direction TO the light = -(direction of travel).
+        let to_light = |d: [f32; 3]| [-d[0], -d[1], -d[2]];
+
+        self.renderer
+            .add_distant_light(to_light(key), key_color, rig.key_intensity);
+
+        if rig.enabled {
+            let fill = [-key[0], key[1], -key[2]];
+            let rim = [-key[0], key[1].max(0.2), -key[2]];
+            let fill_color = [0.78, 0.86, 1.00];
+            let rim_color = [1.00, 0.92, 0.80];
+            self.renderer.add_distant_light(
+                to_light(fill),
+                fill_color,
+                rig.key_intensity * rig.fill_ratio,
+            );
+            self.renderer.add_distant_light(
+                to_light(rim),
+                rim_color,
+                rig.key_intensity * rig.rim_ratio,
+            );
+        }
+    }
+
     /// Render one frame. `view` and `proj` are 4×4 matrices in *row*-
     /// vector convention — Hydra's `GfMatrix4d` expects
     /// `vec_world * view = vec_camera`. forge-paint's `OrbitCamera`
     /// produces column-vector matrices, so we transpose at the
     /// caller's boundary before passing them in.
     ///
-    /// Returns a tightly packed RGBA8 buffer of size
-    /// `width * height * 4`. Hand it to whatever texture-upload path
-    /// the UI uses (egui `ColorImage`, wgpu `write_texture`, …).
+    /// Returns a tightly packed top-down RGBA8 buffer (origin at the
+    /// top-left) of size `width * height * 4`. Hand it to whatever
+    /// texture-upload path the UI uses (egui `ColorImage`, wgpu
+    /// `write_texture`, …). hydra-rs 0.0.3+ reverses Storm's
+    /// GL-bottom-up AOV inside the C++ bridge, so no flip needed here.
     pub fn render(&mut self, view: &[f32; 16], proj: &[f32; 16]) -> Result<Vec<u8>> {
         self.renderer.set_camera_matrices(view, proj);
         Ok(self.renderer.render()?)
-    }
-
-    /// Replace the lighting rig wholesale. Caller is expected to
-    /// re-add lights afterwards via `add_distant_light` etc.
-    #[allow(dead_code)]
-    pub fn clear_lights(&mut self) {
-        self.renderer.clear_lights();
-    }
-
-    #[allow(dead_code)]
-    pub fn add_distant_light(&mut self, dir: [f32; 3], color: [f32; 3], intensity: f32) {
-        self.renderer.add_distant_light(dir, color, intensity);
     }
 }
 
