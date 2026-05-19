@@ -45,13 +45,18 @@ pub struct StudioRig {
 
 /// Snapshot of the wgpu side's HDRI environment, packaged for the
 /// Hydra dome. `path` is the on-disk HDRI file (or any URI the USD
-/// resolver can chase); `intensity` and `rotation_y_radians` mirror
-/// `EnvUniforms` directly. `None` → no dome (procedural sky on the
-/// wgpu side, nothing on the Hydra side — clear-colour shows through).
+/// resolver can chase); `intensity`, `exposure_stops`, and
+/// `rotation_y_radians` mirror the wgpu shader's env state plus the
+/// viewport's exposure slider. `None` → no dome (procedural sky on
+/// the wgpu side, nothing on the Hydra side — clear-colour shows
+/// through). UsdLux combines intensity and exposure multiplicatively
+/// (`final = intensity * 2^exposure`), so handing the slider's stops
+/// straight to the dome's `inputs:exposure` attr lines up.
 #[derive(Debug, Clone)]
 pub struct DomeEnv {
     pub path: std::path::PathBuf,
     pub intensity: f32,
+    pub exposure_stops: f32,
     pub rotation_y_radians: f32,
 }
 
@@ -61,6 +66,12 @@ pub struct HydraView {
     renderer: Renderer,
     pub width: u32,
     pub height: u32,
+    /// Stage path that was passed to `HydraView::new`. The C++ Renderer
+    /// holds an internal `UsdStageRefPtr` baked in at construction, so
+    /// loading a different USD file means the consumer has to drop the
+    /// whole `HydraView` and lazy-init a new one. Exposed so the
+    /// caller can detect the mismatch without bookkeeping of its own.
+    pub stage_path: std::path::PathBuf,
 }
 
 impl HydraView {
@@ -105,7 +116,67 @@ impl HydraView {
             renderer,
             width: 1280,
             height: 720,
+            stage_path: path.to_path_buf(),
         })
+    }
+
+    /// Plugin IDs of every Hydra render delegate the USD plug
+    /// registry found at startup. Storm is always there
+    /// (`HdStormRendererPlugin`); production delegates show up only
+    /// when their anvil packages compose into the run — `3delight`
+    /// adds `HdNSiRendererPlugin`, etc.
+    pub fn list_delegates() -> Vec<String> {
+        hydra_rs::list_render_delegates()
+    }
+
+    /// Plugin ID currently driving `render()`. Empty string if the
+    /// renderer hasn't picked one yet (shouldn't happen post-`new`).
+    pub fn current_delegate(&self) -> String {
+        self.renderer.current_renderer()
+    }
+
+    /// Swap the active Hydra render delegate. The engine keeps the
+    /// stage, scene index, camera, light rig, and dome across the
+    /// swap — only the rasteriser / path-tracer behind them changes.
+    /// Returns `Err` when `plugin_id` isn't a registered delegate.
+    pub fn set_delegate(&mut self, plugin_id: &str) -> Result<()> {
+        if !self.renderer.set_renderer_plugin(plugin_id) {
+            anyhow::bail!(
+                "Hydra render delegate not registered: {plugin_id}. \
+                 Available: {:?}",
+                Self::list_delegates()
+            );
+        }
+        Ok(())
+    }
+
+    /// Author a `UsdPreviewSurface` material into the stage's session
+    /// layer pointing at on-disk PNGs for the four PBR channels, and
+    /// bind it to every mesh. Each path can use the `<UDIM>` token so
+    /// a single material spans multi-tile UDIM layouts. Empty paths
+    /// skip that channel (the corresponding PBR input keeps its
+    /// UsdPreviewSurface default).
+    ///
+    /// Forwards straight to `hydra_rs::Renderer::set_painted_material`.
+    /// See the C++ bridge header for the source-colour-space split
+    /// (sRGB for base colour, raw for roughness/metallic/normal).
+    pub fn set_painted_material(
+        &mut self,
+        base_color: &Path,
+        roughness: &Path,
+        metallic: &Path,
+        normal: &Path,
+    ) -> Result<()> {
+        self.renderer
+            .set_painted_material(base_color, roughness, metallic, normal)
+            .map_err(|e| anyhow::anyhow!("set_painted_material failed: {}", e.what()))
+    }
+
+    /// Drop the painted material authored by `set_painted_material`
+    /// and unbind it from every mesh. The stage's originally-authored
+    /// bindings (if any) drive shading again afterwards.
+    pub fn clear_painted_material(&mut self) {
+        self.renderer.clear_painted_material();
     }
 
     /// Author a `UsdLuxDomeLight` into the stage's session layer (or
@@ -121,14 +192,15 @@ impl HydraView {
         match env {
             Some(e) => {
                 let degrees = e.rotation_y_radians.to_degrees();
-                // forge-paint's env_intensity slider is a linear
-                // multiplier in `[0, 4]`; map it straight to the
-                // UsdLux `intensity` attr and leave exposure at 0,
-                // since UsdLux combines them multiplicatively (final
-                // = intensity * 2^exposure) and the user-facing
-                // slider already lives in the intensity dimension.
+                // env_intensity → UsdLux `inputs:intensity` (linear
+                // multiplier). `exposure_stops` (the viewport's
+                // exposure slider, in stops) → UsdLux
+                // `inputs:exposure`. UsdLux multiplies them as
+                // `final = intensity * 2^exposure`, which matches
+                // the wgpu shader's `intensity * 2^exposure_stops`
+                // — same value flows into both panels.
                 self.renderer
-                    .set_dome_light(&e.path, e.intensity, 0.0, degrees)?;
+                    .set_dome_light(&e.path, e.intensity, e.exposure_stops, degrees)?;
             }
             None => {
                 self.renderer.clear_dome_light();
@@ -208,6 +280,25 @@ impl HydraView {
     pub fn render(&mut self, view: &[f32; 16], proj: &[f32; 16]) -> Result<Vec<u8>> {
         self.renderer.set_camera_matrices(view, proj);
         Ok(self.renderer.render()?)
+    }
+}
+
+/// Map a Hydra delegate plugin ID to the short label we show in the
+/// UI. Falls back to the raw ID when no mapping exists, so an
+/// unrecognised delegate (custom in-house plugin, beta build) still
+/// reads sensibly in the combo box rather than appearing as an empty
+/// row.
+pub fn delegate_label(plugin_id: &str) -> &str {
+    match plugin_id {
+        "HdStormRendererPlugin" => "Storm",
+        // hdNSI registers as `HdNSIRendererPlugin` with three caps —
+        // NSI is the acronym (Nodal Scene Interface). Easy typo.
+        "HdNSIRendererPlugin" => "3Delight",
+        "HdArnoldRendererPlugin" => "Arnold",
+        "HdPrmanLoaderRendererPlugin" | "HdPrmanRendererPlugin" => "RenderMan",
+        "HdCyclesRendererPlugin" => "Cycles",
+        "HdEmbreeRendererPlugin" => "Embree",
+        other => other,
     }
 }
 

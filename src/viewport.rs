@@ -96,7 +96,7 @@ pub struct Viewport {
     cpu_mesh: CpuMesh,
     accel: MeshAccel,
     /// Composited display textures — this is what the PBR shader samples.
-    paint_target: PaintTarget,
+    pub paint_target: PaintTarget,
     /// The paint stack. Brushes stamp into `layers[active]`; the compositor
     /// flattens the stack into `paint_target` after each stamp batch.
     pub layer_stack: LayerStack,
@@ -855,6 +855,7 @@ impl Viewport {
         stencil_view: Option<&wgpu::TextureView>,
         stencil_aspect: f32,
         stencil_egui_tex: Option<egui::TextureId>,
+        request_swap_renderer: &mut bool,
     ) {
         let available = ui.available_size();
         let (rect, response) =
@@ -1739,35 +1740,49 @@ impl Viewport {
             }
         }
 
-        // Renderer badge — top-left of the viewport canvas. Names the
-        // path drawing the frame. The wgpu painter owns the central
-        // viewport; the Hydra preview side panel stamps its own
-        // "▶ Hydra Storm" badge so the two reads at a glance as
-        // distinct renderers.
-        let badge_text = "▶ wgpu painter";
+        // Renderer badge — top-left of the viewport canvas. Clickable
+        // to swap the central viewport over to the Hydra preview
+        // (Solaris-style toggle): badge owns the role of "renderer
+        // label + swap button". The App owns the actual mode flag;
+        // we just signal a swap request via the &mut bool param.
         let badge_size = egui::vec2(160.0, 28.0);
         let badge_rect = egui::Rect::from_min_size(
             egui::pos2(rect.left() + 12.0, rect.top() + 12.0),
             badge_size,
         );
+        let badge_resp = ui.interact(
+            badge_rect,
+            ui.id().with("renderer_badge"),
+            egui::Sense::click(),
+        );
+        if badge_resp.clicked() {
+            *request_swap_renderer = true;
+        }
+        // Hover gives a subtle brightness lift so it reads as a
+        // control rather than a static label. Same yellow scheme as
+        // the focus stroke.
+        let (fill_alpha, stroke_w) = if badge_resp.hovered() { (240u8, 2.0) } else { (220u8, 1.5) };
         ui.painter().rect_filled(
             badge_rect,
             6.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, fill_alpha),
         );
         ui.painter().rect_stroke(
             badge_rect,
             6.0,
-            egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 220, 100)),
+            egui::Stroke::new(stroke_w, egui::Color32::from_rgb(255, 220, 100)),
             egui::StrokeKind::Outside,
         );
         ui.painter().text(
             badge_rect.center(),
             egui::Align2::CENTER_CENTER,
-            badge_text,
+            "▶ wgpu painter",
             egui::FontId::proportional(14.0),
             egui::Color32::from_rgb(255, 220, 100),
         );
+        if badge_resp.hovered() {
+            badge_resp.on_hover_text("Click to switch to Hydra preview");
+        }
 
         // Default brush-shortcut hint — shown at the bottom of the
         // viewport whenever the stencil-transform hint isn't taking the

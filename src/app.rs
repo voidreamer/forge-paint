@@ -38,16 +38,38 @@ pub struct App {
 
     /// Docked 2D UV painting view. Splits the central area when on.
     show_uv_view: bool,
-    /// Right-docked Hydra (Storm) preview panel. Renders the loaded
-    /// stage through `hydra_rs::Renderer` from the same orbit camera
-    /// the wgpu painter uses. The painter stays the source of truth
-    /// for painting; Hydra is the production-reference second view.
-    /// Lazily constructed on first open (needs a USD stage path).
-    show_hydra_view: bool,
+    /// Which renderer owns the central viewport this frame. Solaris-
+    /// style toggle (one viewport, swap between rasteriser and
+    /// path-tracer) rather than side-by-side panels — keeps full
+    /// resolution + a single source of input for orbit/zoom. The
+    /// `▶ wgpu painter` / `▶ Hydra <delegate>` badge in the top-left
+    /// is the swap button.
+    renderer_mode: RendererMode,
     hydra: Option<crate::hydra_view::HydraView>,
     /// egui texture handle for the Hydra render result. Cached so the
     /// previous frame's pixels don't disappear during a re-render.
     hydra_egui_tex: Option<egui::TextureHandle>,
+    /// User-selected Hydra render delegate plugin ID. `None` until
+    /// the first frame populates it from `HydraView::current_delegate`,
+    /// then sticks across stage opens so the user's pick (Storm /
+    /// 3Delight / Arnold / ...) survives a close-reopen.
+    hydra_delegate: Option<String>,
+    /// Root cache dir for painted-material syncs. Each sync writes
+    /// into a versioned subdir (`v<seq>`) of this so the material's
+    /// asset paths change every time — without that, Hydra's texture
+    /// cache keys on the resolved path and returns stale samples
+    /// even though we've overwritten the PNG on disk. Versioned
+    /// subdirs are the simplest invalidation hack.
+    hydra_paint_cache_dir: Option<std::path::PathBuf>,
+    /// Monotonic counter feeding the `vN` subdir name. Bumped on
+    /// every successful sync. Resets per process (re-launch starts
+    /// at 0); since the cache root is also per-pid, there's no risk
+    /// of collision with an older run's textures.
+    hydra_paint_sync_seq: u64,
+    /// Status string for the sync button overlay — set after a sync
+    /// run completes. Either "synced 14:32:05" on success or a
+    /// short error message. Cleared when stage changes.
+    hydra_paint_sync_status: Option<String>,
     /// Pixels-per-UV-unit for the UV atlas. Modified by scroll.
     uv_zoom: f32,
     /// Screen-pixel offset applied to the atlas (drag to pan).
@@ -81,6 +103,28 @@ pub struct App {
     /// Mirrors how the left tool column works — one focused view at a
     /// time, switched via the icon strip on the right edge.
     props_tab: PropertiesTab,
+}
+
+/// Which renderer owns the central viewport. Toggled by clicking the
+/// renderer badge in the canvas top-left. Wgpu mode is the painting
+/// surface (brush, stencil, paint ops); Hydra mode is a read-only
+/// production-reference preview through `hydra-rs` / `UsdImagingGL`.
+/// Camera state lives on `Viewport::camera` and is mirrored into Hydra
+/// each frame, so orbit/zoom feels identical in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RendererMode {
+    #[default]
+    Wgpu,
+    Hydra,
+}
+
+impl RendererMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Wgpu => Self::Hydra,
+            Self::Hydra => Self::Wgpu,
+        }
+    }
 }
 
 /// Pages of the right Properties panel. Default = Layers (the active
@@ -287,10 +331,17 @@ impl eframe::App for App {
                     {
                         ui.close_menu();
                     }
-                    if ui
-                        .checkbox(&mut self.show_hydra_view, "Hydra preview")
-                        .clicked()
-                    {
+                    // Hydra preview is no longer a separate panel —
+                    // click the `▶ wgpu painter` badge in the canvas
+                    // top-left to swap the central viewport over to
+                    // Hydra. View menu carries the keyboard shortcut
+                    // so it's still discoverable.
+                    let label = match self.renderer_mode {
+                        RendererMode::Wgpu => "Switch to Hydra preview",
+                        RendererMode::Hydra => "Switch to wgpu painter",
+                    };
+                    if ui.button(label).clicked() {
+                        self.renderer_mode = self.renderer_mode.toggled();
                         ui.close_menu();
                     }
                 });
@@ -576,18 +627,6 @@ impl eframe::App for App {
             self.show_slot_picker = Some(slot);
         }
 
-        // Hydra preview SidePanel — must declare BEFORE the
-        // CentralPanel (so CentralPanel correctly reserves space
-        // around it) AND before the stencil-view borrow below (the
-        // borrow checker rejects `&mut self` here while
-        // `stencil_view: &Asset` is alive across the central panel
-        // closure). SidePanel doesn't absorb drag input the way
-        // floating windows do, so the wgpu painter under the central
-        // area still receives orbit/zoom drags.
-        if self.show_hydra_view {
-            self.show_hydra_window(ctx, frame);
-        }
-
         // Resolve the active stencil's GPU view + metadata up front,
         // outside the mutable borrow of viewport inside the CentralPanel
         // closure. We also hand the egui TextureId through for the
@@ -662,7 +701,37 @@ impl eframe::App for App {
                             apply_uv_channel_to_brush(self.uv_channel, vp);
                         }
                     }
-                    vp.show(ui, frame, stencil_view, stencil_aspect, stencil_tex_id);
+                    let mut swap_renderer = false;
+                    match self.renderer_mode {
+                        RendererMode::Wgpu => {
+                            vp.show(
+                                ui,
+                                frame,
+                                stencil_view,
+                                stencil_aspect,
+                                stencil_tex_id,
+                                &mut swap_renderer,
+                            );
+                        }
+                        RendererMode::Hydra => {
+                            Self::draw_hydra_central(
+                                ui,
+                                frame,
+                                vp,
+                                &mut self.hydra,
+                                &mut self.hydra_egui_tex,
+                                &mut self.hydra_delegate,
+                                &mut self.hydra_paint_cache_dir,
+                                &mut self.hydra_paint_sync_seq,
+                                &mut self.hydra_paint_sync_status,
+                                self.current_usd_path.as_deref(),
+                                &mut swap_renderer,
+                            );
+                        }
+                    }
+                    if swap_renderer {
+                        self.renderer_mode = self.renderer_mode.toggled();
+                    }
                 } else {
                     ui.centered_and_justified(|ui| ui.label("Initializing GPU…"));
                 }
@@ -2586,194 +2655,475 @@ impl App {
         }
     }
 
-    /// Right-docked Hydra preview panel. Owns `self.hydra` (the
-    /// `HydraView` wrapper) lazily: constructed on first open if a
-    /// USD path is loaded, dropped if the user closes the panel.
-    /// Each frame:
-    ///   1. Resolve camera matrices from `Viewport::camera`, convert
-    ///      glam's column-vector storage to Hydra's row-vector
-    ///      convention, and synth a GL-style projection (GfCamera
-    ///      rejects wgpu's [0, 1] clip-Z).
-    ///   2. Resize the renderer to the panel's content area.
-    ///   3. Mirror the wgpu studio rig into Hydra each frame so
-    ///      changing key/fill/rim on the wgpu side updates here too.
-    ///   4. Call `render()` for an RGBA8 buffer, hand it to egui as a
-    ///      `ColorImage` → `TextureHandle`, paint the texture into
-    ///      the panel with `painter.image()`.
-    ///   5. Stamp a "▶ Hydra Storm" badge on top so the panel reads
-    ///      at a glance as Hydra rather than the wgpu painter.
-    fn show_hydra_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        let stage_path = self.current_usd_path.clone();
-        let mut open = true;
-        // Continuous repaint while the panel is open so wgpu-side
-        // orbit input lands in the Hydra render immediately.
-        ctx.request_repaint();
-        let response = egui::SidePanel::right("hydra_preview")
-            .resizable(true)
-            .default_width(360.0)
-            .min_width(200.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Hydra preview").strong());
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.small_button("✕").on_hover_text("Close").clicked() {
-                                open = false;
-                            }
-                        },
-                    );
-                });
-                ui.separator();
-                let Some(ref path) = stage_path else {
-                    ui.label("Open a USD stage first — Hydra needs a stage path.");
-                    return;
-                };
+    /// Render the Hydra preview into the central viewport, full-size,
+    /// in place of the wgpu painter. Solaris-style mode swap: orbit /
+    /// zoom input still drives `vp.camera` (so flipping back to wgpu
+    /// keeps the same framing), the renderer badge in the top-left is
+    /// clickable and toggles `renderer_mode` back, the delegate combo
+    /// overlay sits top-right.
+    ///
+    /// Associated function (no `&mut self`) so the caller can hand us
+    /// disjoint field borrows of App — that's how we update
+    /// `self.hydra`, `self.hydra_egui_tex`, etc. without colliding
+    /// with the `&mut self.viewport` already in scope inside the
+    /// central panel closure.
+    fn draw_hydra_central(
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+        vp: &mut Viewport,
+        hydra_slot: &mut Option<crate::hydra_view::HydraView>,
+        hydra_egui_tex: &mut Option<egui::TextureHandle>,
+        hydra_delegate: &mut Option<String>,
+        hydra_paint_cache_dir: &mut Option<std::path::PathBuf>,
+        hydra_paint_sync_seq: &mut u64,
+        hydra_paint_sync_status: &mut Option<String>,
+        stage_path: Option<&std::path::Path>,
+        request_swap_renderer: &mut bool,
+    ) {
+        let available = ui.available_size();
+        let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
+        let w = (rect.width() as u32).max(64);
+        let h = (rect.height() as u32).max(64);
+        let aspect = rect.width() / rect.height();
 
-                // Snapshot the camera + rig + size state up front.
-                // Once we touch `self.hydra` mutably below, holding
-                // any other borrow into `self` (like `self.viewport`)
-                // trips the borrow checker — disjoint-field borrows
-                // aren't reliable across a closure capture.
-                let avail = ui.available_size();
-                let w = (avail.x as u32).max(64);
-                let h = (avail.y as u32).max(64);
-                let aspect = w as f32 / h as f32;
-                let (view_row, proj_row, rig, env) = match self.viewport.as_ref() {
-                    Some(vp) => {
-                        let view = vp.camera.view().to_cols_array_2d();
-                        let view_row = crate::hydra_view::glam_to_hydra(&view);
-                        let proj_row = crate::hydra_view::perspective_for_hydra(
-                            vp.camera.fov_y_deg.to_radians(),
-                            aspect,
-                            vp.camera.z_near,
-                            vp.camera.z_far,
-                        );
-                        let rig = crate::hydra_view::StudioRig {
-                            key_dir: vp.light_dir,
-                            key_intensity: vp.light_intensity,
-                            fill_ratio: vp.studio_fill_ratio,
-                            rim_ratio: vp.studio_rim_ratio,
-                            enabled: vp.studio_rig_enabled,
-                        };
-                        // Procedural env stays Hydra-less — the
-                        // procedural texture lives on the wgpu GPU and
-                        // doesn't have a file path to hand to USD's
-                        // asset resolver. Real HDRIs come in with
-                        // `source_path = Some(...)` and route into the
-                        // dome.
-                        let env = vp.env.source_path.as_ref().map(|p| {
-                            crate::hydra_view::DomeEnv {
-                                path: p.clone(),
-                                intensity: vp.env_intensity,
-                                rotation_y_radians: vp.env_rotation_y,
-                            }
-                        });
-                        (view_row, proj_row, rig, env)
-                    }
-                    None => {
-                        ui.label("Viewport not initialised yet.");
-                        return;
-                    }
-                };
+        // Continuous repaint keeps path-tracer convergence going + lets
+        // orbit feel real-time. Cheap when nothing changes (Storm and
+        // hdNSI both short-circuit unchanged frames at the delegate
+        // level).
+        ui.ctx().request_repaint();
 
-                if self.hydra.is_none() {
-                    log::info!("Hydra: opening stage {}", path.display());
-                    match crate::hydra_view::HydraView::new(path) {
-                        Ok(v) => {
-                            log::info!("Hydra: stage opened OK, size {}x{}", w, h);
-                            self.hydra = Some(v);
-                        }
-                        Err(e) => {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(255, 140, 120),
-                                format!("Hydra init failed: {e:#}"),
-                            );
-                            return;
-                        }
-                    }
-                }
-                let hydra = self.hydra.as_mut().unwrap();
-                hydra.resize(w, h);
-                hydra.set_rig(rig);
-                if let Err(e) = hydra.set_environment(env.as_ref()) {
-                    log::warn!("Hydra: set_environment failed: {e:#}");
-                }
+        // Background fill so the not-yet-rendered area reads as part
+        // of the panel rather than the dark canvas behind everything.
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            egui::Color32::from_rgb(5, 5, 6),
+        );
 
-                match hydra.render(&view_row, &proj_row) {
-                    Ok(pixels) => {
-                        let img = egui::ColorImage::from_rgba_unmultiplied(
-                            [w as usize, h as usize],
-                            &pixels,
-                        );
-                        let handle = ui.ctx().load_texture(
-                            "hydra_frame",
-                            img,
-                            egui::TextureOptions::default(),
-                        );
-                        let (rect, _resp) = ui.allocate_exact_size(
-                            egui::vec2(w as f32, h as f32),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().image(
-                            handle.id(),
-                            rect,
-                            egui::Rect::from_min_max(
-                                egui::pos2(0.0, 0.0),
-                                egui::pos2(1.0, 1.0),
-                            ),
-                            egui::Color32::WHITE,
-                        );
-                        self.hydra_egui_tex = Some(handle);
+        // Camera nav — same plumbing as the wgpu side, same scroll
+        // wheel for zoom. Updates `vp.camera`, which is what we
+        // snapshot below to drive Hydra's view matrix.
+        let scroll_dy = if response.hovered() {
+            ui.input(|i| i.smooth_scroll_delta.y)
+        } else {
+            0.0
+        };
+        vp.camera.handle_input(&response, scroll_dy);
 
-                        // Hydra badge — green ring + ▶ glyph, mirrors
-                        // the wgpu badge style so the two panels read
-                        // as a matching pair.
-                        let badge_size = egui::vec2(160.0, 28.0);
-                        let badge_rect = egui::Rect::from_min_size(
-                            egui::pos2(rect.left() + 12.0, rect.top() + 12.0),
-                            badge_size,
-                        );
-                        ui.painter().rect_filled(
-                            badge_rect,
-                            6.0,
-                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
-                        );
-                        ui.painter().rect_stroke(
-                            badge_rect,
-                            6.0,
-                            egui::Stroke::new(
-                                1.5,
-                                egui::Color32::from_rgb(120, 220, 140),
-                            ),
-                            egui::StrokeKind::Outside,
-                        );
-                        ui.painter().text(
-                            badge_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "▶ Hydra Storm",
-                            egui::FontId::proportional(14.0),
-                            egui::Color32::from_rgb(120, 220, 140),
-                        );
-                    }
-                    Err(e) => {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(255, 140, 120),
-                            format!("Hydra render failed: {e:#}"),
-                        );
-                    }
-                }
-                let _ = frame;
-            });
-        // The user closed the panel via its [×]. Drop the renderer so
-        // re-opening starts fresh on the current stage path.
-        if !open {
-            self.show_hydra_view = false;
-            self.hydra = None;
-            self.hydra_egui_tex = None;
+        // Stop here if there's no stage to open — show a placeholder
+        // overlay so the canvas isn't just black with no explanation.
+        let Some(path) = stage_path else {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Open a USD stage to see the Hydra preview.",
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_gray(200),
+            );
+            Self::draw_renderer_badge_hydra(
+                ui,
+                rect,
+                "Hydra",
+                request_swap_renderer,
+            );
+            let _ = frame;
+            return;
+        };
+
+        // Drop the previous `HydraView` if the user has loaded a
+        // different stage since we constructed it — Hydra's C++
+        // Renderer holds a `UsdStageRefPtr` baked in at construction
+        // and has no swap-stage API, so the only safe way to switch
+        // stages is to throw the renderer away and lazy-init a new
+        // one below. Without this, opening a new USD leaves the
+        // Hydra panel rendering the old one indefinitely.
+        if let Some(existing) = hydra_slot.as_ref() {
+            if existing.stage_path != path {
+                log::info!(
+                    "Hydra: stage changed from {} to {}, dropping renderer",
+                    existing.stage_path.display(),
+                    path.display(),
+                );
+                *hydra_slot = None;
+                *hydra_egui_tex = None;
+            }
         }
-        let _ = response;
+
+        // Lazy-init the renderer once we have both a stage path and a
+        // viewport. Same shape as the previous side-panel
+        // implementation — the only thing that changed is where the
+        // rect comes from.
+        if hydra_slot.is_none() {
+            log::info!("Hydra: opening stage {}", path.display());
+            match crate::hydra_view::HydraView::new(path) {
+                Ok(v) => {
+                    log::info!("Hydra: stage opened OK, size {}x{}", w, h);
+                    *hydra_slot = Some(v);
+                }
+                Err(e) => {
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!("Hydra init failed: {e:#}"),
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::from_rgb(255, 140, 120),
+                    );
+                    Self::draw_renderer_badge_hydra(
+                        ui,
+                        rect,
+                        "Hydra",
+                        request_swap_renderer,
+                    );
+                    let _ = frame;
+                    return;
+                }
+            }
+        }
+        let hydra = hydra_slot.as_mut().unwrap();
+
+        // Snapshot viewport state for this frame.
+        let view = vp.camera.view().to_cols_array_2d();
+        let view_row = crate::hydra_view::glam_to_hydra(&view);
+        let proj_row = crate::hydra_view::perspective_for_hydra(
+            vp.camera.fov_y_deg.to_radians(),
+            aspect,
+            vp.camera.z_near,
+            vp.camera.z_far,
+        );
+        let rig = crate::hydra_view::StudioRig {
+            key_dir: vp.light_dir,
+            key_intensity: vp.light_intensity,
+            fill_ratio: vp.studio_fill_ratio,
+            rim_ratio: vp.studio_rim_ratio,
+            enabled: vp.studio_rig_enabled,
+        };
+        let env = vp.env.source_path.as_ref().map(|p| {
+            crate::hydra_view::DomeEnv {
+                path: p.clone(),
+                intensity: vp.env_intensity,
+                exposure_stops: vp.exposure_stops,
+                rotation_y_radians: vp.env_rotation_y,
+            }
+        });
+
+        // Adopt the user's delegate pick, if any.
+        let current_delegate = hydra.current_delegate();
+        let desired_delegate = hydra_delegate
+            .clone()
+            .unwrap_or_else(|| current_delegate.clone());
+        if !desired_delegate.is_empty() && desired_delegate != current_delegate {
+            if let Err(e) = hydra.set_delegate(&desired_delegate) {
+                log::warn!("Hydra: delegate switch failed: {e:#}");
+            }
+        }
+        if hydra_delegate.is_none() && !current_delegate.is_empty() {
+            *hydra_delegate = Some(current_delegate.clone());
+        }
+
+        hydra.resize(w, h);
+        hydra.set_rig(rig);
+        if let Err(e) = hydra.set_environment(env.as_ref()) {
+            log::warn!("Hydra: set_environment failed: {e:#}");
+        }
+
+        match hydra.render(&view_row, &proj_row) {
+            Ok(pixels) => {
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    &pixels,
+                );
+                let handle = ui.ctx().load_texture(
+                    "hydra_frame",
+                    img,
+                    egui::TextureOptions::default(),
+                );
+                ui.painter().image(
+                    handle.id(),
+                    rect,
+                    egui::Rect::from_min_max(
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1.0, 1.0),
+                    ),
+                    egui::Color32::WHITE,
+                );
+                *hydra_egui_tex = Some(handle);
+            }
+            Err(e) => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("Hydra render failed: {e:#}"),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgb(255, 140, 120),
+                );
+            }
+        }
+
+        // Renderer badge top-left — same shape as the wgpu badge,
+        // green palette + ▶ Hydra <delegate> text. Click swaps back.
+        let badge_text_owned = format!(
+            "▶ Hydra {}",
+            crate::hydra_view::delegate_label(&desired_delegate),
+        );
+        Self::draw_renderer_badge_hydra(
+            ui,
+            rect,
+            &badge_text_owned,
+            request_swap_renderer,
+        );
+
+        // Delegate combo overlay top-right — Hydra-mode-only, mirror
+        // image of the badge. Shows every registered delegate; pick
+        // one and the next frame's `set_delegate` does the switch.
+        let combo_size = egui::vec2(150.0, 28.0);
+        let combo_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - combo_size.x - 12.0, rect.top() + 12.0),
+            combo_size,
+        );
+        let delegates = crate::hydra_view::HydraView::list_delegates();
+        let mut chosen = desired_delegate.clone();
+        let mut combo_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(combo_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        egui::ComboBox::from_id_salt("hydra_delegate_canvas")
+            .selected_text(crate::hydra_view::delegate_label(&chosen))
+            .show_ui(&mut combo_ui, |ui| {
+                for id in &delegates {
+                    ui.selectable_value(
+                        &mut chosen,
+                        id.clone(),
+                        crate::hydra_view::delegate_label(id),
+                    );
+                }
+            });
+        if chosen != desired_delegate {
+            *hydra_delegate = Some(chosen);
+        }
+
+        // "Sync paint" button — sits directly under the delegate
+        // combo, same right-aligned x. Click reads the current paint
+        // target back from the wgpu side, writes per-tile PNGs into
+        // a cache dir, and authors a `UsdPreviewSurface` material
+        // in the Hydra session layer bound to all meshes. Hydra
+        // picks up the binding next frame.
+        let sync_btn_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.right() - combo_size.x - 12.0,
+                rect.top() + 12.0 + combo_size.y + 6.0,
+            ),
+            egui::vec2(combo_size.x, 26.0),
+        );
+        let sync_resp = ui.interact(
+            sync_btn_rect,
+            ui.id().with("hydra_sync_paint"),
+            egui::Sense::click(),
+        );
+        if sync_resp.clicked() {
+            // Borrow the renderer one more time to author the
+            // material — keeps `vp` borrow alive only for the
+            // export readback inside the helper.
+            let hydra = hydra_slot.as_mut().expect("hydra exists post-init");
+            let status = Self::sync_painted_material(
+                frame,
+                vp,
+                hydra,
+                hydra_paint_cache_dir,
+                hydra_paint_sync_seq,
+            );
+            log::info!("Hydra paint sync: {status}");
+            *hydra_paint_sync_status = Some(status);
+        }
+        let (sync_fill_alpha, sync_stroke_w) = if sync_resp.hovered() { (240u8, 2.0) } else { (220u8, 1.5) };
+        ui.painter().rect_filled(
+            sync_btn_rect,
+            6.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, sync_fill_alpha),
+        );
+        ui.painter().rect_stroke(
+            sync_btn_rect,
+            6.0,
+            egui::Stroke::new(sync_stroke_w, egui::Color32::from_rgb(180, 200, 255)),
+            egui::StrokeKind::Outside,
+        );
+        ui.painter().text(
+            sync_btn_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "↻ Sync paint",
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_rgb(180, 200, 255),
+        );
+        if sync_resp.hovered() {
+            sync_resp.on_hover_text(
+                "Read paint targets → write per-tile PNGs → author UsdPreviewSurface in Hydra",
+            );
+        }
+
+        // Status line under the sync button — last sync's outcome.
+        if let Some(status) = hydra_paint_sync_status.as_deref() {
+            let status_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.right() - combo_size.x - 12.0,
+                    sync_btn_rect.bottom() + 4.0,
+                ),
+                egui::vec2(combo_size.x, 18.0),
+            );
+            ui.painter().text(
+                status_rect.right_center(),
+                egui::Align2::RIGHT_CENTER,
+                status,
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(180),
+            );
+        }
+
+        let _ = frame;
     }
+
+    /// Exports the current paint target to a cache dir as per-tile
+    /// PNGs, then authors a `UsdPreviewSurface` material in the
+    /// Hydra session layer pointing at those PNGs (via the `<UDIM>`
+    /// token so a single material spans every tile). The Hydra
+    /// preview re-renders next frame with the painted look applied.
+    ///
+    /// Cache dir is per-process under `std::env::temp_dir()`. It's
+    /// re-used across sync calls so the material in the session
+    /// layer stays valid — re-exporting just overwrites the same
+    /// files in place. Returns a short status string for the
+    /// overlay (success timestamp or error message).
+    fn sync_painted_material(
+        frame: &eframe::Frame,
+        vp: &Viewport,
+        hydra: &mut crate::hydra_view::HydraView,
+        cache_root: &mut Option<std::path::PathBuf>,
+        sync_seq: &mut u64,
+    ) -> String {
+        let Some(render_state) = frame.wgpu_render_state() else {
+            return "Sync failed: no wgpu render state".to_string();
+        };
+
+        // Root cache dir is per-process so concurrent forge-paint
+        // instances can't trample each other's PNGs and so /tmp's
+        // own GC reclaims everything on process exit.
+        let root: std::path::PathBuf = cache_root
+            .get_or_insert_with(|| {
+                let pid = std::process::id();
+                std::env::temp_dir().join(format!("forge-paint-hydra-{pid}"))
+            })
+            .clone();
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            return format!("Sync failed: create cache root: {e}");
+        }
+
+        // Versioned subdir per sync — Hydra's texture cache keys on
+        // the resolved asset path, so re-writing the same PNG path
+        // would hand back the old sampled data. Bumping the dir
+        // forces a fresh fetch on the delegate side.
+        *sync_seq = sync_seq.saturating_add(1);
+        let seq = *sync_seq;
+        let versioned_dir = root.join(format!("v{seq}"));
+        if let Err(e) = std::fs::create_dir_all(&versioned_dir) {
+            return format!("Sync failed: create versioned dir: {e}");
+        }
+
+        let exports = match crate::export::export_tiles(
+            &render_state.device,
+            &render_state.queue,
+            &vp.paint_target,
+            &versioned_dir,
+        ) {
+            Ok(e) => e,
+            Err(e) => return format!("Sync failed: export: {e:#}"),
+        };
+
+        // Build one `<UDIM>` asset path per channel. `export_tiles`
+        // writes `<channel>.<udim>.png` (e.g. basecolor.1001.png),
+        // so the path with `<UDIM>` in place of the integer is
+        // exactly what UsdUVTexture's resolver will substitute. The
+        // resolver doesn't care if a particular tile's PNG is
+        // missing — it just samples default for those UVs.
+        let path_for = |channel: &str| -> String {
+            if !exports.iter().any(|e| e.channel == channel) {
+                return String::new();
+            }
+            versioned_dir
+                .join(format!("{channel}.<UDIM>.png"))
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        let base_color = path_for("basecolor");
+        let roughness = path_for("roughness");
+        let metallic = path_for("metallic");
+        let normal = path_for("normal");
+
+        let bc = std::path::PathBuf::from(&base_color);
+        let ro = std::path::PathBuf::from(&roughness);
+        let me = std::path::PathBuf::from(&metallic);
+        let nm = std::path::PathBuf::from(&normal);
+        if let Err(e) = hydra.set_painted_material(&bc, &ro, &me, &nm) {
+            return format!("Sync failed: set_painted_material: {e:#}");
+        }
+
+        // Trim history: keep the current sync's dir plus one prior
+        // (in case the delegate is still sampling from the previous
+        // version mid-render — unlikely with our continuous-repaint
+        // loop, but cheap insurance). Delete `v<seq-2>` and earlier.
+        if seq >= 2 {
+            let _ = std::fs::remove_dir_all(root.join(format!("v{}", seq - 2)));
+        }
+
+        format!("synced v{seq} ({} tiles)", exports.len() / 4)
+    }
+
+    /// Draw the green "▶ Hydra ..." badge in `rect`'s top-left as a
+    /// clickable button. Mirrors `Viewport::show`'s yellow wgpu badge.
+    /// Sets `*request_swap` to true on click so the App can flip
+    /// `renderer_mode` back to Wgpu after the closure returns.
+    fn draw_renderer_badge_hydra(
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        label: &str,
+        request_swap: &mut bool,
+    ) {
+        let badge_size = egui::vec2(170.0, 28.0);
+        let badge_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 12.0, rect.top() + 12.0),
+            badge_size,
+        );
+        let resp = ui.interact(
+            badge_rect,
+            ui.id().with("renderer_badge_hydra"),
+            egui::Sense::click(),
+        );
+        if resp.clicked() {
+            *request_swap = true;
+        }
+        let (fill_alpha, stroke_w) = if resp.hovered() { (240u8, 2.0) } else { (220u8, 1.5) };
+        ui.painter().rect_filled(
+            badge_rect,
+            6.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, fill_alpha),
+        );
+        ui.painter().rect_stroke(
+            badge_rect,
+            6.0,
+            egui::Stroke::new(stroke_w, egui::Color32::from_rgb(120, 220, 140)),
+            egui::StrokeKind::Outside,
+        );
+        ui.painter().text(
+            badge_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(14.0),
+            egui::Color32::from_rgb(120, 220, 140),
+        );
+        if resp.hovered() {
+            resp.on_hover_text("Click to switch back to wgpu painter");
+        }
+    }
+
 
     fn do_undo(&mut self, frame: &eframe::Frame) {
         let Some(render_state) = frame.wgpu_render_state() else {

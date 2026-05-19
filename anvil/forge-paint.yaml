@@ -8,6 +8,16 @@ description: "USD-centric Rust painter — prototype Substance Painter replaceme
 requires:
   - usd
   - resolver-0.26.5
+  # 3delight-runtime exposes DELIGHT + DYLD_LIBRARY_PATH only — just
+  # the bits hdNSI needs to dlopen lib3delight.dylib at runtime. The
+  # actual hdNSI plug-in is built locally against our USD (~/USD/
+  # plugin/usd/hdNSI) so it picks up via USD's install-relative plug-in
+  # scan. Composes as a no-op when /Applications/3Delight isn't
+  # installed — DYLD_LIBRARY_PATH points at a missing dir, hdNSI just
+  # isn't in the plug-in registry, and the panel's delegate dropdown
+  # only shows Storm. See anvil/3delight-runtime.yaml's header
+  # comment for the deliberate split from the full `3delight` pkg.
+  - 3delight-runtime
 
 environment:
   # Point at the locally-built binary. Adjust if the project lives elsewhere.
