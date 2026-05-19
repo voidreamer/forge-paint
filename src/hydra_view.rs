@@ -43,6 +43,18 @@ pub struct StudioRig {
     pub enabled: bool,
 }
 
+/// Snapshot of the wgpu side's HDRI environment, packaged for the
+/// Hydra dome. `path` is the on-disk HDRI file (or any URI the USD
+/// resolver can chase); `intensity` and `rotation_y_radians` mirror
+/// `EnvUniforms` directly. `None` → no dome (procedural sky on the
+/// wgpu side, nothing on the Hydra side — clear-colour shows through).
+#[derive(Debug, Clone)]
+pub struct DomeEnv {
+    pub path: std::path::PathBuf,
+    pub intensity: f32,
+    pub rotation_y_radians: f32,
+}
+
 /// Per-panel Hydra renderer. Held alongside the wgpu viewport — the
 /// caller decides which panel(s) to surface in the UI.
 pub struct HydraView {
@@ -74,17 +86,19 @@ impl HydraView {
         let mut renderer = Renderer::new(path)?;
         renderer.set_size(1280, 720);
 
-        // Diagnostic magenta clear so empty-frustum / black-shading
-        // are visually distinguishable from an unlit-but-rendered
-        // model. Easy to spot in a side-by-side with the wgpu panel.
-        renderer.set_clear_color([1.0, 0.0, 1.0, 1.0]);
+        // Neutral dark backdrop for when no dome is bound — matches
+        // the wgpu central panel's `from_rgb(18, 18, 22)`. Once a
+        // `DomeEnv` is set via `set_environment`, the dome draws
+        // behind the geometry and the clear colour is only visible
+        // through any holes in coverage.
+        renderer.set_clear_color([0.02, 0.02, 0.025, 1.0]);
 
-        // Hydra has no IBL, so without an ambient lift the shadow
-        // side of the model crushes to black and the panel reads
-        // dramatically darker than the wgpu side. Pull a single
-        // additive ambient from the same sky-tint colour the wgpu
-        // shader uses for its sky/ground ambient term, scaled down
-        // since Storm only takes one ambient (no separate ground).
+        // Fall-back scene ambient for the no-dome case. With the dome
+        // bound Storm gets full IBL out of the env-map importance
+        // sample, so this ambient becomes a small residual; without
+        // the dome it's the only thing keeping the shadow side off
+        // pure black. Linear-space, sky-tinted to match the wgpu
+        // shader's ambient term.
         renderer.set_scene_ambient([0.20, 0.24, 0.30, 1.0]);
 
         Ok(Self {
@@ -92,6 +106,35 @@ impl HydraView {
             width: 1280,
             height: 720,
         })
+    }
+
+    /// Author a `UsdLuxDomeLight` into the stage's session layer (or
+    /// remove it, if `env` is `None`). Storm renders the dome as both
+    /// the visible skybox and an IBL source, so calling this routes
+    /// the wgpu HDRI into Hydra for free — no separate background
+    /// task, no manual env-map importance sampling.
+    ///
+    /// Cheap enough to call every frame: the bridge re-uses the same
+    /// session-layer prim path and just rewrites the attributes,
+    /// rather than tearing it down and rebuilding.
+    pub fn set_environment(&mut self, env: Option<&DomeEnv>) -> Result<()> {
+        match env {
+            Some(e) => {
+                let degrees = e.rotation_y_radians.to_degrees();
+                // forge-paint's env_intensity slider is a linear
+                // multiplier in `[0, 4]`; map it straight to the
+                // UsdLux `intensity` attr and leave exposure at 0,
+                // since UsdLux combines them multiplicatively (final
+                // = intensity * 2^exposure) and the user-facing
+                // slider already lives in the intensity dimension.
+                self.renderer
+                    .set_dome_light(&e.path, e.intensity, 0.0, degrees)?;
+            }
+            None => {
+                self.renderer.clear_dome_light();
+            }
+        }
+        Ok(())
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {

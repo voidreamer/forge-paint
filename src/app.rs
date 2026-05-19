@@ -2639,7 +2639,7 @@ impl App {
                 let w = (avail.x as u32).max(64);
                 let h = (avail.y as u32).max(64);
                 let aspect = w as f32 / h as f32;
-                let (view_row, proj_row, rig) = match self.viewport.as_ref() {
+                let (view_row, proj_row, rig, env) = match self.viewport.as_ref() {
                     Some(vp) => {
                         let view = vp.camera.view().to_cols_array_2d();
                         let view_row = crate::hydra_view::glam_to_hydra(&view);
@@ -2656,7 +2656,20 @@ impl App {
                             rim_ratio: vp.studio_rim_ratio,
                             enabled: vp.studio_rig_enabled,
                         };
-                        (view_row, proj_row, rig)
+                        // Procedural env stays Hydra-less — the
+                        // procedural texture lives on the wgpu GPU and
+                        // doesn't have a file path to hand to USD's
+                        // asset resolver. Real HDRIs come in with
+                        // `source_path = Some(...)` and route into the
+                        // dome.
+                        let env = vp.env.source_path.as_ref().map(|p| {
+                            crate::hydra_view::DomeEnv {
+                                path: p.clone(),
+                                intensity: vp.env_intensity,
+                                rotation_y_radians: vp.env_rotation_y,
+                            }
+                        });
+                        (view_row, proj_row, rig, env)
                     }
                     None => {
                         ui.label("Viewport not initialised yet.");
@@ -2683,6 +2696,9 @@ impl App {
                 let hydra = self.hydra.as_mut().unwrap();
                 hydra.resize(w, h);
                 hydra.set_rig(rig);
+                if let Err(e) = hydra.set_environment(env.as_ref()) {
+                    log::warn!("Hydra: set_environment failed: {e:#}");
+                }
 
                 match hydra.render(&view_row, &proj_row) {
                     Ok(pixels) => {

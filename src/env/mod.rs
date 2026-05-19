@@ -62,6 +62,13 @@ pub struct Environment {
     pub prefilter_mips: u32,
 
     pub name: String,
+
+    /// Disk path the HDRI was loaded from, when applicable. Procedural
+    /// envs leave this `None`. Consumers that need an asset path (the
+    /// Hydra preview panel's `UsdLuxDomeLight`, project save sidecars)
+    /// read this — the GPU texture isn't routable through anything
+    /// other than wgpu.
+    pub source_path: Option<std::path::PathBuf>,
 }
 
 impl Environment {
@@ -143,7 +150,7 @@ impl Environment {
             .and_then(|s| s.to_str())
             .unwrap_or("hdri")
             .to_string();
-        Ok(Self::from_equirect_rgba16f(
+        let mut env = Self::from_equirect_rgba16f(
             device,
             queue,
             brdf_lut,
@@ -153,7 +160,9 @@ impl Environment {
             w,
             h,
             &pixels,
-        ))
+        );
+        env.source_path = Some(path.to_path_buf());
+        Ok(env)
     }
 
     /// Build an `Environment` from already-decoded Rgba16F equirectangular
@@ -351,6 +360,7 @@ impl Environment {
             prefilter_view,
             prefilter_mips,
             name: name.to_string(),
+            source_path: None,
         }
     }
 
