@@ -1,0 +1,35 @@
+#usda 1.0
+(
+    defaultPrim = "Material"
+    doc = "Bundled MaterialX starter — aged brass via ND_standard_surface_surfaceshader. Demonstrates the MaterialX cross-renderer path (Storm + 3Delight both consume `ND_*` MaterialX node definitions through USD's SdrRegistry)."
+)
+
+def Material "Material"
+{
+    # MaterialX bindings use the `mtlx:surface` output rather than
+    # the bare `surface` token UsdPreviewSurface uses. Both work in
+    # parallel — a delegate that doesn't know MaterialX falls back to
+    # the surface output, so MaterialX-aware delegates pick mtlx.
+    token outputs:mtlx:surface.connect = </Material/Surface.outputs:out>
+    token outputs:surface.connect = </Material/Surface.outputs:out>
+
+    def Shader "Surface"
+    {
+        uniform token info:id = "ND_standard_surface_surfaceshader"
+
+        # MaterialX standard_surface input names — different from
+        # UsdPreviewSurface's (`base_color` vs `diffuseColor`,
+        # `metalness` vs `metallic`, `specular_roughness` vs
+        # `roughness`). Worth seeing in the wild as a contrast.
+        color3f inputs:base_color = (0.81, 0.61, 0.27)
+        float inputs:base = 1.0
+        float inputs:metalness = 1.0
+        float inputs:specular = 1.0
+        float inputs:specular_roughness = 0.38
+        # Subtle warm coat to read as aged / patinaed brass under HDRI.
+        float inputs:coat = 0.15
+        float inputs:coat_roughness = 0.4
+
+        token outputs:out
+    }
+}
