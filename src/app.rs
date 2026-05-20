@@ -70,6 +70,20 @@ pub struct App {
     /// run completes. Either "synced 14:32:05" on success or a
     /// short error message. Cleared when stage changes.
     hydra_paint_sync_status: Option<String>,
+    /// `UsdGeomImageable::purpose` filter toggles for the Hydra view.
+    /// Defaults: render = on (pipeline assets wrap detail geom in
+    /// `Scope { purpose = "render" }`), proxy = on (playback proxies),
+    /// guides = off (overlay-only annotations). Mirrored into the
+    /// bridge every frame.
+    hydra_show_render: bool,
+    hydra_show_proxy: bool,
+    hydra_show_guides: bool,
+    /// Latched true whenever the user flips wgpu → Hydra. Consumed by
+    /// `draw_hydra_central` to run one painted-material sync at mode
+    /// entry, so any wgpu strokes get reflected in the Hydra panel
+    /// without the user needing to click `↻ Sync paint`. Cleared
+    /// after the sync (or after a failure that won't repeat).
+    hydra_paint_sync_pending: bool,
     /// Pixels-per-UV-unit for the UV atlas. Modified by scroll.
     uv_zoom: f32,
     /// Screen-pixel offset applied to the atlas (drag to pan).
@@ -225,6 +239,11 @@ impl App {
             uv_zoom: 400.0,
             uv_show_wireframe: true,
             uv_channel: crate::render::ViewMode::BaseColor,
+            // Defaults — render + proxy on, guides off. Matches
+            // usdview and Solaris's "show me the asset" defaults.
+            hydra_show_render: true,
+            hydra_show_proxy: true,
+            hydra_show_guides: false,
             ..Default::default()
         }
     }
@@ -710,7 +729,6 @@ impl eframe::App for App {
                                 stencil_view,
                                 stencil_aspect,
                                 stencil_tex_id,
-                                &mut swap_renderer,
                             );
                         }
                         RendererMode::Hydra => {
@@ -724,14 +742,47 @@ impl eframe::App for App {
                                 &mut self.hydra_paint_cache_dir,
                                 &mut self.hydra_paint_sync_seq,
                                 &mut self.hydra_paint_sync_status,
+                                &mut self.hydra_paint_sync_pending,
+                                &mut self.hydra_show_render,
+                                &mut self.hydra_show_proxy,
+                                &mut self.hydra_show_guides,
                                 self.current_usd_path.as_deref(),
                                 &mut swap_renderer,
                             );
                         }
                     }
-                    if swap_renderer {
-                        self.renderer_mode = self.renderer_mode.toggled();
+                    // Renderer / delegate picker — single combo
+                    // overlay covering both modes. Placed top-right
+                    // of the canvas, mirrored from the badges'
+                    // previous home. Drives renderer_mode and
+                    // hydra_delegate directly. Also stamps the Storm
+                    // warning banner when Storm is the active Hydra
+                    // delegate.
+                    let prev_mode = self.renderer_mode;
+                    let prev_delegate = self.hydra_delegate.clone();
+                    let viewport_rect = ui.max_rect();
+                    Self::draw_renderer_picker(
+                        ui,
+                        viewport_rect,
+                        &mut self.renderer_mode,
+                        &mut self.hydra_delegate,
+                    );
+                    let _ = swap_renderer;
+                    if prev_mode == RendererMode::Wgpu
+                        && self.renderer_mode == RendererMode::Hydra
+                    {
+                        // Just entered Hydra → schedule the one-
+                        // shot paint sync so any strokes painted in
+                        // wgpu mode show up here without an extra
+                        // click. Hydra → Wgpu needs nothing — the
+                        // wgpu painter has been seeing the live
+                        // paint targets the whole time.
+                        self.hydra_paint_sync_pending = true;
                     }
+                    // If the user picked a different Hydra delegate
+                    // while already in Hydra mode, no sync needed —
+                    // the delegate switch alone is fine.
+                    let _ = prev_delegate;
                 } else {
                     ui.centered_and_justified(|ui| ui.label("Initializing GPU…"));
                 }
@@ -2410,33 +2461,152 @@ fn material_factors_section(ui: &mut egui::Ui, vp: &mut Viewport) {
 }
 
 fn light_section(ui: &mut egui::Ui, vp: &mut Viewport) {
-    ui.label("Key light");
-    ui.add(egui::Slider::new(&mut vp.light_intensity, 0.0..=10.0).text("intensity"));
+    use crate::lights::{Light, LightKind, MAX_LIGHTS};
+
+    // Header — add buttons + count.
     ui.horizontal(|ui| {
-        ui.label("dir");
-        ui.add(egui::DragValue::new(&mut vp.light_dir[0]).speed(0.02).prefix("x:"));
-        ui.add(egui::DragValue::new(&mut vp.light_dir[1]).speed(0.02).prefix("y:"));
-        ui.add(egui::DragValue::new(&mut vp.light_dir[2]).speed(0.02).prefix("z:"));
+        ui.label(format!("Lights ({}/{})", vp.lights.len(), MAX_LIGHTS));
+        let at_cap = vp.lights.len() >= MAX_LIGHTS;
+        ui.add_enabled_ui(!at_cap, |ui| {
+            if ui
+                .button("+ Directional")
+                .on_hover_text("Add a directional light")
+                .clicked()
+            {
+                vp.lights.push(Light::new_directional());
+            }
+            if ui
+                .button("+ Spot")
+                .on_hover_text("Add a spot light")
+                .clicked()
+            {
+                vp.lights.push(Light::new_spot());
+            }
+        });
     });
-    ui.add_space(6.0);
-    ui.checkbox(&mut vp.studio_rig_enabled, "Studio rig (key + fill + rim)");
-    ui.add_enabled_ui(vp.studio_rig_enabled, |ui| {
-        ui.add(
-            egui::Slider::new(&mut vp.studio_fill_ratio, 0.0..=1.0)
-                .text("fill (× key)")
-                .show_value(true),
+    if vp.lights.is_empty() {
+        ui.weak("No analytic lights. HDRI (Environment) drives all lighting.");
+        return;
+    }
+
+    let mut remove_idx: Option<usize> = None;
+    for (i, light) in vp.lights.iter_mut().enumerate() {
+        let header = format!(
+            "#{i} {}{}",
+            light.kind.label(),
+            if light.enabled { "" } else { " — disabled" },
         );
-        ui.add(
-            egui::Slider::new(&mut vp.studio_rim_ratio, 0.0..=1.5)
-                .text("rim (× key)")
-                .show_value(true),
-        );
-        ui.add(
-            egui::Slider::new(&mut vp.studio_ibl_scale, 0.0..=1.0)
-                .text("IBL scale")
-                .show_value(true),
-        );
-    });
+        egui::CollapsingHeader::new(header)
+            .id_salt(("light_block", i))
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut light.enabled, "enabled");
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("Remove light")
+                        .clicked()
+                    {
+                        remove_idx = Some(i);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("color");
+                    let mut color = light.color;
+                    if ui.color_edit_button_rgb(&mut color).changed() {
+                        light.color = color;
+                    }
+                });
+                ui.add(
+                    egui::Slider::new(&mut light.intensity, 0.0..=10.0)
+                        .text("intensity")
+                        .show_value(true),
+                );
+                match light.kind {
+                    LightKind::Directional => {
+                        ui.horizontal(|ui| {
+                            ui.label("dir");
+                            ui.add(
+                                egui::DragValue::new(&mut light.direction[0])
+                                    .speed(0.02)
+                                    .prefix("x:"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut light.direction[1])
+                                    .speed(0.02)
+                                    .prefix("y:"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut light.direction[2])
+                                    .speed(0.02)
+                                    .prefix("z:"),
+                            );
+                        });
+                    }
+                    LightKind::Spot => {
+                        ui.horizontal(|ui| {
+                            ui.label("pos");
+                            ui.add(
+                                egui::DragValue::new(&mut light.position[0])
+                                    .speed(0.05)
+                                    .prefix("x:"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut light.position[1])
+                                    .speed(0.05)
+                                    .prefix("y:"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut light.position[2])
+                                    .speed(0.05)
+                                    .prefix("z:"),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("dir");
+                            ui.add(
+                                egui::DragValue::new(&mut light.direction[0])
+                                    .speed(0.02)
+                                    .prefix("x:"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut light.direction[1])
+                                    .speed(0.02)
+                                    .prefix("y:"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut light.direction[2])
+                                    .speed(0.02)
+                                    .prefix("z:"),
+                            );
+                        });
+                        // Inner ≤ outer is the invariant the shader's
+                        // smoothstep assumes. Clamp inner against
+                        // whatever outer is and vice versa after the
+                        // user edits either slider.
+                        ui.add(
+                            egui::Slider::new(&mut light.inner_cone_deg, 0.0..=170.0)
+                                .text("inner cone (deg)")
+                                .show_value(true),
+                        );
+                        if light.inner_cone_deg > light.outer_cone_deg {
+                            light.outer_cone_deg = light.inner_cone_deg;
+                        }
+                        ui.add(
+                            egui::Slider::new(&mut light.outer_cone_deg, 0.0..=179.0)
+                                .text("outer cone (deg)")
+                                .show_value(true),
+                        );
+                        if light.outer_cone_deg < light.inner_cone_deg {
+                            light.inner_cone_deg = light.outer_cone_deg;
+                        }
+                    }
+                }
+            });
+    }
+    if let Some(i) = remove_idx {
+        vp.lights.remove(i);
+    }
 }
 
 fn human_bytes(n: u64) -> String {
@@ -2677,6 +2847,10 @@ impl App {
         hydra_paint_cache_dir: &mut Option<std::path::PathBuf>,
         hydra_paint_sync_seq: &mut u64,
         hydra_paint_sync_status: &mut Option<String>,
+        hydra_paint_sync_pending: &mut bool,
+        show_render: &mut bool,
+        show_proxy: &mut bool,
+        show_guides: &mut bool,
         stage_path: Option<&std::path::Path>,
         request_swap_renderer: &mut bool,
     ) {
@@ -2686,10 +2860,8 @@ impl App {
         let h = (rect.height() as u32).max(64);
         let aspect = rect.width() / rect.height();
 
-        // Continuous repaint keeps path-tracer convergence going + lets
-        // orbit feel real-time. Cheap when nothing changes (Storm and
-        // hdNSI both short-circuit unchanged frames at the delegate
-        // level).
+        // Continuous repaint while the panel is up — keeps path-
+        // tracer convergence going and orbit feeling real-time.
         ui.ctx().request_repaint();
 
         // Background fill so the not-yet-rendered area reads as part
@@ -2710,6 +2882,11 @@ impl App {
         };
         vp.camera.handle_input(&response, scroll_dy);
 
+        // Paint-in-Hydra is intentionally dropped — Hydra mode is
+        // visualization-only. Brush input lives in wgpu mode; the
+        // mode-entry sync below re-authors the painted material so
+        // any new strokes show up here without extra ceremony.
+
         // Stop here if there's no stage to open — show a placeholder
         // overlay so the canvas isn't just black with no explanation.
         let Some(path) = stage_path else {
@@ -2720,12 +2897,7 @@ impl App {
                 egui::FontId::proportional(14.0),
                 egui::Color32::from_gray(200),
             );
-            Self::draw_renderer_badge_hydra(
-                ui,
-                rect,
-                "Hydra",
-                request_swap_renderer,
-            );
+            let _ = request_swap_renderer;
             let _ = frame;
             return;
         };
@@ -2768,12 +2940,7 @@ impl App {
                         egui::FontId::proportional(13.0),
                         egui::Color32::from_rgb(255, 140, 120),
                     );
-                    Self::draw_renderer_badge_hydra(
-                        ui,
-                        rect,
-                        "Hydra",
-                        request_swap_renderer,
-                    );
+                    let _ = request_swap_renderer;
                     let _ = frame;
                     return;
                 }
@@ -2790,13 +2957,6 @@ impl App {
             vp.camera.z_near,
             vp.camera.z_far,
         );
-        let rig = crate::hydra_view::StudioRig {
-            key_dir: vp.light_dir,
-            key_intensity: vp.light_intensity,
-            fill_ratio: vp.studio_fill_ratio,
-            rim_ratio: vp.studio_rim_ratio,
-            enabled: vp.studio_rig_enabled,
-        };
         let env = vp.env.source_path.as_ref().map(|p| {
             crate::hydra_view::DomeEnv {
                 path: p.clone(),
@@ -2821,9 +2981,33 @@ impl App {
         }
 
         hydra.resize(w, h);
-        hydra.set_rig(rig);
+        // No studio rig push — the 3-point GlfSimpleLight rig doesn't
+        // respond to UsdLuxDomeLight's exposure attr, so dome +
+        // analytic rig were giving physically inconsistent results.
+        // HDRI dome alone is the lighting model in Hydra. Load an
+        // HDRI from the Lighting panel for a lit scene.
+        hydra.set_purposes(*show_render, *show_proxy, *show_guides);
         if let Err(e) = hydra.set_environment(env.as_ref()) {
             log::warn!("Hydra: set_environment failed: {e:#}");
+        }
+
+        // One-shot sync on Hydra mode entry. Triggered by the
+        // `update()` dispatch when the badge click flips wgpu → Hydra.
+        // Clearing the flag unconditionally (even on sync failure)
+        // keeps us out of an infinite "try again next frame" loop;
+        // the failure status is surfaced via `hydra_paint_sync_status`
+        // for the overlay.
+        if *hydra_paint_sync_pending {
+            *hydra_paint_sync_pending = false;
+            let status = Self::sync_painted_material(
+                frame,
+                vp,
+                hydra,
+                hydra_paint_cache_dir,
+                hydra_paint_sync_seq,
+            );
+            log::info!("Hydra paint mode-entry sync: {status}");
+            *hydra_paint_sync_status = Some(status);
         }
 
         match hydra.render(&view_row, &proj_row) {
@@ -2859,48 +3043,15 @@ impl App {
             }
         }
 
-        // Renderer badge top-left — same shape as the wgpu badge,
-        // green palette + ▶ Hydra <delegate> text. Click swaps back.
-        let badge_text_owned = format!(
-            "▶ Hydra {}",
-            crate::hydra_view::delegate_label(&desired_delegate),
-        );
-        Self::draw_renderer_badge_hydra(
-            ui,
-            rect,
-            &badge_text_owned,
-            request_swap_renderer,
-        );
 
-        // Delegate combo overlay top-right — Hydra-mode-only, mirror
-        // image of the badge. Shows every registered delegate; pick
-        // one and the next frame's `set_delegate` does the switch.
+        // Renderer / delegate picker now lives in a single overlay
+        // drawn by `App::draw_renderer_picker` (after this function
+        // returns), shared between wgpu + Hydra modes. The picker's
+        // selection drives `renderer_mode` and `hydra_delegate`
+        // directly, so this function no longer needs the swap-request
+        // bool that the old clickable badge consumed.
+        let _ = request_swap_renderer;
         let combo_size = egui::vec2(150.0, 28.0);
-        let combo_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - combo_size.x - 12.0, rect.top() + 12.0),
-            combo_size,
-        );
-        let delegates = crate::hydra_view::HydraView::list_delegates();
-        let mut chosen = desired_delegate.clone();
-        let mut combo_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(combo_rect)
-                .layout(egui::Layout::right_to_left(egui::Align::Center)),
-        );
-        egui::ComboBox::from_id_salt("hydra_delegate_canvas")
-            .selected_text(crate::hydra_view::delegate_label(&chosen))
-            .show_ui(&mut combo_ui, |ui| {
-                for id in &delegates {
-                    ui.selectable_value(
-                        &mut chosen,
-                        id.clone(),
-                        crate::hydra_view::delegate_label(id),
-                    );
-                }
-            });
-        if chosen != desired_delegate {
-            *hydra_delegate = Some(chosen);
-        }
 
         // "Sync paint" button — sits directly under the delegate
         // combo, same right-aligned x. Click reads the current paint
@@ -2921,10 +3072,9 @@ impl App {
             egui::Sense::click(),
         );
         if sync_resp.clicked() {
-            // Borrow the renderer one more time to author the
-            // material — keeps `vp` borrow alive only for the
-            // export readback inside the helper.
-            let hydra = hydra_slot.as_mut().expect("hydra exists post-init");
+            // Reuse the live `hydra` borrow from above — re-grabbing
+            // through `hydra_slot.as_mut()` here would shadow that
+            // earlier borrow and trip the borrow checker.
             let status = Self::sync_painted_material(
                 frame,
                 vp,
@@ -2961,7 +3111,7 @@ impl App {
         }
 
         // Status line under the sync button — last sync's outcome.
-        if let Some(status) = hydra_paint_sync_status.as_deref() {
+        let status_y = if let Some(status) = hydra_paint_sync_status.as_deref() {
             let status_rect = egui::Rect::from_min_size(
                 egui::pos2(
                     rect.right() - combo_size.x - 12.0,
@@ -2976,7 +3126,63 @@ impl App {
                 egui::FontId::proportional(11.0),
                 egui::Color32::from_gray(180),
             );
-        }
+            status_rect.bottom()
+        } else {
+            sync_btn_rect.bottom()
+        };
+
+        // Purpose toggles — render / proxy / guides. Three chip-style
+        // buttons below the sync UI; filled when on, outlined when
+        // off. Matches usdview / Solaris's purpose checkbox triplet.
+        // Default-purpose prims always draw and aren't user-toggleable.
+        let chip_w = (combo_size.x - 8.0) / 3.0; // 3 across, 4px gaps
+        let chip_h = 22.0;
+        let chips_y = status_y + 6.0;
+        let chip_x0 = rect.right() - combo_size.x - 12.0;
+        let mut draw_chip = |idx: usize, label: &str, on: &mut bool| {
+            let chip_rect = egui::Rect::from_min_size(
+                egui::pos2(chip_x0 + (chip_w + 4.0) * idx as f32, chips_y),
+                egui::vec2(chip_w, chip_h),
+            );
+            let resp = ui.interact(
+                chip_rect,
+                ui.id().with(("hydra_purpose_chip", idx)),
+                egui::Sense::click(),
+            );
+            if resp.clicked() {
+                *on = !*on;
+            }
+            let active = *on;
+            let stroke = egui::Color32::from_rgb(200, 200, 230);
+            let fill = if active {
+                egui::Color32::from_rgba_unmultiplied(70, 90, 130, 240)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200)
+            };
+            let stroke_w = if resp.hovered() { 1.8 } else { 1.0 };
+            ui.painter().rect_filled(chip_rect, 4.0, fill);
+            ui.painter().rect_stroke(
+                chip_rect,
+                4.0,
+                egui::Stroke::new(stroke_w, stroke),
+                egui::StrokeKind::Outside,
+            );
+            ui.painter().text(
+                chip_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(11.0),
+                stroke,
+            );
+            if resp.hovered() {
+                resp.on_hover_text(format!(
+                    "Toggle the `{label}` `UsdGeomImageable::purpose` filter"
+                ));
+            }
+        };
+        draw_chip(0, "render", show_render);
+        draw_chip(1, "proxy", show_proxy);
+        draw_chip(2, "guides", show_guides);
 
         let _ = frame;
     }
@@ -3075,6 +3281,117 @@ impl App {
         }
 
         format!("synced v{seq} ({} tiles)", exports.len() / 4)
+    }
+
+    /// One combo box that picks the renderer driving the central
+    /// viewport: `wgpu` (paint mode), or any Hydra delegate the plug
+    /// registry found (Storm, 3Delight, …). Drives `renderer_mode`
+    /// and `hydra_delegate` together so the rest of the App just
+    /// reads those two fields.
+    ///
+    /// Also stamps the Storm-mode warning banner when the active
+    /// delegate is `HdStormRendererPlugin` — Storm renders the
+    /// stage but doesn't paint, so the banner is a nudge to switch
+    /// to wgpu when you're trying to author rather than preview.
+    fn draw_renderer_picker(
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        renderer_mode: &mut RendererMode,
+        hydra_delegate: &mut Option<String>,
+    ) {
+        const WGPU_ID: &str = "__wgpu";
+        let delegates = crate::hydra_view::HydraView::list_delegates();
+
+        // Current selection in the combo:
+        //  - Wgpu mode      → WGPU_ID
+        //  - Hydra mode     → whichever delegate is active (falls back
+        //                     to the first registered one if nothing's
+        //                     been picked yet)
+        let current_id = match *renderer_mode {
+            RendererMode::Wgpu => WGPU_ID.to_string(),
+            RendererMode::Hydra => hydra_delegate
+                .clone()
+                .or_else(|| delegates.first().cloned())
+                .unwrap_or_default(),
+        };
+        let current_label = if current_id == WGPU_ID {
+            "wgpu painter"
+        } else {
+            crate::hydra_view::delegate_label(&current_id)
+        };
+
+        // Combo overlay rect — top-right corner of the viewport,
+        // mirrors where the old Hydra-only combo used to sit.
+        let combo_size = egui::vec2(170.0, 28.0);
+        let combo_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - combo_size.x - 12.0, rect.top() + 12.0),
+            combo_size,
+        );
+        let mut combo_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(combo_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+
+        let mut chosen_id = current_id.clone();
+        egui::ComboBox::from_id_salt("renderer_picker")
+            .selected_text(format!("▶ {current_label}"))
+            .show_ui(&mut combo_ui, |ui| {
+                ui.selectable_value(
+                    &mut chosen_id,
+                    WGPU_ID.to_string(),
+                    "wgpu painter",
+                );
+                for id in &delegates {
+                    ui.selectable_value(
+                        &mut chosen_id,
+                        id.clone(),
+                        crate::hydra_view::delegate_label(id),
+                    );
+                }
+            });
+
+        if chosen_id != current_id {
+            if chosen_id == WGPU_ID {
+                *renderer_mode = RendererMode::Wgpu;
+            } else {
+                *renderer_mode = RendererMode::Hydra;
+                *hydra_delegate = Some(chosen_id.clone());
+            }
+        }
+
+        // Storm warning banner. Storm-only — when 3Delight is the
+        // active delegate the banner stays hidden. Centered at the
+        // top of the canvas, just below the combo's y. Reads as a
+        // nudge ("Storm is preview, paint in wgpu") rather than an
+        // error.
+        let storm_active = *renderer_mode == RendererMode::Hydra
+            && chosen_id == "HdStormRendererPlugin";
+        if storm_active {
+            let banner_size = egui::vec2(260.0, 22.0);
+            let banner_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.top() + 12.0 + banner_size.y / 2.0),
+                banner_size,
+            );
+            ui.painter().rect_filled(
+                banner_rect,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(60, 30, 0, 220),
+            );
+            ui.painter().rect_stroke(
+                banner_rect,
+                4.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 180, 80)),
+                egui::StrokeKind::Outside,
+            );
+            ui.painter().text(
+                banner_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Storm preview — switch to wgpu to paint",
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgb(255, 220, 160),
+            );
+        }
     }
 
     /// Draw the green "▶ Hydra ..." badge in `rect`'s top-left as a

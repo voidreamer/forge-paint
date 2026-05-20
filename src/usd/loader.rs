@@ -23,6 +23,36 @@ pub fn load_stage(path: &Path) -> Result<Vec<LoadedMesh>> {
     let stage = rust_usd::Stage::open(path)
         .map_err(|e| anyhow!("Stage::open({}) failed: {}", path.display(), e.what()))?;
 
+    // Pick a default variant for every `VariantSet` that doesn't have
+    // an authored selection. Nvidia Omniverse SimReady assets (and
+    // anything else authored by tools that lean on global variant
+    // fallbacks) leave variantSets unset; the meshes live behind
+    // those variants, so the stage looks empty without this pass.
+    // usdview / Houdini Solaris use `PcpVariantFallbackMap`'s global
+    // fallbacks to the same effect — we use per-prim first-variant
+    // because rust_usd already exposes that and it doesn't require
+    // pre-Stage-Open plumbing.
+    //
+    // Run until stable: each variant selection can pull in new
+    // references whose prims have their own variantSets, so we keep
+    // walking until a pass selects nothing new (capped to keep
+    // pathological cycles from spinning).
+    let mut total_selected = 0;
+    for _ in 0..8 {
+        let n = auto_select_first_variants(&stage.pseudo_root());
+        total_selected += n;
+        if n == 0 {
+            break;
+        }
+    }
+    if total_selected > 0 {
+        log::info!(
+            "load_stage({}): auto-selected {} variant(s) on previously-unset variantSets",
+            path.display(),
+            total_selected
+        );
+    }
+
     let pxr_meshes = stage.meshes();
     if pxr_meshes.is_empty() {
         bail!("stage at {} contains no UsdGeomMesh prims", path.display());
@@ -38,6 +68,36 @@ pub fn load_stage(path: &Path) -> Result<Vec<LoadedMesh>> {
         });
     }
     Ok(loaded)
+}
+
+/// Walk the stage from `prim` down, set the first variant of any
+/// `VariantSet` whose selection hasn't been authored yet. Returns the
+/// number of selections written so the caller can loop until stable.
+fn auto_select_first_variants(prim: &rust_usd::Prim) -> usize {
+    let mut selected = 0;
+    for vs_name in prim.variant_set_names() {
+        if let Some(vs) = prim.variant_set(&vs_name) {
+            if !vs.has_authored_selection() {
+                let variants = vs.variants();
+                if let Some(first) = variants.first() {
+                    if vs.set_selection(first) {
+                        selected += 1;
+                        log::debug!(
+                            "auto-selected variant `{first}` on variantSet `{vs_name}` of `{}`",
+                            prim.path()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Re-fetch children AFTER our selections — picking a variant can
+    // pull in new references whose child prims weren't visible to
+    // the first traversal.
+    for child in prim.children() {
+        selected += auto_select_first_variants(&child);
+    }
+    selected
 }
 
 /// Convenience: load a stage and merge all mesh prims into one CpuMesh.

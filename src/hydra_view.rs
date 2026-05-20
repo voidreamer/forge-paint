@@ -32,7 +32,7 @@ use std::path::Path;
 /// TO the light — `set_rig` negates internally to fit Hydra's
 /// `GlfSimpleLight` (position with w=0 is the direction from origin
 /// to the light source).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StudioRig {
     pub key_dir: [f32; 3],
     pub key_intensity: f32,
@@ -52,7 +52,7 @@ pub struct StudioRig {
 /// through). UsdLux combines intensity and exposure multiplicatively
 /// (`final = intensity * 2^exposure`), so handing the slider's stops
 /// straight to the dome's `inputs:exposure` attr lines up.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DomeEnv {
     pub path: std::path::PathBuf,
     pub intensity: f32,
@@ -72,6 +72,29 @@ pub struct HydraView {
     /// whole `HydraView` and lazy-init a new one. Exposed so the
     /// caller can detect the mismatch without bookkeeping of its own.
     pub stage_path: std::path::PathBuf,
+
+    // Dirty-tracking shadows. The bridge's `set_*` methods write into
+    // the USD session layer (for dome / painted material) or push
+    // into the legacy lighting context (for the rig); every push
+    // triggers a scene-index notification, which the delegate burns
+    // CPU on its next Sync. Idempotent in value but never free.
+    // Comparing here against the last-applied snapshot keeps the
+    // per-frame setters as no-ops when nothing actually changed,
+    // which makes zoom / orbit feel smooth on the path-tracer path.
+    last_rig: Option<StudioRig>,
+    last_dome: Option<DomeEnv>,
+    last_purposes: Option<(bool, bool, bool)>,
+
+    /// Wall-clock timestamp of the most-recent successful
+    /// `render(...)` call. The caller throttles re-render frequency
+    /// against this so a path-tracer delegate doesn't peg the UI
+    /// thread doing one sample pass per egui frame.
+    pub last_render: Option<std::time::Instant>,
+    /// Latest RGBA8 buffer returned by `render(...)`. Cached so the
+    /// caller can re-display it on frames that don't trigger a new
+    /// render (during the throttle window, while is_converged stays
+    /// true, etc.). Tuple is `(pixels, width, height)`.
+    pub last_pixels: Option<(Vec<u8>, u32, u32)>,
 }
 
 impl HydraView {
@@ -117,6 +140,11 @@ impl HydraView {
             width: 1280,
             height: 720,
             stage_path: path.to_path_buf(),
+            last_rig: None,
+            last_dome: None,
+            last_purposes: None,
+            last_render: None,
+            last_pixels: None,
         })
     }
 
@@ -179,6 +207,24 @@ impl HydraView {
         self.renderer.clear_painted_material();
     }
 
+    /// Apply `UsdGeomImageable::purpose` filters in one call. Cheap
+    /// enough to send every frame from the consumer; the bridge just
+    /// stores three bools and reads them inside `render_color`.
+    pub fn set_purposes(&mut self, render: bool, proxy: bool, guides: bool) {
+        // Dirty-check: cheaper than the dome auth (just three bool
+        // writes inside the bridge struct), but it still triggers a
+        // resync on the delegate side because purpose filters are
+        // part of render params. No reason to do it every frame.
+        let new = (render, proxy, guides);
+        if self.last_purposes == Some(new) {
+            return;
+        }
+        self.last_purposes = Some(new);
+        self.renderer.set_show_render(render);
+        self.renderer.set_show_proxy(proxy);
+        self.renderer.set_show_guides(guides);
+    }
+
     /// Author a `UsdLuxDomeLight` into the stage's session layer (or
     /// remove it, if `env` is `None`). Storm renders the dome as both
     /// the visible skybox and an IBL source, so calling this routes
@@ -189,6 +235,14 @@ impl HydraView {
     /// session-layer prim path and just rewrites the attributes,
     /// rather than tearing it down and rebuilding.
     pub fn set_environment(&mut self, env: Option<&DomeEnv>) -> Result<()> {
+        // Dirty-check: dome auth writes into the session layer, which
+        // triggers a scene-index notification → delegate Sync → path
+        // tracer restart. Doing that every frame even when intensity
+        // / rotation / path haven't changed is what made zoom feel
+        // laggy. Compare against last-applied snapshot first.
+        if self.last_dome.as_ref() == env {
+            return Ok(());
+        }
         match env {
             Some(e) => {
                 let degrees = e.rotation_y_radians.to_degrees();
@@ -206,6 +260,7 @@ impl HydraView {
                 self.renderer.clear_dome_light();
             }
         }
+        self.last_dome = env.cloned();
         Ok(())
     }
 
@@ -231,6 +286,18 @@ impl HydraView {
     /// and the studio color tints + intensity ratios — see
     /// `viewport::Viewport::show` for the canonical values.
     pub fn set_rig(&mut self, rig: StudioRig) {
+        // Dirty-check: rig values get snapshotted from `Viewport`
+        // every frame even when the user hasn't touched a slider, so
+        // skip the push when the rig is identical to last frame.
+        // Each `clear_lights` + `add_distant_light` triplet pushes
+        // into the legacy `GlfSimpleLighting` context — non-zero work
+        // + triggers a Sync, which on a path tracer means a fresh
+        // sample cycle.
+        if self.last_rig.as_ref() == Some(&rig) {
+            return;
+        }
+        self.last_rig = Some(rig);
+
         // clear_lights() drops the explicit list AND turns off the
         // default-headlight gating bool. That's fine — Storm's
         // render path computes `enableLighting = !lights.empty() ||
@@ -280,6 +347,16 @@ impl HydraView {
     pub fn render(&mut self, view: &[f32; 16], proj: &[f32; 16]) -> Result<Vec<u8>> {
         self.renderer.set_camera_matrices(view, proj);
         Ok(self.renderer.render()?)
+    }
+
+    /// Whether the active delegate considers the current frame fully
+    /// resolved. Storm flips to true after the first pass; sampling
+    /// delegates (hdNSI etc.) flip true once their sample budget is
+    /// hit. The viewport loop uses this to decide whether to request
+    /// another repaint after the throttle window expires — once
+    /// converged, no point burning CPU.
+    pub fn is_converged(&self) -> bool {
+        self.renderer.is_converged()
     }
 }
 

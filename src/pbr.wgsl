@@ -2,22 +2,35 @@
 // rough_metal (glTF packing: R=AO, G=roughness, B=metallic), and normal.
 // `uv_to_layer` maps a mesh UV into the array layer for that UDIM tile.
 
+struct Light {
+    // x,y,z = travel direction, w = type (0 directional, 1 spot)
+    direction_type: vec4<f32>,
+    // x,y,z = world position (spot only), w = enabled (1 / 0)
+    position_enabled: vec4<f32>,
+    // x,y,z = linear color, w = intensity multiplier
+    color_intensity: vec4<f32>,
+    // x = cos(inner cone half-angle), y = cos(outer), z/w pad (spot only)
+    cone: vec4<f32>,
+}
+
 struct Frame {
     view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,
-    light_dir: vec4<f32>,
-    light_color: vec4<f32>,
-    fill_dir: vec4<f32>,
-    fill_color: vec4<f32>,
-    rim_dir: vec4<f32>,
-    rim_color: vec4<f32>,
     ambient_sky: vec4<f32>,
     ambient_ground: vec4<f32>,
     view_mode: u32,        // 0 Material, 1 BaseColor, 2 Rough, 3 Metal, 4 Normal, 5 Mask
     tonemap_mode: u32,     // 0 None, 1 Reinhard, 2 ACES, 3 Filmic, 4 Neutral, 5 AgX
     exposure: f32,         // pre-tonemap linear multiplier (= 2^stops)
-    ibl_scale: f32,        // multiplier on IBL contribution (rig dampens to ~0.4)
+    ibl_scale: f32,        // multiplier on IBL contribution
     inv_view_proj: mat4x4<f32>,
+    // light_count is followed by 12 bytes of std140 auto-padding so
+    // the `lights` array (16-aligned) lands at the next 16-byte
+    // boundary. The CPU-side `FrameUniforms` carries an explicit
+    // `_pad_lights: [u32; 3]` to mirror that pad. Don't declare the
+    // pad in WGSL — vec3<u32> would occupy a full 16-byte slot AND
+    // bring its own alignment padding, double-padding the layout.
+    light_count: u32,
+    lights: array<Light, 8>,
 }
 
 struct Material {
@@ -347,52 +360,67 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     roughness = clamp(roughness, 0.04, 1.0);
     let f0 = mix(vec3<f32>(0.04), base_color, metallic);
 
-    // Per-light Cook-Torrance evaluation. Three lights (key + fill + rim)
-    // form a studio rig — fill/rim light_color.w can be zero to disable,
-    // which costs the cos(NdotL) clamp + a few mults but skips the BRDF
-    // entirely once all factors collapse.
+    // Dynamic analytic-light loop. Replaces the hard-coded
+    // key/fill/rim rig — Viewport::lights drives this, default zero
+    // entries means HDRI is the only contributor (see IBL block
+    // below). Type-tag in `light.direction_type.w` switches between
+    // directional (constant L) and spot (L from light position + a
+    // cosine-falloff cone factor).
     var direct = vec3<f32>(0.0);
-    let key_l = normalize(-frame.light_dir.xyz);
-    let key_h = normalize(v + key_l);
-    let key_ndl = max(dot(n, key_l), 0.0);
-    if frame.light_color.w * key_ndl > 0.0 {
-        let ndh = max(dot(n, key_h), 0.0);
-        let vdh = max(dot(v, key_h), 0.0);
-        let d_ = d_ggx(ndh, roughness);
-        let g_ = v_smith_ggx(n_dot_v, key_ndl, roughness);
-        let f_ = f_schlick(vdh, f0);
-        let spec = (d_ * g_) * f_;
-        let kd = (vec3<f32>(1.0) - f_) * (1.0 - metallic);
-        let diff = kd * base_color / PI;
-        direct = direct + (diff + spec) * frame.light_color.rgb * frame.light_color.w * key_ndl;
-    }
-    let fill_l = normalize(-frame.fill_dir.xyz);
-    let fill_ndl = max(dot(n, fill_l), 0.0);
-    if frame.fill_color.w * fill_ndl > 0.0 {
-        let h_ = normalize(v + fill_l);
+    for (var i: u32 = 0u; i < frame.light_count; i = i + 1u) {
+        let light = frame.lights[i];
+        if light.position_enabled.w < 0.5 {
+            continue;
+        }
+        let is_spot = light.direction_type.w > 0.5;
+
+        var L: vec3<f32>;
+        var spot_attenuation: f32 = 1.0;
+        if is_spot {
+            let to_light = light.position_enabled.xyz - in.world_pos;
+            let dist = length(to_light);
+            // Guard against the degenerate case where the fragment
+            // sits at the light's origin; bail with zero contribution.
+            if dist < 1e-4 {
+                continue;
+            }
+            L = to_light / dist;
+            // Compare the angle from the light's forward axis to the
+            // sample direction `-L`. Inside the inner cone the factor
+            // is 1; outside the outer cone it's 0; smoothstep between.
+            let cone_axis = normalize(light.direction_type.xyz);
+            let cos_angle = dot(cone_axis, -L);
+            spot_attenuation = smoothstep(
+                light.cone.y,
+                light.cone.x,
+                cos_angle,
+            );
+            if spot_attenuation <= 0.0 {
+                continue;
+            }
+        } else {
+            // Directional: L points from the surface toward the
+            // light, opposite of the light's travel direction.
+            L = normalize(-light.direction_type.xyz);
+        }
+
+        let n_dot_l = max(dot(n, L), 0.0);
+        if n_dot_l <= 0.0 {
+            continue;
+        }
+
+        let h_ = normalize(v + L);
         let ndh = max(dot(n, h_), 0.0);
         let vdh = max(dot(v, h_), 0.0);
         let d_ = d_ggx(ndh, roughness);
-        let g_ = v_smith_ggx(n_dot_v, fill_ndl, roughness);
+        let g_ = v_smith_ggx(n_dot_v, n_dot_l, roughness);
         let f_ = f_schlick(vdh, f0);
         let spec = (d_ * g_) * f_;
         let kd = (vec3<f32>(1.0) - f_) * (1.0 - metallic);
         let diff = kd * base_color / PI;
-        direct = direct + (diff + spec) * frame.fill_color.rgb * frame.fill_color.w * fill_ndl;
-    }
-    let rim_l = normalize(-frame.rim_dir.xyz);
-    let rim_ndl = max(dot(n, rim_l), 0.0);
-    if frame.rim_color.w * rim_ndl > 0.0 {
-        let h_ = normalize(v + rim_l);
-        let ndh = max(dot(n, h_), 0.0);
-        let vdh = max(dot(v, h_), 0.0);
-        let d_ = d_ggx(ndh, roughness);
-        let g_ = v_smith_ggx(n_dot_v, rim_ndl, roughness);
-        let f_ = f_schlick(vdh, f0);
-        let spec = (d_ * g_) * f_;
-        let kd = (vec3<f32>(1.0) - f_) * (1.0 - metallic);
-        let diff = kd * base_color / PI;
-        direct = direct + (diff + spec) * frame.rim_color.rgb * frame.rim_color.w * rim_ndl;
+
+        let weight = light.color_intensity.w * spot_attenuation * n_dot_l;
+        direct = direct + (diff + spec) * light.color_intensity.rgb * weight;
     }
 
     // Karis split-sum IBL with the closed-form LUT approximation (task #45

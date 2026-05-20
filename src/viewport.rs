@@ -93,7 +93,7 @@ pub struct Viewport {
     egui_tex_id: Option<egui::TextureId>,
 
     mesh: GpuMesh,
-    cpu_mesh: CpuMesh,
+    pub cpu_mesh: CpuMesh,
     accel: MeshAccel,
     /// Composited display textures — this is what the PBR shader samples.
     pub paint_target: PaintTarget,
@@ -174,9 +174,11 @@ pub struct Viewport {
     /// resolution to look smooth.
     pub subdivision_level: u32,
 
-    // Lighting
-    pub light_intensity: f32,
-    pub light_dir: [f32; 3],
+    // Lighting — dynamic analytic-light list. Default empty: HDRI is
+    // the only contributor until the user adds a Directional / Spot
+    // via the Lighting panel's `+` buttons. Replaces the old
+    // light_dir / light_intensity / studio_* rig.
+    pub lights: Vec<crate::lights::Light>,
 
     pub view_mode: ViewMode,
 
@@ -193,15 +195,6 @@ pub struct Viewport {
     /// Unsharp-mask amount applied to the HDR input before tonemap (so
     /// sharpening tracks intensity). 0 = off; 0.1..0.3 reads as "crisp".
     pub grading_clarity: f32,
-
-    /// Three-point studio rig toggle. When on, the fragment shader
-    /// evaluates BRDF for fill + rim lights (in addition to key) and the
-    /// IBL is dampened by `studio_ibl_scale`. Mirrors how Marmoset and
-    /// Substance Painter ship with default product-shot lighting.
-    pub studio_rig_enabled: bool,
-    pub studio_fill_ratio: f32,
-    pub studio_rim_ratio: f32,
-    pub studio_ibl_scale: f32,
 
     pub tile_resolution: u32,
 
@@ -388,8 +381,7 @@ impl Viewport {
             baked_normal_blend: 0.0,
             ao_intensity: 1.0,
             subdivision_level: 0,
-            light_intensity: 3.0,
-            light_dir: [-0.4, -1.0, -0.3],
+            lights: Vec::new(),
             view_mode: ViewMode::Material,
             // ArmorPaint defaults to Filmic (Hable UC2) — reads as less crushed
             // than ACES and matches the reference painter's look.
@@ -398,10 +390,6 @@ impl Viewport {
             grading_contrast: 1.10,
             grading_saturation: 1.10,
             grading_clarity: 0.15,
-            studio_rig_enabled: true,
-            studio_fill_ratio: 0.50,
-            studio_rim_ratio: 0.75,
-            studio_ibl_scale: 0.45,
             tile_resolution,
             last_hit_uv: None,
             last_hit_tile: None,
@@ -855,7 +843,6 @@ impl Viewport {
         stencil_view: Option<&wgpu::TextureView>,
         stencil_aspect: f32,
         stencil_egui_tex: Option<egui::TextureId>,
-        request_swap_renderer: &mut bool,
     ) {
         let available = ui.available_size();
         let (rect, response) =
@@ -969,54 +956,32 @@ impl Viewport {
             let inv_view_proj = view_proj.inverse();
             let eye = self.camera.eye();
 
-            // Three-point rig directions are derived from the key once the
-            // rig is enabled — fill is the key reflected horizontally (so it
-            // paints opposite-side fill), rim is the key flipped (back-light).
-            // Scaling the IBL down lets the analytic rig dominate, which is
-            // what gives the Marmoset / Painter "studio" look.
-            let key = [self.light_dir[0], self.light_dir[1], self.light_dir[2]];
-            let (fill, rim, ibl_scale) = if self.studio_rig_enabled {
-                (
-                    [-key[0], key[1], -key[2]],
-                    [-key[0], key[1].max(0.2), -key[2]],
-                    self.studio_ibl_scale,
-                )
-            } else {
-                (
-                    [0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0],
-                    1.0,
-                )
-            };
-            let fill_intensity = if self.studio_rig_enabled {
-                self.light_intensity * self.studio_fill_ratio
-            } else {
-                0.0
-            };
-            let rim_intensity = if self.studio_rig_enabled {
-                self.light_intensity * self.studio_rim_ratio
-            } else {
-                0.0
-            };
+            // Pack the user's analytic lights into the GPU array.
+            // `Vec::iter().take(MAX_LIGHTS)` silently drops anything
+            // past the cap; UI prevents the user from adding more so
+            // this is just defensive.
+            let mut gpu_lights = [crate::lights::GpuLight::default();
+                crate::lights::MAX_LIGHTS];
+            let light_count = self.lights.len().min(crate::lights::MAX_LIGHTS);
+            for (i, light) in self.lights.iter().take(light_count).enumerate() {
+                gpu_lights[i] = crate::lights::GpuLight::from_light(light);
+            }
 
             self.renderer.write_frame(
                 &render_state.queue,
                 &FrameUniforms {
                     view_proj: view_proj.to_cols_array_2d(),
                     camera_pos: [eye.x, eye.y, eye.z, 1.0],
-                    light_dir: [key[0], key[1], key[2], 0.0],
-                    light_color: [1.0, 0.98, 0.95, self.light_intensity],
-                    fill_dir: [fill[0], fill[1], fill[2], 0.0],
-                    fill_color: [0.78, 0.86, 1.00, fill_intensity],
-                    rim_dir: [rim[0], rim[1], rim[2], 0.0],
-                    rim_color: [1.00, 0.92, 0.80, rim_intensity],
                     ambient_sky: [0.35, 0.45, 0.55, 1.0],
                     ambient_ground: [0.08, 0.07, 0.06, 1.0],
                     view_mode: self.view_mode.as_u32(),
                     tonemap_mode: self.tonemap_mode.as_u32(),
                     exposure: (2.0_f32).powf(self.exposure_stops),
-                    ibl_scale,
+                    ibl_scale: 1.0,
                     inv_view_proj: inv_view_proj.to_cols_array_2d(),
+                    light_count: light_count as u32,
+                    _pad_lights: [0; 3],
+                    lights: gpu_lights,
                 },
             );
             let material_uniforms = self.paint_target.material_uniforms(
@@ -1740,49 +1705,10 @@ impl Viewport {
             }
         }
 
-        // Renderer badge — top-left of the viewport canvas. Clickable
-        // to swap the central viewport over to the Hydra preview
-        // (Solaris-style toggle): badge owns the role of "renderer
-        // label + swap button". The App owns the actual mode flag;
-        // we just signal a swap request via the &mut bool param.
-        let badge_size = egui::vec2(160.0, 28.0);
-        let badge_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + 12.0, rect.top() + 12.0),
-            badge_size,
-        );
-        let badge_resp = ui.interact(
-            badge_rect,
-            ui.id().with("renderer_badge"),
-            egui::Sense::click(),
-        );
-        if badge_resp.clicked() {
-            *request_swap_renderer = true;
-        }
-        // Hover gives a subtle brightness lift so it reads as a
-        // control rather than a static label. Same yellow scheme as
-        // the focus stroke.
-        let (fill_alpha, stroke_w) = if badge_resp.hovered() { (240u8, 2.0) } else { (220u8, 1.5) };
-        ui.painter().rect_filled(
-            badge_rect,
-            6.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, fill_alpha),
-        );
-        ui.painter().rect_stroke(
-            badge_rect,
-            6.0,
-            egui::Stroke::new(stroke_w, egui::Color32::from_rgb(255, 220, 100)),
-            egui::StrokeKind::Outside,
-        );
-        ui.painter().text(
-            badge_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "▶ wgpu painter",
-            egui::FontId::proportional(14.0),
-            egui::Color32::from_rgb(255, 220, 100),
-        );
-        if badge_resp.hovered() {
-            badge_resp.on_hover_text("Click to switch to Hydra preview");
-        }
+        // Renderer label / picker now lives in a shared combo overlay
+        // drawn by `App::draw_renderer_picker` after this function
+        // returns. No badge here — the picker is the single
+        // wgpu/Storm/3Delight selector.
 
         // Default brush-shortcut hint — shown at the bottom of the
         // viewport whenever the stencil-transform hint isn't taking the

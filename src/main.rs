@@ -11,6 +11,7 @@ mod env;
 mod export;
 mod fxaa;
 mod hydra_view;
+mod lights;
 mod mesh;
 mod paint;
 mod persist;

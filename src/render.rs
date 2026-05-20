@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
 
+use crate::lights::{GpuLight, MAX_LIGHTS};
 use crate::mesh::Vertex;
 
 #[repr(C)]
@@ -8,19 +9,6 @@ use crate::mesh::Vertex;
 pub struct FrameUniforms {
     pub view_proj: [[f32; 4]; 4],
     pub camera_pos: [f32; 4],
-    /// Key light — primary direction + (rgb, intensity in w). Always
-    /// active. Defaults to a slightly elevated front-quarter angle.
-    pub light_dir: [f32; 4],
-    pub light_color: [f32; 4],
-    /// Fill light — opposite key, ~50% intensity, slightly cooler.
-    /// Set color.w = 0 to disable.
-    pub fill_dir: [f32; 4],
-    pub fill_color: [f32; 4],
-    /// Rim / back light — behind the model, slightly above. Provides
-    /// the highlight silhouette that reads as "product shot crispness".
-    /// Set color.w = 0 to disable.
-    pub rim_dir: [f32; 4],
-    pub rim_color: [f32; 4],
     pub ambient_sky: [f32; 4],
     pub ambient_ground: [f32; 4],
     /// Picks what the fragment shader visualises. See `ViewMode::as_u32`.
@@ -29,12 +17,25 @@ pub struct FrameUniforms {
     pub tonemap_mode: u32,
     /// Pre-tonemap linear multiplier (= 2^exposure_stops).
     pub exposure: f32,
-    /// Multiplier on the IBL contribution. Three-point studio rigs
-    /// dampen this (~0.4) so the analytic lights dominate.
+    /// Multiplier on the IBL contribution. Stays at 1.0 now that the
+    /// hard-coded studio rig is gone; kept as a uniform so the
+    /// shader can still scale IBL if a downstream feature wants it
+    /// (e.g. future ambient-occlusion modulation).
     pub ibl_scale: f32,
     /// Inverse of `view_proj` — used by the skybox vertex shader to
     /// reconstruct a world-space ray direction from clip-space NDC.
     pub inv_view_proj: [[f32; 4]; 4],
+    /// Number of valid entries in `lights`. Shader iterates
+    /// `0..light_count` and skips the rest.
+    pub light_count: u32,
+    /// std140 pads `light_count` (a scalar) up to a vec4 before the
+    /// `lights` array starts. The three extra u32s keep the CPU and
+    /// shader views byte-for-byte aligned.
+    pub _pad_lights: [u32; 3],
+    /// Dynamic analytic-light array — directional + spot. Driven
+    /// from `Viewport::lights`. Zero count by default; user adds via
+    /// the Lighting panel's `+ Directional` / `+ Spot` buttons.
+    pub lights: [GpuLight; MAX_LIGHTS],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
