@@ -278,6 +278,7 @@ pub enum Tab {
     Meshes,
     Stencils,
     Swatches,
+    Materials,
 }
 
 impl Tab {
@@ -287,9 +288,63 @@ impl Tab {
             Tab::Meshes => "Meshes",
             Tab::Stencils => "Stencils",
             Tab::Swatches => "Swatches",
+            Tab::Materials => "Materials",
         }
     }
-    pub const ALL: &'static [Tab] = &[Tab::Textures, Tab::Meshes, Tab::Stencils, Tab::Swatches];
+    pub const ALL: &'static [Tab] = &[
+        Tab::Textures,
+        Tab::Meshes,
+        Tab::Stencils,
+        Tab::Swatches,
+        Tab::Materials,
+    ];
+}
+
+/// What flavour of shader network the material is built on. Used by
+/// the Materials pane to filter the library, and to decide whether a
+/// given material is safe to apply for the user's current delegate
+/// (UsdPreviewSurface is universal; 3Delight OSL is hdNSI-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterialKind {
+    UsdPreviewSurface,
+    MaterialX,
+    /// 3Delight's native OSL shaders. Rendered correctly by hdNSI;
+    /// other delegates may ignore or fall back.
+    OslDelight,
+    Other,
+}
+
+impl MaterialKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            MaterialKind::UsdPreviewSurface => "UsdPreviewSurface",
+            MaterialKind::MaterialX => "MaterialX",
+            MaterialKind::OslDelight => "3Delight (OSL)",
+            MaterialKind::Other => "Other",
+        }
+    }
+    pub const ALL: &'static [MaterialKind] = &[
+        MaterialKind::UsdPreviewSurface,
+        MaterialKind::MaterialX,
+        MaterialKind::OslDelight,
+        MaterialKind::Other,
+    ];
+}
+
+/// One entry in the Materials pane. Sourced from a USD file on disk —
+/// applying the material references the source into the loaded stage's
+/// session layer (bridge's `set_external_material`).
+#[derive(Debug, Clone)]
+pub struct MaterialAsset {
+    pub name: String,
+    /// USD file containing the material network. Handed to the bridge
+    /// as the reference source.
+    pub source: PathBuf,
+    /// Path of the `UsdShadeMaterial` prim inside `source`. Empty
+    /// string means "use the source's default prim", which is the
+    /// pipeline convention most material libraries follow.
+    pub prim_path: String,
+    pub kind: MaterialKind,
 }
 
 /// Reference to a USD file on disk — thumbnail comes later; for now we
@@ -303,7 +358,13 @@ pub struct MeshAsset {
 pub struct AssetBrowser {
     pub textures: Vec<TextureAsset>,
     pub meshes: Vec<MeshAsset>,
+    pub materials: Vec<MaterialAsset>,
     pub active_tab: Tab,
+    /// Filter chip set for the Materials pane — `None` entries are
+    /// hidden. Tracks each `MaterialKind`'s visibility independently
+    /// so the user can multi-select (UsdPreviewSurface + MaterialX
+    /// but not 3Delight, say).
+    pub material_kind_filter: [bool; 4],
 }
 
 impl Default for AssetBrowser {
@@ -311,7 +372,9 @@ impl Default for AssetBrowser {
         Self {
             textures: Vec::new(),
             meshes: Vec::new(),
+            materials: Vec::new(),
             active_tab: Tab::Textures,
+            material_kind_filter: [true; 4],
         }
     }
 }
@@ -603,4 +666,119 @@ pub fn apply_as_mask(
         );
     }
     Ok(())
+}
+
+/// Walk `<root>/assets/materials/` (and a few fallback locations
+/// matching the HDRI discovery's heuristic) for USD files that
+/// look like material definitions, classify each by shader id, and
+/// return the resulting list ready to drop into
+/// `AssetBrowser::materials`.
+///
+/// Empty result is OK — `assets/materials/` doesn't exist by default;
+/// the user (or pipeline) drops `*.usd` / `*.usda` / `*.usdc` files
+/// with `def Material` prims into it to populate the pane.
+pub fn discover_materials(root: &Path) -> Vec<MaterialAsset> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(root.join("assets").join("materials"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("assets").join("materials"));
+            if let Some(p2) = parent.parent() {
+                candidates.push(p2.join("assets").join("materials"));
+            }
+            if let Some(p3) = parent.parent().and_then(|p| p.parent()) {
+                candidates.push(p3.join("assets").join("materials"));
+            }
+        }
+    }
+    if let Some(env_dir) = std::env::var_os("FORGE_PAINT_MATERIAL_DIR") {
+        candidates.push(env_dir.into());
+    }
+
+    for dir in candidates {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_usd = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    let l = e.to_ascii_lowercase();
+                    l == "usd" || l == "usda" || l == "usdc" || l == "usdz"
+                })
+                .unwrap_or(false);
+            if !is_usd {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("material")
+                .to_string();
+            let kind = classify_material_file(&path);
+            out.push(MaterialAsset {
+                name,
+                source: path,
+                // Library convention: each file's default prim is the
+                // material. Multi-material files extracted into one-
+                // per-entry later if needed — keeps v1 shape simple.
+                prim_path: String::new(),
+                kind,
+            });
+        }
+        if !out.is_empty() {
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+            return out;
+        }
+    }
+    Vec::new()
+}
+
+/// Cheap shader-id sniff of a USD material file. Filename hints
+/// first (`*.materialx.usd`, `*.osl.usd`, …); falls back to
+/// pattern-matching the first ~64 KB as text. Binary `.usdc` files
+/// without matching identifiers land in `Other` — full
+/// classification would mean opening the stage via rust-usd, which
+/// is heavier than this pane warrants for v1.
+fn classify_material_file(path: &Path) -> MaterialKind {
+    let lower_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if lower_name.contains("materialx") || lower_name.contains(".mtlx") {
+        return MaterialKind::MaterialX;
+    }
+    if lower_name.contains(".osl.") || lower_name.contains("delight") {
+        return MaterialKind::OslDelight;
+    }
+    if lower_name.contains("preview") || lower_name.contains(".up.") {
+        return MaterialKind::UsdPreviewSurface;
+    }
+
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return MaterialKind::Other;
+    };
+    use std::io::Read;
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let head = std::str::from_utf8(&buf[..n]).unwrap_or_default();
+    if head.contains("UsdPreviewSurface") {
+        return MaterialKind::UsdPreviewSurface;
+    }
+    if head.contains("MaterialX") || head.contains("ND_") {
+        // `ND_` is MaterialX's node-definition prefix — common in any
+        // serialised MaterialX network even when embedded in USD.
+        return MaterialKind::MaterialX;
+    }
+    if head.contains("dlPrincipled")
+        || head.contains("dlSubstance")
+        || head.contains("DelightSurface")
+    {
+        return MaterialKind::OslDelight;
+    }
+    MaterialKind::Other
 }

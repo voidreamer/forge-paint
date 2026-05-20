@@ -1,0 +1,19 @@
+#usda 1.0
+(
+    defaultPrim = "Material"
+    doc = "Bundled UsdPreviewSurface starter material — chalky matte white (lookdev neutral)."
+)
+
+def Material "Material"
+{
+    token outputs:surface.connect = </Material/Surface.outputs:surface>
+
+    def Shader "Surface"
+    {
+        uniform token info:id = "UsdPreviewSurface"
+        color3f inputs:diffuseColor = (0.9, 0.9, 0.9)
+        float inputs:metallic = 0.0
+        float inputs:roughness = 0.9
+        token outputs:surface
+    }
+}

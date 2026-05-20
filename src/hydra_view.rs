@@ -84,6 +84,19 @@ pub struct HydraView {
     last_rig: Option<StudioRig>,
     last_dome: Option<DomeEnv>,
     last_purposes: Option<(bool, bool, bool)>,
+    /// Packed snapshot of the user-light array that was last pushed
+    /// through `set_user_lights`. Compared against on each frame to
+    /// skip the session-layer rewrite when nothing changed —
+    /// without this, every frame would Define a fresh
+    /// `UsdLuxDistantLight` / `UsdLuxSphereLight` and trigger a
+    /// scene-index notification on the delegate. Hashed-equivalent
+    /// (bytewise) because lights pack to plain `f32`s.
+    last_user_lights: Vec<[f32; 16]>,
+    /// Library material currently referenced into the session layer
+    /// (source path + sub-prim path). `None` means no library
+    /// material is bound. Compared against to skip bridge calls
+    /// when the selection hasn't changed.
+    last_external_material: Option<(std::path::PathBuf, String)>,
 
     /// Wall-clock timestamp of the most-recent successful
     /// `render(...)` call. The caller throttles re-render frequency
@@ -143,6 +156,8 @@ impl HydraView {
             last_rig: None,
             last_dome: None,
             last_purposes: None,
+            last_user_lights: Vec::new(),
+            last_external_material: None,
             last_render: None,
             last_pixels: None,
         })
@@ -205,6 +220,78 @@ impl HydraView {
     /// bindings (if any) drive shading again afterwards.
     pub fn clear_painted_material(&mut self) {
         self.renderer.clear_painted_material();
+    }
+
+    /// Reference a library material into the stage's session layer
+    /// and bind it to every mesh. `source` is the USD file from the
+    /// `Materials` library pane; `prim_path` is the path inside that
+    /// file (empty = source's default prim, which is the convention
+    /// the discovery walker expects). Hydra-only — wgpu mode keeps
+    /// rendering paint targets.
+    ///
+    /// Idempotent: re-pointing at a different material is one bridge
+    /// call. Dirty-tracking lives in the caller (`draw_hydra_central`
+    /// only invokes this when the selected index changes).
+    pub fn set_external_material(
+        &mut self,
+        source: &Path,
+        prim_path: &str,
+    ) -> Result<()> {
+        let next = (source.to_path_buf(), prim_path.to_string());
+        if self.last_external_material.as_ref() == Some(&next) {
+            return Ok(());
+        }
+        self.renderer
+            .set_external_material(source, prim_path)
+            .map_err(|e| anyhow::anyhow!("set_external_material failed: {}", e.what()))?;
+        self.last_external_material = Some(next);
+        Ok(())
+    }
+
+    /// Drop the library material reference and unbind from meshes.
+    pub fn clear_external_material(&mut self) {
+        if self.last_external_material.is_none() {
+            return;
+        }
+        self.renderer.clear_external_material();
+        self.last_external_material = None;
+    }
+
+    /// Push the consumer's analytic-light list into the Hydra
+    /// session layer. Each `Light` becomes either a
+    /// `UsdLuxDistantLight` (directional) or a `UsdLuxSphereLight`
+    /// with `shaping:cone:*` (spot) at `/_hydraLight<i>`.
+    ///
+    /// Dirty-tracked — the bridge call is skipped when the packed
+    /// payload matches the last one we sent. Each session-layer
+    /// edit triggers a delegate Sync (path-tracer restart on
+    /// hdNSI), so the early-out matters when the panel is idle.
+    pub fn set_user_lights(&mut self, lights: &[crate::lights::Light]) -> Result<()> {
+        let packed: Vec<[f32; 16]> = lights
+            .iter()
+            .map(|l| {
+                let gl = crate::lights::GpuLight::from_light(l);
+                let mut row = [0.0f32; 16];
+                row[0..4].copy_from_slice(&gl.direction_type);
+                row[4..8].copy_from_slice(&gl.position_enabled);
+                row[8..12].copy_from_slice(&gl.color_intensity);
+                row[12..16].copy_from_slice(&gl.cone);
+                row
+            })
+            .collect();
+        if packed == self.last_user_lights {
+            return Ok(());
+        }
+        log::info!(
+            "Hydra: pushing {} user light(s) to bridge ({} prev)",
+            packed.len(),
+            self.last_user_lights.len(),
+        );
+        self.renderer
+            .set_user_lights(&packed)
+            .map_err(|e| anyhow::anyhow!("set_user_lights failed: {}", e.what()))?;
+        self.last_user_lights = packed;
+        Ok(())
     }
 
     /// Apply `UsdGeomImageable::purpose` filters in one call. Cheap

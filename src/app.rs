@@ -84,6 +84,12 @@ pub struct App {
     /// without the user needing to click `↻ Sync paint`. Cleared
     /// after the sync (or after a failure that won't repeat).
     hydra_paint_sync_pending: bool,
+    /// Index into `browser.materials` of the currently-applied
+    /// library material, or `None` for "no library material — fall
+    /// back to whatever the stage authored or the painted-material
+    /// override". Pushed to Hydra each frame (dirty-tracked) so the
+    /// session-layer reference re-asserts itself after stage changes.
+    selected_material_idx: Option<usize>,
     /// Pixels-per-UV-unit for the UV atlas. Modified by scroll.
     uv_zoom: f32,
     /// Screen-pixel offset applied to the atlas (drag to pan).
@@ -732,6 +738,9 @@ impl eframe::App for App {
                             );
                         }
                         RendererMode::Hydra => {
+                            let mat_ref = self
+                                .selected_material_idx
+                                .and_then(|i| self.browser.materials.get(i));
                             Self::draw_hydra_central(
                                 ui,
                                 frame,
@@ -746,6 +755,7 @@ impl eframe::App for App {
                                 &mut self.hydra_show_render,
                                 &mut self.hydra_show_proxy,
                                 &mut self.hydra_show_guides,
+                                mat_ref,
                                 self.current_usd_path.as_deref(),
                                 &mut swap_renderer,
                             );
@@ -2518,9 +2528,15 @@ fn light_section(ui: &mut egui::Ui, vp: &mut Viewport) {
                     }
                 });
                 ui.add(
-                    egui::Slider::new(&mut light.intensity, 0.0..=10.0)
+                    egui::Slider::new(&mut light.intensity, 0.0..=1000.0)
                         .text("intensity")
-                        .show_value(true),
+                        .show_value(true)
+                        // Logarithmic so 0–10 still has good slider
+                        // resolution while 100–1000 stays reachable
+                        // without the slider getting unusable. Matches
+                        // UsdLux's radiometric range, where 1 is dim
+                        // and 1000+ is sun-bright.
+                        .logarithmic(true),
                 );
                 match light.kind {
                     LightKind::Directional => {
@@ -2851,6 +2867,7 @@ impl App {
         show_render: &mut bool,
         show_proxy: &mut bool,
         show_guides: &mut bool,
+        selected_material: Option<&crate::assets::MaterialAsset>,
         stage_path: Option<&std::path::Path>,
         request_swap_renderer: &mut bool,
     ) {
@@ -2981,11 +2998,29 @@ impl App {
         }
 
         hydra.resize(w, h);
-        // No studio rig push — the 3-point GlfSimpleLight rig doesn't
-        // respond to UsdLuxDomeLight's exposure attr, so dome +
-        // analytic rig were giving physically inconsistent results.
-        // HDRI dome alone is the lighting model in Hydra. Load an
-        // HDRI from the Lighting panel for a lit scene.
+        // Mirror the wgpu side's analytic-light list into the Hydra
+        // session layer as `UsdLuxDistantLight` / `UsdLuxSphereLight`
+        // prims. Dirty-tracked inside `set_user_lights`, so when the
+        // panel is idle this is a no-op. Combined with the dome
+        // below, both renderers see the same lighting from the same
+        // source of truth.
+        if let Err(e) = hydra.set_user_lights(&vp.lights) {
+            log::warn!("Hydra: set_user_lights failed: {e:#}");
+        }
+        // External library material — if the user picked one in the
+        // Materials pane, reference it into the session layer; if
+        // they clear the pick, drop the reference so the stage's
+        // original bindings take over again.
+        match selected_material {
+            Some(mat) => {
+                if let Err(e) =
+                    hydra.set_external_material(&mat.source, &mat.prim_path)
+                {
+                    log::warn!("Hydra: set_external_material failed: {e:#}");
+                }
+            }
+            None => hydra.clear_external_material(),
+        }
         hydra.set_purposes(*show_render, *show_proxy, *show_guides);
         if let Err(e) = hydra.set_environment(env.as_ref()) {
             log::warn!("Hydra: set_environment failed: {e:#}");
@@ -2997,17 +3032,31 @@ impl App {
         // keeps us out of an infinite "try again next frame" loop;
         // the failure status is surfaced via `hydra_paint_sync_status`
         // for the overlay.
+        //
+        // Skip the paint sync entirely when a library material is
+        // bound — the paint sync's `MaterialBindingAPI.Bind` would
+        // overwrite the external-material binding (UsdShade strength
+        // is "last-authored wins"), which the user sees as "the
+        // material I picked got unassigned every time I bounce
+        // through wgpu". With a library material active, leave the
+        // session layer alone.
         if *hydra_paint_sync_pending {
             *hydra_paint_sync_pending = false;
-            let status = Self::sync_painted_material(
-                frame,
-                vp,
-                hydra,
-                hydra_paint_cache_dir,
-                hydra_paint_sync_seq,
-            );
-            log::info!("Hydra paint mode-entry sync: {status}");
-            *hydra_paint_sync_status = Some(status);
+            if selected_material.is_none() {
+                let status = Self::sync_painted_material(
+                    frame,
+                    vp,
+                    hydra,
+                    hydra_paint_cache_dir,
+                    hydra_paint_sync_seq,
+                );
+                log::info!("Hydra paint mode-entry sync: {status}");
+                *hydra_paint_sync_status = Some(status);
+            } else {
+                log::info!(
+                    "Hydra: skipping paint mode-entry sync — library material bound",
+                );
+            }
         }
 
         match hydra.render(&view_row, &proj_row) {
@@ -3577,6 +3626,18 @@ impl App {
             }
         }
 
+        // Materials library — scan once at startup. Same exe-relative
+        // fallback as the HDRI discovery.
+        let materials_root = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        self.browser.materials = crate::assets::discover_materials(&materials_root);
+        if !self.browser.materials.is_empty() {
+            log::info!(
+                "Materials library: {} entries",
+                self.browser.materials.len(),
+            );
+        }
+
         if count > 0 || !self.browser.meshes.is_empty() {
             self.status = format!(
                 "Imported {count} texture(s), {} mesh(es)",
@@ -3625,6 +3686,9 @@ impl App {
             }
             assets::Tab::Meshes => {
                 self.mesh_strip(ui, frame);
+            }
+            assets::Tab::Materials => {
+                self.material_strip(ui);
             }
             _ => {
                 ui.weak("(this tab is not implemented yet)");
@@ -3688,6 +3752,131 @@ impl App {
             });
         if let Some(path) = load_requested {
             self.load_usd(frame, path);
+        }
+    }
+
+    fn material_strip(&mut self, ui: &mut egui::Ui) {
+        // Filter chip row + clear button at the top.
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            for (i, &kind) in crate::assets::MaterialKind::ALL.iter().enumerate() {
+                let mut on = self.browser.material_kind_filter[i];
+                if ui.toggle_value(&mut on, kind.label()).changed() {
+                    self.browser.material_kind_filter[i] = on;
+                }
+            }
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let bound = self.selected_material_idx.is_some();
+                    if ui
+                        .add_enabled(bound, egui::Button::new("Clear material"))
+                        .on_hover_text(
+                            "Drop the library material binding; stage's authored materials take over again.",
+                        )
+                        .clicked()
+                    {
+                        self.selected_material_idx = None;
+                    }
+                    if let Some(idx) = self.selected_material_idx {
+                        if let Some(mat) = self.browser.materials.get(idx) {
+                            ui.label(
+                                egui::RichText::new(format!("Bound: {}", mat.name))
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(180, 220, 180)),
+                            );
+                        }
+                    }
+                },
+            );
+        });
+        ui.separator();
+
+        if self.browser.materials.is_empty() {
+            ui.weak(
+                "No materials found. Drop `*.usd` / `*.usda` / `*.usdc` files \
+                 with a `def Material` prim into `assets/materials/` (or set \
+                 `FORGE_PAINT_MATERIAL_DIR` to your library) and restart.",
+            );
+            return;
+        }
+
+        let mut clicked: Option<usize> = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("asset_material_strip")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, mat) in self.browser.materials.iter().enumerate() {
+                        let kind_idx = match mat.kind {
+                            crate::assets::MaterialKind::UsdPreviewSurface => 0,
+                            crate::assets::MaterialKind::MaterialX => 1,
+                            crate::assets::MaterialKind::OslDelight => 2,
+                            crate::assets::MaterialKind::Other => 3,
+                        };
+                        if !self.browser.material_kind_filter[kind_idx] {
+                            continue;
+                        }
+                        ui.vertical(|ui| {
+                            // Card body: a 80×80 phosphor glyph button.
+                            // Real previews (offscreen-rendered swatches)
+                            // are a follow-up; sphere glyph reads as
+                            // "material" well enough for v1.
+                            let glyph = egui::RichText::new(
+                                egui_phosphor::regular::SPHERE,
+                            )
+                            .size(40.0);
+                            let active = self.selected_material_idx == Some(i);
+                            let btn = egui::Button::new(glyph)
+                                .min_size(egui::vec2(80.0, 80.0))
+                                .selected(active);
+                            let resp = ui.add(btn).on_hover_text(format!(
+                                "{}\n{}\n{}",
+                                mat.name,
+                                mat.kind.label(),
+                                mat.source.display(),
+                            ));
+                            if resp.clicked() {
+                                clicked = Some(i);
+                            }
+                            // Tag chip under the card — kind label in
+                            // small text so the type is visible at a
+                            // glance without hovering.
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(mat.kind.label())
+                                        .small()
+                                        .color(egui::Color32::from_gray(160)),
+                                )
+                                .truncate(),
+                            );
+                            // Name under the chip, slightly larger,
+                            // truncated to keep the card narrow.
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&mat.name).size(11.0),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    }
+                });
+            });
+
+        if let Some(i) = clicked {
+            // Toggle: clicking the active card clears the selection.
+            self.selected_material_idx =
+                if self.selected_material_idx == Some(i) {
+                    None
+                } else {
+                    Some(i)
+                };
+            // Materials only matter in Hydra mode; nudge the user if
+            // they pick a material while in wgpu.
+            if self.renderer_mode == RendererMode::Wgpu
+                && self.selected_material_idx.is_some()
+            {
+                self.status = "Material bound in Hydra session layer — switch to Hydra to preview.".to_string();
+            }
         }
     }
 

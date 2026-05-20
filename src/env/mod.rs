@@ -451,31 +451,64 @@ fn mip_count_for(dim: u32) -> u32 {
 }
 
 /// Attempt to load any bundled HDRIs from `assets/hdri/`. Returns `(name, path)`.
+///
+/// Looks in several places (in order, first non-empty wins):
+///   1. `<root>/assets/hdri/` — `root` is usually `current_dir()`.
+///   2. `<exe-parent>/assets/hdri/` — covers the case where the
+///      binary is launched from somewhere other than the project
+///      root (`forge launch <project> forge-paint` sets cwd to the
+///      pipeline project dir, not forge-paint's repo).
+///   3. `$FORGE_PAINT_HDRI_DIR` if set — explicit override for
+///      pipeline / packaged deployments that ship HDRIs elsewhere.
 pub fn discover_bundled_hdris(root: &Path) -> Vec<(String, std::path::PathBuf)> {
-    let dir = root.join("assets").join("hdri");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_hdr = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("hdr") || e.eq_ignore_ascii_case("exr"))
-            .unwrap_or(false);
-        if !is_hdr {
-            continue;
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    candidates.push(root.join("assets").join("hdri"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            // `target/release/forge-paint` → ../../assets/hdri lands
+            // back at the repo root. Walk up at most three parents to
+            // tolerate both `target/release/` and a hand-off layout.
+            candidates.push(parent.join("assets").join("hdri"));
+            if let Some(p2) = parent.parent() {
+                candidates.push(p2.join("assets").join("hdri"));
+            }
+            if let Some(p3) = parent.parent().and_then(|p| p.parent()) {
+                candidates.push(p3.join("assets").join("hdri"));
+            }
         }
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("hdri")
-            .to_string();
-        out.push((name, path));
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    if let Some(env_dir) = std::env::var_os("FORGE_PAINT_HDRI_DIR") {
+        candidates.push(env_dir.into());
+    }
+
+    for dir in candidates {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_hdr = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("hdr") || e.eq_ignore_ascii_case("exr"))
+                .unwrap_or(false);
+            if !is_hdr {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("hdri")
+                .to_string();
+            out.push((name, path));
+        }
+        if !out.is_empty() {
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            return out;
+        }
+    }
+    Vec::new()
 }
 
 #[allow(dead_code)]
