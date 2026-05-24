@@ -1,0 +1,24 @@
+#usda 1.0
+(
+    defaultPrim = "Material"
+    doc = "Bundled 3Delight Principled (dlPrincipled) — polished gold. Modern PBR-style controls; coating activates implicitly when coating_thickness > 0 (no on/off toggle, unlike the legacy _3DelightMaterial). hdNSI-only — Storm/Arnold fall back to a default surface."
+)
+
+def Material "Material"
+{
+    token outputs:nsi:surface.connect = </Material/Surface.outputs:surface>
+    token outputs:surface.connect = </Material/Surface.outputs:surface>
+
+    def Shader "Surface"
+    {
+        uniform token info:id = "dlPrincipled"
+
+        color3f inputs:i_color = (1.0, 0.78, 0.34)
+        float inputs:metallic = 1.0
+        float inputs:roughness = 0.18
+        float inputs:specular_level = 1.0
+        float inputs:anisotropy = 0.0
+
+        token outputs:surface
+    }
+}

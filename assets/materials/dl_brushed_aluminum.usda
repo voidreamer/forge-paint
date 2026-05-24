@@ -1,0 +1,24 @@
+#usda 1.0
+(
+    defaultPrim = "Material"
+    doc = "Bundled 3Delight Metal (dlMetal) — brushed aluminum with mild anisotropy. dlMetal is a specialized metallic shader (no diffuse term) with a complex-IOR-driven edge_color tint; for full anisotropic streak control you also want to author a tangent primvar on the mesh."
+)
+
+def Material "Material"
+{
+    token outputs:nsi:surface.connect = </Material/Surface.outputs:surface>
+    token outputs:surface.connect = </Material/Surface.outputs:surface>
+
+    def Shader "Surface"
+    {
+        uniform token info:id = "dlMetal"
+
+        color3f inputs:i_color = (0.91, 0.92, 0.92)
+        color3f inputs:edge_color = (0.98, 0.99, 1.0)
+        float inputs:roughness = 0.30
+        float inputs:anisotropy = 0.55
+        color3f inputs:anisotropy_direction = (0.5, 1.0, 0.0)
+
+        token outputs:surface
+    }
+}

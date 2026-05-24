@@ -1,0 +1,28 @@
+#usda 1.0
+(
+    defaultPrim = "Material"
+    doc = "Bundled 3Delight Principled (dlPrincipled) — red plastic with a thin clear coat. Demonstrates the Principled coating path: coating_thickness > 0 activates the coat (no explicit toggle), coating_color tints absorption through the layer, coating_specular_level dials its Fresnel."
+)
+
+def Material "Material"
+{
+    token outputs:nsi:surface.connect = </Material/Surface.outputs:surface>
+    token outputs:surface.connect = </Material/Surface.outputs:surface>
+
+    def Shader "Surface"
+    {
+        uniform token info:id = "dlPrincipled"
+
+        color3f inputs:i_color = (0.82, 0.10, 0.10)
+        float inputs:metallic = 0.0
+        float inputs:roughness = 0.45
+        float inputs:specular_level = 0.5
+
+        float inputs:coating_thickness = 0.4
+        color3f inputs:coating_color = (1.0, 1.0, 1.0)
+        float inputs:coating_roughness = 0.05
+        float inputs:coating_specular_level = 0.9
+
+        token outputs:surface
+    }
+}

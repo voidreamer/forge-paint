@@ -257,6 +257,36 @@ impl HydraView {
         self.last_external_material = None;
     }
 
+    /// Live-edit a scalar input on the currently-bound external
+    /// material's surface shader (e.g. `metallic`, `roughness`,
+    /// `opacity`). Forwards to `hydra-rs::set_external_material_
+    /// input_f` which authors a session-layer override on top of
+    /// the referenced source value.
+    pub fn set_external_material_input_f(&mut self, input_name: &str, value: f32) {
+        self.renderer.set_external_material_input_f(input_name, value);
+    }
+
+    /// Live-edit a colour input on the currently-bound external
+    /// material's surface shader (e.g. `diffuseColor`, `base_color`,
+    /// `emissiveColor`).
+    pub fn set_external_material_input_color3(
+        &mut self,
+        input_name: &str,
+        color: [f32; 3],
+    ) {
+        self.renderer
+            .set_external_material_input_color3(input_name, color);
+    }
+
+    /// Live-edit an int input on the currently-bound external
+    /// material's surface shader. Used for OSL bool-flavoured
+    /// toggles (`coating_on`, `sss_on`, …) which gate downstream
+    /// layer contribution and can't be set through the float setter.
+    pub fn set_external_material_input_i(&mut self, input_name: &str, value: i32) {
+        self.renderer
+            .set_external_material_input_i(input_name, value);
+    }
+
     /// Push the consumer's analytic-light list into the Hydra
     /// session layer. Each `Light` becomes either a
     /// `UsdLuxDistantLight` (directional) or a `UsdLuxSphereLight`

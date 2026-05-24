@@ -1,0 +1,30 @@
+#usda 1.0
+(
+    defaultPrim = "Material"
+    doc = "Bundled 3Delight Skin (dlSkin) — multi-layer SSS tuned for a generic warm skin tone. The specialized inputs (skin_color, sss_color/scale, sheen) bake in here; the library editor's generic sliders only drive `roughness` for this kind. Author the per-shader knobs in DCC tools or the upcoming node editor."
+)
+
+def Material "Material"
+{
+    token outputs:nsi:surface.connect = </Material/Surface.outputs:surface>
+    token outputs:surface.connect = </Material/Surface.outputs:surface>
+
+    def Shader "Surface"
+    {
+        uniform token info:id = "dlSkin"
+
+        color3f inputs:skin_color = (0.79, 0.60, 0.49)
+        float inputs:roughness = 0.40
+        float inputs:specular_level = 0.4
+
+        color3f inputs:sss_color = (0.96, 0.34, 0.22)
+        float inputs:sss_scale = 0.7
+        float inputs:sss_anisotropy = 0.2
+
+        float inputs:sheen_level = 0.15
+        float inputs:sheen_roughness = 0.4
+        color3f inputs:sheen_color = (1.0, 0.95, 0.92)
+
+        token outputs:surface
+    }
+}

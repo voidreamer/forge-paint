@@ -1,0 +1,28 @@
+#usda 1.0
+(
+    defaultPrim = "Material"
+    doc = "Bundled 3Delight Glass (dlGlass) — clear architectural glass at IOR 1.5. Volumetric absorption disabled (volumetric_enable=0); for tinted glass enable it and set volumetric_transparency_color. dlGlass's `i_color` is the refraction tint, NOT diffuse — this differs from dlPrincipled."
+)
+
+def Material "Material"
+{
+    token outputs:nsi:surface.connect = </Material/Surface.outputs:surface>
+    token outputs:surface.connect = </Material/Surface.outputs:surface>
+
+    def Shader "Surface"
+    {
+        uniform token info:id = "dlGlass"
+
+        color3f inputs:reflect_color = (1.0, 1.0, 1.0)
+        float inputs:reflect_roughness = 0.0
+        float inputs:reflect_ior = 1.5
+
+        color3f inputs:i_color = (1.0, 1.0, 1.0)
+        float inputs:refract_roughness = 0.0
+        float inputs:refract_ior = 1.5
+
+        int inputs:volumetric_enable = 0
+
+        token outputs:surface
+    }
+}

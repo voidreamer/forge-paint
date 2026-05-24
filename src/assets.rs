@@ -308,9 +308,11 @@ impl Tab {
 pub enum MaterialKind {
     UsdPreviewSurface,
     MaterialX,
-    /// 3Delight's native OSL shaders. Rendered correctly by hdNSI;
-    /// other delegates may ignore or fall back.
-    OslDelight,
+    /// 3Delight Disney-style shaders — `dlPrincipled` and its
+    /// specialized siblings (`dlMetal`, `dlGlass`, `dlSkin`,
+    /// `dlCarPaint`, …). Rendered correctly by hdNSI; other
+    /// delegates may fall back to a default surface.
+    DlPrincipled,
     Other,
 }
 
@@ -319,16 +321,84 @@ impl MaterialKind {
         match self {
             MaterialKind::UsdPreviewSurface => "UsdPreviewSurface",
             MaterialKind::MaterialX => "MaterialX",
-            MaterialKind::OslDelight => "3Delight (OSL)",
+            MaterialKind::DlPrincipled => "3Delight",
             MaterialKind::Other => "Other",
         }
     }
     pub const ALL: &'static [MaterialKind] = &[
         MaterialKind::UsdPreviewSurface,
         MaterialKind::MaterialX,
-        MaterialKind::OslDelight,
+        MaterialKind::DlPrincipled,
         MaterialKind::Other,
     ];
+
+    /// Surface-shader input names this kind uses for the editor's
+    /// slider set. UsdPreviewSurface, MaterialX
+    /// `ND_standard_surface_surfaceshader`, and 3Delight's
+    /// `_3DelightMaterial` all expose conceptually-equivalent inputs
+    /// under different attribute names. `None` for an entry means
+    /// "this shader doesn't have a corresponding knob" — the editor
+    /// hides that row and the bridge skips the override.
+    pub fn input_names(self) -> ShaderInputNames {
+        match self {
+            MaterialKind::UsdPreviewSurface | MaterialKind::Other => ShaderInputNames {
+                diffuse_color: Some("diffuseColor"),
+                metallic: Some("metallic"),
+                roughness: Some("roughness"),
+                opacity: Some("opacity"),
+                clearcoat: Some("clearcoat"),
+                clearcoat_roughness: Some("clearcoatRoughness"),
+                emission_color: Some("emissiveColor"),
+                // UsdPreviewSurface folds emission magnitude into the
+                // emissiveColor's components — no separate scalar.
+                emission_intensity: None,
+            },
+            MaterialKind::MaterialX => ShaderInputNames {
+                diffuse_color: Some("base_color"),
+                metallic: Some("metalness"),
+                roughness: Some("specular_roughness"),
+                opacity: Some("opacity"),
+                // MaterialX standard_surface uses `coat` for the
+                // clearcoat layer toggle (0..1 weight) and
+                // `coat_roughness` for its roughness.
+                clearcoat: Some("coat"),
+                clearcoat_roughness: Some("coat_roughness"),
+                emission_color: Some("emission_color"),
+                emission_intensity: Some("emission"),
+            },
+            MaterialKind::DlPrincipled => ShaderInputNames {
+                // dlPrincipled / dlMetal / dlCarPaint all use the
+                // Disney-style naming below. The coat slot drives
+                // `coating_thickness` directly — there is no
+                // `coating_on` toggle, coat activates whenever
+                // thickness > 0.
+                diffuse_color: Some("i_color"),
+                metallic: Some("metallic"),
+                roughness: Some("roughness"),
+                opacity: Some("opacity"),
+                clearcoat: Some("coating_thickness"),
+                clearcoat_roughness: Some("coating_roughness"),
+                emission_color: Some("incandescence"),
+                emission_intensity: Some("incandescence_intensity"),
+            },
+        }
+    }
+}
+
+/// Maps the editor's standardised slider concepts onto shader-id-
+/// specific `inputs:*` names. `None` = the shader doesn't expose
+/// that concept under any name we know of — the editor hides the
+/// row and the bridge skips the override.
+#[derive(Debug, Clone, Copy)]
+pub struct ShaderInputNames {
+    pub diffuse_color: Option<&'static str>,
+    pub metallic: Option<&'static str>,
+    pub roughness: Option<&'static str>,
+    pub opacity: Option<&'static str>,
+    pub clearcoat: Option<&'static str>,
+    pub clearcoat_roughness: Option<&'static str>,
+    pub emission_color: Option<&'static str>,
+    pub emission_intensity: Option<&'static str>,
 }
 
 /// One entry in the Materials pane. Sourced from a USD file on disk —
@@ -737,6 +807,143 @@ pub fn discover_materials(root: &Path) -> Vec<MaterialAsset> {
     Vec::new()
 }
 
+/// Snapshot of a UsdPreviewSurface / MaterialX standard_surface /
+/// 3Delight `_3DelightMaterial` shader's commonly-edited inputs.
+/// Populated by reading the source USDA text — binary `.usdc` files
+/// miss it (and the editor falls back to safe defaults).
+///
+/// Point is to seed the editor sliders with the material's authored
+/// values so the user starts from what the library says rather than
+/// mid-range guesses. Any change authors an override session-layer-
+/// side via the bridge.
+#[derive(Debug, Clone, Copy)]
+pub struct MaterialInputs {
+    pub diffuse_color: [f32; 3],
+    pub metallic: f32,
+    pub roughness: f32,
+    pub opacity: f32,
+    pub clearcoat: f32,
+    pub clearcoat_roughness: f32,
+    pub emission_color: [f32; 3],
+    pub emission_intensity: f32,
+}
+
+impl Default for MaterialInputs {
+    fn default() -> Self {
+        Self {
+            diffuse_color: [0.8, 0.8, 0.8],
+            metallic: 0.0,
+            roughness: 0.5,
+            opacity: 1.0,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.5,
+            emission_color: [0.0, 0.0, 0.0],
+            emission_intensity: 0.0,
+        }
+    }
+}
+
+/// Parse the first ~64KB of a `.usda` (or any UTF-8 USD text) for the
+/// common surface-shader inputs. Recognises both UsdPreviewSurface
+/// names (`diffuseColor`, `metallic`, `roughness`, `opacity`) and
+/// MaterialX standard_surface aliases (`base_color`, `metalness`,
+/// `specular_roughness`) — first match wins. Binary `.usdc` files
+/// return defaults.
+///
+/// Cheap text-pattern match — not a full parser. Misses textured
+/// inputs (`inputs:diffuseColor.connect = …`), which is fine: the
+/// sliders only drive literal values.
+pub fn read_material_inputs(path: &Path) -> MaterialInputs {
+    let mut inputs = MaterialInputs::default();
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return inputs;
+    };
+    use std::io::Read;
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let Ok(text) = std::str::from_utf8(&buf[..n]) else {
+        return inputs;
+    };
+    let scan_color = |needles: &[&str]| -> Option<[f32; 3]> {
+        for needle in needles {
+            for prefix in [
+                format!("color3f inputs:{needle} = ("),
+                format!("color3f inputs:{needle}= ("),
+            ] {
+                if let Some(start) = text.find(&prefix) {
+                    let tail = &text[start + prefix.len()..];
+                    if let Some(end) = tail.find(')') {
+                        let parts: Vec<f32> = tail[..end]
+                            .split(',')
+                            .filter_map(|s| s.trim().parse().ok())
+                            .collect();
+                        if parts.len() == 3 {
+                            return Some([parts[0], parts[1], parts[2]]);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    };
+    let scan_float = |needles: &[&str]| -> Option<f32> {
+        for needle in needles {
+            for prefix in [
+                format!("float inputs:{needle} = "),
+                format!("float inputs:{needle}= "),
+            ] {
+                if let Some(start) = text.find(&prefix) {
+                    let tail = &text[start + prefix.len()..];
+                    let end = tail
+                        .find(|c: char| c == '\n' || c == ' ')
+                        .unwrap_or(tail.len());
+                    if let Ok(v) = tail[..end].trim().parse::<f32>() {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    if let Some(c) = scan_color(&["diffuseColor", "base_color", "i_color"]) {
+        inputs.diffuse_color = c;
+    }
+    if let Some(v) = scan_float(&["metallic", "metalness"]) {
+        inputs.metallic = v;
+    }
+    if let Some(v) = scan_float(&["roughness", "specular_roughness"]) {
+        inputs.roughness = v;
+    }
+    if let Some(v) = scan_float(&["opacity"]) {
+        inputs.opacity = v;
+    }
+    // dlPrincipled has no clearcoat weight — `coating_thickness > 0`
+    // activates coat directly. Scan it so the slider reflects the
+    // authored thickness for those materials.
+    if let Some(v) = scan_float(&["clearcoat", "coat", "coating_thickness"]) {
+        inputs.clearcoat = v;
+    }
+    if let Some(v) = scan_float(&[
+        "clearcoatRoughness",
+        "coat_roughness",
+        "coating_roughness",
+    ]) {
+        inputs.clearcoat_roughness = v;
+    }
+    if let Some(c) = scan_color(&[
+        "emissiveColor",
+        "emission_color",
+        "incandescence",
+    ]) {
+        inputs.emission_color = c;
+    }
+    if let Some(v) = scan_float(&["emission", "incandescence_intensity"]) {
+        inputs.emission_intensity = v;
+    }
+    inputs
+}
+
 /// Cheap shader-id sniff of a USD material file. Filename hints
 /// first (`*.materialx.usd`, `*.osl.usd`, …); falls back to
 /// pattern-matching the first ~64 KB as text. Binary `.usdc` files
@@ -752,8 +959,15 @@ fn classify_material_file(path: &Path) -> MaterialKind {
     if lower_name.contains("materialx") || lower_name.contains(".mtlx") {
         return MaterialKind::MaterialX;
     }
-    if lower_name.contains(".osl.") || lower_name.contains("delight") {
-        return MaterialKind::OslDelight;
+    // `dl_` is our naming convention for any 3Delight Disney-style
+    // material (dlPrincipled / dlMetal / dlSkin / dlGlass / dlCarPaint
+    // / dlHairAndFur). `.osl.` / `delight` substrings catch the same
+    // family under alternative naming.
+    if lower_name.starts_with("dl_")
+        || lower_name.contains(".osl.")
+        || lower_name.contains("delight")
+    {
+        return MaterialKind::DlPrincipled;
     }
     if lower_name.contains("preview") || lower_name.contains(".up.") {
         return MaterialKind::UsdPreviewSurface;
@@ -775,10 +989,14 @@ fn classify_material_file(path: &Path) -> MaterialKind {
         return MaterialKind::MaterialX;
     }
     if head.contains("dlPrincipled")
+        || head.contains("dlMetal")
+        || head.contains("dlGlass")
+        || head.contains("dlSkin")
+        || head.contains("dlCarPaint")
+        || head.contains("dlHairAndFur")
         || head.contains("dlSubstance")
-        || head.contains("DelightSurface")
     {
-        return MaterialKind::OslDelight;
+        return MaterialKind::DlPrincipled;
     }
     MaterialKind::Other
 }

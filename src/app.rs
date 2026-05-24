@@ -90,6 +90,17 @@ pub struct App {
     /// override". Pushed to Hydra each frame (dirty-tracked) so the
     /// session-layer reference re-asserts itself after stage changes.
     selected_material_idx: Option<usize>,
+    /// Live values of the bound library material's editable inputs.
+    /// Seeded from the source's authored values when a material is
+    /// picked, then mutated by the editor sliders. Any change goes
+    /// through to Hydra via `set_external_material_input_*`, which
+    /// authors a session-layer override on top of the reference.
+    selected_material_inputs: Option<crate::assets::MaterialInputs>,
+    /// Last values pushed to the bridge — comparison gate so we only
+    /// fire `set_external_material_input_*` when the slider actually
+    /// moved. Hydra authors session-layer overrides on every set, so
+    /// per-frame redundant writes would churn the scene index.
+    last_material_inputs: Option<crate::assets::MaterialInputs>,
     /// Pixels-per-UV-unit for the UV atlas. Modified by scroll.
     uv_zoom: f32,
     /// Screen-pixel offset applied to the atlas (drag to pan).
@@ -637,7 +648,32 @@ impl eframe::App for App {
                                 bake_tab(ui, vp, frame);
                             }
                             PropertiesTab::Material => {
-                                slot_clicked = material_tab(ui, vp);
+                                // Two modes, mutually exclusive:
+                                //  * Library material bound → show
+                                //    the library editor only. The
+                                //    wgpu paint-slot / factor knobs
+                                //    aren't driving Hydra (the
+                                //    library material overrides
+                                //    them), so showing them would
+                                //    read as "duplicate material UI".
+                                //  * No library material → show the
+                                //    paint-pipeline UI (slot
+                                //    assignments + numeric factors).
+                                //    Library cards in the bottom
+                                //    pane are the path to the other
+                                //    mode.
+                                if let Some(idx) = self.selected_material_idx {
+                                    if let (Some(mat), Some(inputs)) = (
+                                        self.browser.materials.get(idx),
+                                        self.selected_material_inputs.as_mut(),
+                                    ) {
+                                        library_material_editor(ui, mat, inputs);
+                                    } else {
+                                        slot_clicked = material_tab(ui, vp);
+                                    }
+                                } else {
+                                    slot_clicked = material_tab(ui, vp);
+                                }
                             }
                             PropertiesTab::Project => {
                                 project_tab(ui, vp, frame, &mut self.status);
@@ -741,6 +777,7 @@ impl eframe::App for App {
                             let mat_ref = self
                                 .selected_material_idx
                                 .and_then(|i| self.browser.materials.get(i));
+                            let mat_inputs = self.selected_material_inputs.as_ref();
                             Self::draw_hydra_central(
                                 ui,
                                 frame,
@@ -756,6 +793,8 @@ impl eframe::App for App {
                                 &mut self.hydra_show_proxy,
                                 &mut self.hydra_show_guides,
                                 mat_ref,
+                                mat_inputs,
+                                &mut self.last_material_inputs,
                                 self.current_usd_path.as_deref(),
                                 &mut swap_renderer,
                             );
@@ -995,6 +1034,121 @@ fn lighting_tab(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
 
 fn bake_tab(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
     mesh_maps_panel(ui, vp, frame);
+}
+
+/// Editor for the currently-bound library material's commonly-edited
+/// inputs. Mutates `inputs` in place; the main loop notices the change
+/// and pushes session-layer overrides through the bridge.
+///
+/// Shape is intentionally minimal — one color picker + three sliders.
+/// Mirrors what a user wants right after applying a library material
+/// ("a touch redder, less metallic, rougher"). Extending to per-shader
+/// custom inputs (clearcoat, IOR, emission, MaterialX-specific stuff)
+/// is a follow-up that needs shader-id-aware UI dispatch.
+fn library_material_editor(
+    ui: &mut egui::Ui,
+    mat: &crate::assets::MaterialAsset,
+    inputs: &mut crate::assets::MaterialInputs,
+) {
+    ui.label(
+        egui::RichText::new(format!("Library: {}", mat.name))
+            .strong()
+            .color(egui::Color32::from_rgb(180, 220, 180)),
+    );
+    ui.weak(format!(
+        "{} · {}",
+        mat.kind.label(),
+        mat.source
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    ui.add_space(4.0);
+
+    // Each row only renders when the active shader kind has an input
+    // name for that concept (e.g. UsdPreviewSurface has no separate
+    // `emission_intensity` — its emission magnitude is folded into
+    // the `emissiveColor` channel values, so the row stays hidden).
+    let names = mat.kind.input_names();
+
+    if names.diffuse_color.is_some() {
+        ui.horizontal(|ui| {
+            ui.label("diffuse");
+            let mut color = inputs.diffuse_color;
+            if ui.color_edit_button_rgb(&mut color).changed() {
+                inputs.diffuse_color = color;
+            }
+        });
+    }
+    if names.metallic.is_some() {
+        ui.add(
+            egui::Slider::new(&mut inputs.metallic, 0.0..=1.0)
+                .text("metallic")
+                .show_value(true),
+        );
+    }
+    if names.roughness.is_some() {
+        ui.add(
+            egui::Slider::new(&mut inputs.roughness, 0.04..=1.0)
+                .text("roughness")
+                .show_value(true),
+        );
+    }
+    if names.opacity.is_some() {
+        ui.add(
+            egui::Slider::new(&mut inputs.opacity, 0.0..=1.0)
+                .text("opacity")
+                .show_value(true),
+        );
+    }
+
+    // Clearcoat + emission live behind a collapsing section so the
+    // editor stays compact for "just dial roughness" cases.
+    let has_clearcoat = names.clearcoat.is_some();
+    let has_emission = names.emission_color.is_some();
+    if has_clearcoat || has_emission {
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Advanced")
+            .id_salt("library_material_advanced")
+            .default_open(false)
+            .show(ui, |ui| {
+                if has_clearcoat {
+                    ui.add(
+                        egui::Slider::new(&mut inputs.clearcoat, 0.0..=1.0)
+                            .text("clearcoat")
+                            .show_value(true),
+                    );
+                }
+                if names.clearcoat_roughness.is_some() {
+                    ui.add(
+                        egui::Slider::new(&mut inputs.clearcoat_roughness, 0.0..=1.0)
+                            .text("clearcoat roughness")
+                            .show_value(true),
+                    );
+                }
+                if has_emission {
+                    ui.horizontal(|ui| {
+                        ui.label("emission");
+                        let mut color = inputs.emission_color;
+                        if ui.color_edit_button_rgb(&mut color).changed() {
+                            inputs.emission_color = color;
+                        }
+                    });
+                }
+                if names.emission_intensity.is_some() {
+                    ui.add(
+                        egui::Slider::new(&mut inputs.emission_intensity, 0.0..=10.0)
+                            .text("emission intensity")
+                            .show_value(true),
+                    );
+                }
+            });
+    }
+
+    ui.add_space(4.0);
+    if ui.button("Reset to library defaults").clicked() {
+        *inputs = crate::assets::read_material_inputs(&mat.source);
+    }
 }
 
 fn material_tab(ui: &mut egui::Ui, vp: &mut Viewport) -> Option<MaterialSlot> {
@@ -2251,6 +2405,17 @@ fn uv_view_body(
     let ix_max = uv_br.x.ceil() as i32;
     let iy_min = uv_tl.y.floor() as i32;
     let iy_max = uv_br.y.ceil() as i32;
+    // Hard cap the visible UDIM-grid extent so a zoomed-out / panned
+    // view doesn't generate tens of thousands of line segments and
+    // blow the egui index buffer (the wgpu validation error caps at
+    // 256 MB per buffer, hit by SimReady-class assets with a wide
+    // UV range). ±50 tiles covers every UDIM scheme we care about
+    // (1001..1100), and the user can pan within that.
+    const GRID_HALF: i32 = 50;
+    let ix_min = ix_min.max(-GRID_HALF);
+    let ix_max = ix_max.min(GRID_HALF);
+    let iy_min = iy_min.max(-GRID_HALF);
+    let iy_max = iy_max.min(GRID_HALF);
     for x in ix_min..=ix_max {
         let a = to_screen(egui::vec2(x as f32, iy_min as f32));
         let b = to_screen(egui::vec2(x as f32, iy_max as f32));
@@ -2262,29 +2427,50 @@ fn uv_view_body(
         painter.line_segment([a, b], grid_stroke);
     }
 
-    // UV wireframe — draw every triangle's three edges at the mesh's
-    // UV coordinates. Dedup-free for simplicity; egui batches shapes
-    // internally. Clipped to the panel rect so off-screen edges cost
-    // nothing. Drawn under the paint cursor but over the tile images.
+    // UV wireframe — every triangle becomes three line segments. egui
+    // expands each segment into ~4 vertices + 6 indices for AA, so a
+    // 100K-triangle mesh would land at ~1.8 M indices just for the
+    // wireframe — fine on its own, but the SimReady warehouse rack
+    // pushed past wgpu's per-buffer cap when combined with all the
+    // other UI in the same egui frame. Skip the overlay when the
+    // mesh is denser than a "small enough to read at a glance"
+    // threshold; show a hint so the user knows the toggle still
+    // worked, the renderer just declined the draw.
     if *show_wireframe {
         let mesh = vp.cpu_mesh();
-        let stroke = egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(100, 220, 255, 120),
-        );
-        let visible = rect.expand(8.0);
-        for &[i0, i1, i2] in &mesh.indices {
-            let uv0 = mesh.uvs[i0 as usize];
-            let uv1 = mesh.uvs[i1 as usize];
-            let uv2 = mesh.uvs[i2 as usize];
-            let a = to_screen(egui::vec2(uv0.x, uv0.y));
-            let b = to_screen(egui::vec2(uv1.x, uv1.y));
-            let c = to_screen(egui::vec2(uv2.x, uv2.y));
-            for (p0, p1) in [(a, b), (b, c), (c, a)] {
-                // Cheap AABB cull — skip segments entirely off-panel.
-                let seg = egui::Rect::from_two_pos(p0, p1);
-                if seg.intersects(visible) {
-                    painter.line_segment([p0, p1], stroke);
+        const TRI_CAP: usize = 50_000;
+        if mesh.indices.len() > TRI_CAP {
+            ui.ctx().debug_painter().text(
+                rect.center_top() + egui::vec2(0.0, 20.0),
+                egui::Align2::CENTER_TOP,
+                format!(
+                    "UV wireframe hidden — {} triangles exceed cap of {}",
+                    mesh.indices.len(),
+                    TRI_CAP,
+                ),
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(180),
+            );
+        } else {
+            let stroke = egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(100, 220, 255, 120),
+            );
+            let visible = rect.expand(8.0);
+            for &[i0, i1, i2] in &mesh.indices {
+                let uv0 = mesh.uvs[i0 as usize];
+                let uv1 = mesh.uvs[i1 as usize];
+                let uv2 = mesh.uvs[i2 as usize];
+                let a = to_screen(egui::vec2(uv0.x, uv0.y));
+                let b = to_screen(egui::vec2(uv1.x, uv1.y));
+                let c = to_screen(egui::vec2(uv2.x, uv2.y));
+                for (p0, p1) in [(a, b), (b, c), (c, a)] {
+                    // Cheap AABB cull — skip segments entirely
+                    // off-panel.
+                    let seg = egui::Rect::from_two_pos(p0, p1);
+                    if seg.intersects(visible) {
+                        painter.line_segment([p0, p1], stroke);
+                    }
                 }
             }
         }
@@ -2868,6 +3054,8 @@ impl App {
         show_proxy: &mut bool,
         show_guides: &mut bool,
         selected_material: Option<&crate::assets::MaterialAsset>,
+        material_inputs: Option<&crate::assets::MaterialInputs>,
+        last_material_inputs: &mut Option<crate::assets::MaterialInputs>,
         stage_path: Option<&std::path::Path>,
         request_swap_renderer: &mut bool,
     ) {
@@ -2965,7 +3153,13 @@ impl App {
         }
         let hydra = hydra_slot.as_mut().unwrap();
 
-        // Snapshot viewport state for this frame.
+        // Same auto camera-clipping as the wgpu side does inside
+        // `Viewport::show`. Hydra mode doesn't go through `show`, so
+        // without re-deriving near/far here the projection would
+        // stay at whatever the last wgpu frame set (or the original
+        // 0.01 / 1000 defaults if Hydra was the first mode used).
+        // Re-using the wgpu helper keeps the formula in lock-step.
+        vp.refresh_clip_planes();
         let view = vp.camera.view().to_cols_array_2d();
         let view_row = crate::hydra_view::glam_to_hydra(&view);
         let proj_row = crate::hydra_view::perspective_for_hydra(
@@ -3018,8 +3212,78 @@ impl App {
                 {
                     log::warn!("Hydra: set_external_material failed: {e:#}");
                 }
+                // Push the editor's live input snapshot through to
+                // the bridge, dirty-tracked against the last values
+                // we sent. Authoring session-layer overrides every
+                // frame would re-trigger a delegate Sync each time,
+                // so we only call when a slider has moved.
+                if let Some(inputs) = material_inputs {
+                    let dirty = match last_material_inputs {
+                        Some(prev) => prev.diffuse_color != inputs.diffuse_color
+                            || prev.metallic != inputs.metallic
+                            || prev.roughness != inputs.roughness
+                            || prev.opacity != inputs.opacity
+                            || prev.clearcoat != inputs.clearcoat
+                            || prev.clearcoat_roughness != inputs.clearcoat_roughness
+                            || prev.emission_color != inputs.emission_color
+                            || prev.emission_intensity != inputs.emission_intensity,
+                        None => true,
+                    };
+                    if dirty {
+                        // Use shader-id-specific input names so each
+                        // shader sees the override on the attribute
+                        // its network actually consumes. The bridge
+                        // is generic — it just sets `inputs:<name>`
+                        // on the first Shader child of the external
+                        // material — so picking the right `<name>`
+                        // per kind is the consumer's job here.
+                        // `None` means the shader doesn't expose
+                        // that concept; skip the call entirely.
+                        let names = mat.kind.input_names();
+                        if let Some(n) = names.diffuse_color {
+                            hydra.set_external_material_input_color3(
+                                n,
+                                inputs.diffuse_color,
+                            );
+                        }
+                        if let Some(n) = names.metallic {
+                            hydra.set_external_material_input_f(n, inputs.metallic);
+                        }
+                        if let Some(n) = names.roughness {
+                            hydra.set_external_material_input_f(n, inputs.roughness);
+                        }
+                        if let Some(n) = names.opacity {
+                            hydra.set_external_material_input_f(n, inputs.opacity);
+                        }
+                        if let Some(n) = names.clearcoat {
+                            hydra.set_external_material_input_f(n, inputs.clearcoat);
+                        }
+                        if let Some(n) = names.clearcoat_roughness {
+                            hydra.set_external_material_input_f(
+                                n,
+                                inputs.clearcoat_roughness,
+                            );
+                        }
+                        if let Some(n) = names.emission_color {
+                            hydra.set_external_material_input_color3(
+                                n,
+                                inputs.emission_color,
+                            );
+                        }
+                        if let Some(n) = names.emission_intensity {
+                            hydra.set_external_material_input_f(
+                                n,
+                                inputs.emission_intensity,
+                            );
+                        }
+                        *last_material_inputs = Some(*inputs);
+                    }
+                }
             }
-            None => hydra.clear_external_material(),
+            None => {
+                hydra.clear_external_material();
+                *last_material_inputs = None;
+            }
         }
         hydra.set_purposes(*show_render, *show_proxy, *show_guides);
         if let Err(e) = hydra.set_environment(env.as_ref()) {
@@ -3810,7 +4074,7 @@ impl App {
                         let kind_idx = match mat.kind {
                             crate::assets::MaterialKind::UsdPreviewSurface => 0,
                             crate::assets::MaterialKind::MaterialX => 1,
-                            crate::assets::MaterialKind::OslDelight => 2,
+                            crate::assets::MaterialKind::DlPrincipled => 2,
                             crate::assets::MaterialKind::Other => 3,
                         };
                         if !self.browser.material_kind_filter[kind_idx] {
@@ -3870,6 +4134,16 @@ impl App {
                 } else {
                     Some(i)
                 };
+            // Seed (or clear) the editable input snapshot so the
+            // settings pane shows the material's authored values
+            // immediately. Skipping the source-read on clear keeps
+            // the Hydra-side overrides cleared automatically by the
+            // dirty-tracker.
+            self.selected_material_inputs = self
+                .selected_material_idx
+                .and_then(|idx| self.browser.materials.get(idx))
+                .map(|mat| crate::assets::read_material_inputs(&mat.source));
+            self.last_material_inputs = None;
             // Materials only matter in Hydra mode; nudge the user if
             // they pick a material while in wgpu.
             if self.renderer_mode == RendererMode::Wgpu
