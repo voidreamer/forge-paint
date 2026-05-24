@@ -305,7 +305,7 @@ fn sample_env(dir: vec3<f32>, lod: f32) -> vec3<f32> {
 }
 
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
     let layer = uv_to_layer(in.uv);
 
     var base_color: vec3<f32>;
@@ -343,7 +343,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         n_tangent_space = normalize(mix(painted_n, baked_n, blend));
     }
 
-    let n_geom = normalize(in.world_normal);
+    // Render double-sided: flip the geometric normal on back-facing
+    // fragments so lighting works on both sides. USD assets routinely
+    // ship with mixed `orientation` tokens and mirror xforms; rather
+    // than relying on the loader getting every authored-normal
+    // convention right, we just light whichever side the camera sees.
+    // Tangent and bitangent stay consistent because they're rebuilt
+    // from the (possibly flipped) n_geom below.
+    var n_geom = normalize(in.world_normal);
+    if !front_facing {
+        n_geom = -n_geom;
+    }
     let t_raw = in.world_tangent.xyz;
     let t = normalize(t_raw - n_geom * dot(n_geom, t_raw));
     let b = cross(n_geom, t) * in.world_tangent.w;

@@ -70,11 +70,43 @@ fn main() -> eframe::Result<()> {
         std::process::exit(bake_cli::run(b));
     }
 
+    // Bump the wgpu device's per-buffer cap so dense meshes
+    // (SimReady-class assets, hi-res hero geometry) can land their
+    // vertex / index buffers in a single allocation. The downlevel
+    // default is 256 MB; modern desktop GPUs report several GBs, and
+    // refusing to push past 256 MB means assets with ~10 M verts
+    // fail to load with a `forge_paint_mesh_vb` validation error. We
+    // start from the adapter's reported limits (the actual GPU
+    // ceiling) and just raise `max_buffer_size` to 2 GB on top — the
+    // adapter-default for non-buffer limits stays unchanged.
+    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
+        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+            eframe::egui_wgpu::WgpuSetupCreateNew {
+                device_descriptor: std::sync::Arc::new(|adapter| {
+                    let mut limits = adapter.limits();
+                    // 2 GB — comfortably covers ~40 M verts at 48 B
+                    // each. Bump again if a real consumer hits it.
+                    const TWO_GB: u64 = 2 * 1024 * 1024 * 1024;
+                    limits.max_buffer_size = limits.max_buffer_size.max(TWO_GB);
+                    egui_wgpu::wgpu::DeviceDescriptor {
+                        label: Some("forge-paint device"),
+                        required_features: egui_wgpu::wgpu::Features::empty(),
+                        required_limits: limits,
+                        memory_hints: egui_wgpu::wgpu::MemoryHints::default(),
+                    }
+                }),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    };
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([900.0, 600.0])
             .with_title("forge-paint"),
+        wgpu_options,
         ..Default::default()
     };
 

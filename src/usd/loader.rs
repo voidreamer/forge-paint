@@ -181,20 +181,45 @@ struct UsdMesh {
     st: Option<StPrimvar>,
     normals: Option<NormalPrimvar>,
     world_xform: Mat4,
+    // UsdGeomMesh::orientation == "leftHanded" ⇒ face vertices wind CW.
+    // Tracked so the triangulator can flip the emit order (otherwise
+    // wgpu's `front_face = Ccw` rasterizer culls the visible side) and
+    // so `compute_face_normal` knows the cross-product points INWARD
+    // and needs negating to recover the outward-pointing normal.
+    left_handed: bool,
 }
 
 fn build_intermediate(m: &rust_usd::Mesh) -> Result<UsdMesh> {
     let path = m.prim_path();
 
-    // USD authors `local_to_world` as row-major; rust-usd hands it back
-    // as [[f32;4];4] in the same convention. glam::Mat4 is column-major.
+    // USD uses row-vector convention with row-major storage:
+    // `v_world_row = v_local_row * M_USD`, translation lives in
+    // `M_USD[3]` (row 3). rust-usd hands it back as `[[f32; 4]; 4]`
+    // indexed `lt_w[row][col]` — so `lt_w[3] = [Tx, Ty, Tz, 1]`.
+    //
+    // glam uses column-vector convention with column-major storage:
+    // `v_world_col = M_glam * v_local_col`, translation in
+    // `M_glam.col(3)`. The semantic conversion from USD's row-vector
+    // form to glam's column-vector form IS a transpose:
+    //   M_glam = M_USD^T,  i.e.  M_glam.col(c) = M_USD.row(c)
+    //
+    // Since `lt_w[c]` is already a `[f32; 4]` carrying USD's row c,
+    // feeding it straight into `from_cols_array_2d` does the right
+    // thing — that constructor reads `data[c]` as glam's column c.
+    //
+    // Previously this code did a per-element shuffle
+    // (`data[c] = [lt_w[0][c], lt_w[1][c], lt_w[2][c], lt_w[3][c]]`)
+    // that's actually a transpose-of-a-transpose, equivalent to
+    // skipping the convention conversion entirely. The result: any
+    // mesh with a non-trivial xform (non-identity rotation /
+    // non-zero translation) landed in the wrong world position, and
+    // its normal matrix's rotation was effectively flipped, so the
+    // normals on those meshes faced the wrong way. Hydra reads the
+    // same stage through its own scene index — which DOES the
+    // convention swap correctly — which is why the same asset
+    // looked right on the Hydra side and wrong in wgpu.
     let lt_w = m.local_to_world();
-    let world_xform = Mat4::from_cols_array_2d(&[
-        [lt_w[0][0], lt_w[1][0], lt_w[2][0], lt_w[3][0]],
-        [lt_w[0][1], lt_w[1][1], lt_w[2][1], lt_w[3][1]],
-        [lt_w[0][2], lt_w[1][2], lt_w[2][2], lt_w[3][2]],
-        [lt_w[0][3], lt_w[1][3], lt_w[2][3], lt_w[3][3]],
-    ]);
+    let world_xform = Mat4::from_cols_array_2d(&lt_w);
 
     let normals_data = m.normals_xyz();
     let normals = if normals_data.is_empty() {
@@ -233,6 +258,8 @@ fn build_intermediate(m: &rust_usd::Mesh) -> Result<UsdMesh> {
         })
     };
 
+    let left_handed = m.orientation() == "leftHanded";
+
     Ok(UsdMesh {
         path,
         points: m.points_xyz(),
@@ -241,6 +268,7 @@ fn build_intermediate(m: &rust_usd::Mesh) -> Result<UsdMesh> {
         st,
         normals,
         world_xform,
+        left_handed,
     })
 }
 
@@ -261,6 +289,15 @@ fn triangulate(m: &UsdMesh) -> Result<CpuMesh> {
     }
 
     let normal_mat = normal_matrix_from_xform(&m.world_xform);
+
+    // wgpu's pipeline culls back-faces using screen-space winding
+    // (front_face defaults to Ccw). The mesh's effective winding in
+    // world / screen space flips for either a leftHanded orientation
+    // OR a mirror xform — XOR because two flips cancel out. When the
+    // effective winding ends up CW we need to swap the emitted index
+    // order so the rasterizer sees CCW and keeps the visible side.
+    let xform_negative_det = Mat3::from_mat4(m.world_xform).determinant() < 0.0;
+    let flip_winding = m.left_handed ^ xform_negative_det;
 
     let mut positions: Vec<Vec3> = Vec::new();
     let mut normals: Vec<Vec3> = Vec::new();
@@ -316,7 +353,11 @@ fn triangulate(m: &UsdMesh) -> Result<CpuMesh> {
                 &mut normals,
                 &mut uvs,
             );
-            indices.push([pivot_out, a_out, b_out]);
+            if flip_winding {
+                indices.push([pivot_out, b_out, a_out]);
+            } else {
+                indices.push([pivot_out, a_out, b_out]);
+            }
         }
 
         fv_cursor += count;
@@ -332,7 +373,15 @@ fn triangulate(m: &UsdMesh) -> Result<CpuMesh> {
 
 fn normal_matrix_from_xform(m: &Mat4) -> Mat3 {
     let m3 = Mat3::from_mat4(*m);
-    m3.inverse().transpose()
+    let it = m3.inverse().transpose();
+    // Inverse-transpose preserves perpendicularity through a
+    // negative-determinant (mirror / odd-scale) xform but the
+    // resulting normal flips to point INTO the surface in world
+    // space. Negate so it stays outward — Hydra/Storm apply the same
+    // correction when reading the stage, which is why mirrored
+    // sub-meshes look right in the Hydra view but were wrong on the
+    // wgpu side.
+    if m3.determinant() < 0.0 { -it } else { it }
 }
 
 fn compute_face_normal(m: &UsdMesh, off: usize, count: usize) -> Vec3 {
@@ -345,7 +394,11 @@ fn compute_face_normal(m: &UsdMesh, off: usize, count: usize) -> Vec3 {
     let p0 = Vec3::from_array(m.points[i0]);
     let p1 = Vec3::from_array(m.points[i1]);
     let p2 = Vec3::from_array(m.points[i2]);
-    (p1 - p0).cross(p2 - p0).normalize_or_zero()
+    let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+    // leftHanded winds CW from the outside, so the cross product
+    // yields the inward normal. Flip so the per-face fallback (used
+    // when no authored normals primvar exists) still points outward.
+    if m.left_handed { -n } else { n }
 }
 
 #[allow(clippy::too_many_arguments)]

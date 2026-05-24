@@ -34,6 +34,11 @@ pub fn screen_to_ray(
 /// Möller-Trumbore ray-triangle intersection.
 /// Returns (t, u, v) where t is parametric distance along `dir`, and (u, v)
 /// are barycentric coords for `v1`/`v2` (w = 1 - u - v corresponds to `v0`).
+///
+/// Double-sided — `det.abs() < EPS` just guards the parallel-ray
+/// degenerate. The wgpu pipeline renders double-sided too (paint
+/// workflows always want both sides paintable), so picking matches
+/// what the user sees.
 fn ray_tri(
     orig: Vec3,
     dir: Vec3,

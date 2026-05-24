@@ -198,6 +198,13 @@ pub struct Viewport {
 
     pub tile_resolution: u32,
 
+    /// Cached scene bounding-sphere radius from the most-recent mesh
+    /// load. Drives the per-frame camera near/far recomputation so
+    /// large models (SimReady-class assets, hi-res hero geometry)
+    /// don't get clipped by the OrbitCamera's fixed 0.01 / 1000
+    /// defaults. Updated whenever `load_*` rebuilds the GPU mesh.
+    scene_radius: f32,
+
     /// Last successful pick this frame, if any — surfaced so the UI can show
     /// the cursor UV / tile.
     pub last_hit_uv: Option<[f32; 2]>,
@@ -329,6 +336,7 @@ impl Viewport {
         let mut camera = OrbitCamera::default();
         camera.target = gpu.center;
         camera.distance = (gpu.radius * 2.5).max(1.5);
+        let scene_radius = gpu.radius.max(0.001);
 
         let accel = MeshAccel::build(cpu);
         Self {
@@ -391,6 +399,10 @@ impl Viewport {
             grading_saturation: 1.10,
             grading_clarity: 0.15,
             tile_resolution,
+            // gpu is moved into `mesh` above; the radius is read
+            // before then via `gpu.radius` in the camera-init block,
+            // so we stash a Copy primitive of it here.
+            scene_radius,
             last_hit_uv: None,
             last_hit_tile: None,
             last_paint_pos: None,
@@ -400,10 +412,32 @@ impl Viewport {
         }
     }
 
+    /// Auto camera clipping — derive `z_near` / `z_far` from the
+    /// camera's current `distance` and the scene's bounding-sphere
+    /// `scene_radius`. Same idea usdview uses: near pulled in just
+    /// shy of the nearest visible point on the model, far pushed out
+    /// past the back. Called per-frame from both `vp.show` (wgpu) and
+    /// the Hydra dispatch so the projection stays valid no matter
+    /// which renderer is driving the central viewport.
+    ///
+    /// Without this, the fixed 0.01 / 1000 defaults break either
+    /// way: large assets (SimReady props, the train) clip in front,
+    /// and tiny meshes lose depth-buffer precision because the far
+    /// plane is way too distant for what's actually visible.
+    pub fn refresh_clip_planes(&mut self) {
+        let r = self.scene_radius.max(1e-3);
+        let dist = self.camera.distance;
+        let near = ((dist - r) * 0.5).max(r * 0.001).max(0.001);
+        let far = (dist + r) * 1.5 + r;
+        self.camera.z_near = near;
+        self.camera.z_far = far;
+    }
+
     pub fn set_mesh(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, cpu: &CpuMesh) {
         let gpu = GpuMesh::from_cpu(device, cpu);
         self.camera.target = gpu.center;
         self.camera.distance = (gpu.radius * 2.5).max(1.5);
+        self.scene_radius = gpu.radius.max(0.001);
         self.mesh = gpu;
         self.cpu_mesh = cpu.clone();
         self.accel = MeshAccel::build(cpu);
@@ -951,6 +985,7 @@ impl Viewport {
             self.renderer.ensure_hdr(&render_state.device, w, h);
             self.renderer.ensure_ldr(&render_state.device, w, h);
 
+            self.refresh_clip_planes();
             let aspect = w as f32 / h as f32;
             let view_proj = self.camera.view_proj(aspect);
             let inv_view_proj = view_proj.inverse();

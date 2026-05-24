@@ -360,7 +360,18 @@ impl Renderer {
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
+                // Paint workflows render double-sided — Substance, Mari
+                // and Mudbox all do this. Sidesteps the orientation
+                // (leftHanded) and mirror-xform corner cases that USD
+                // assets routinely ship with: even with the loader's
+                // winding fix, a handful of meshes still came out
+                // reversed because their authored normals were exported
+                // against an inconsistent convention. With cull off,
+                // the fragment shader flips normals via
+                // `@builtin(front_facing)` so back-faces light the
+                // same as front-faces and the user always sees lit
+                // geometry regardless of authored convention.
+                cull_mode: None,
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
