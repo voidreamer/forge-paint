@@ -25,7 +25,7 @@ rust-usd = "0.0.4"
 # day-to-day dev uses the source tree and CI (once crates.io has
 # 0.0.3) uses the published wheel. Bump the version requirement when
 # the bridge gets new API.
-hydra-rs = "0.0.5"
+hydra-rs = "0.0.6"
 
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu"] }
 egui = "0.31"

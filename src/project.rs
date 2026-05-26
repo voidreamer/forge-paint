@@ -75,6 +75,13 @@ pub struct BoundMaterialBinding {
     /// Snapshot of the live editor inputs at save time. Replayed
     /// through `set_external_material_input_*` on next-frame draw.
     pub inputs: MaterialInputs,
+    /// SdfPaths the binding is restricted to. Empty = stage-wide
+    /// (every UsdGeomMesh gets the binding). Non-empty = the
+    /// listed prims only; Xform / Scope entries auto-include their
+    /// Mesh descendants (Solaris-style cascade) when hydra-rs
+    /// authors the bindings.
+    #[serde(default)]
+    pub target_prims: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

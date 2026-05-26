@@ -97,6 +97,11 @@ pub struct HydraView {
     /// material is bound. Compared against to skip bridge calls
     /// when the selection hasn't changed.
     last_external_material: Option<(std::path::PathBuf, String)>,
+    /// Last target-prims list authored via
+    /// `set_external_material_on_prims`. Empty == stage-wide, which
+    /// is also the legacy `set_external_material` semantics, so a
+    /// switch between the two re-authors correctly.
+    last_target_prims: Vec<String>,
 
     /// Wall-clock timestamp of the most-recent successful
     /// `render(...)` call. The caller throttles re-render frequency
@@ -158,6 +163,7 @@ impl HydraView {
             last_purposes: None,
             last_user_lights: Vec::new(),
             last_external_material: None,
+            last_target_prims: Vec::new(),
             last_render: None,
             last_pixels: None,
         })
@@ -245,6 +251,35 @@ impl HydraView {
             .set_external_material(source, prim_path)
             .map_err(|e| anyhow::anyhow!("set_external_material failed: {}", e.what()))?;
         self.last_external_material = Some(next);
+        Ok(())
+    }
+
+    /// Per-prim variant of `set_external_material`. Empty
+    /// `target_prims` ⇒ stage-wide (same as the legacy method).
+    /// Non-empty ⇒ bind only to the listed SdfPaths; Xform / Scope
+    /// entries cascade to descendant Mesh prims hydra-rs-side.
+    pub fn set_external_material_on_prims(
+        &mut self,
+        source: &Path,
+        prim_path: &str,
+        target_prims: &[String],
+    ) -> Result<()> {
+        // Skip the redundant authoring if neither source nor scope
+        // has moved. Tracked separately from last_external_material
+        // so a switch between stage-wide and per-prim still re-fires.
+        let src_next = (source.to_path_buf(), prim_path.to_string());
+        let same_src = self.last_external_material.as_ref() == Some(&src_next);
+        let same_scope = self.last_target_prims.as_slice() == target_prims;
+        if same_src && same_scope {
+            return Ok(());
+        }
+        self.renderer
+            .set_external_material_on_prims(source, prim_path, target_prims)
+            .map_err(|e| {
+                anyhow::anyhow!("set_external_material_on_prims failed: {}", e.what())
+            })?;
+        self.last_external_material = Some(src_next);
+        self.last_target_prims = target_prims.to_vec();
         Ok(())
     }
 

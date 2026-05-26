@@ -113,6 +113,17 @@ pub struct App {
     /// moved. Hydra authors session-layer overrides on every set, so
     /// per-frame redundant writes would churn the scene index.
     last_material_inputs: Option<crate::assets::MaterialInputs>,
+    /// Scope of the current library-material binding. Empty = the
+    /// binding is stage-wide (every UsdGeomMesh, the legacy
+    /// default after clicking a chip). Non-empty = restricted to
+    /// these SdfPaths; Xform / Scope entries cascade to their
+    /// Mesh descendants in hydra-rs. Edited via the "Bound to:"
+    /// controls in the bottom material editor.
+    selected_material_target_prims: Vec<String>,
+    /// Last `target_prims` pushed through to Hydra, so we can dirty-
+    /// check and avoid re-authoring the binding network every
+    /// frame when nothing has changed.
+    last_pushed_target_prims: Vec<String>,
     /// Node-graph state for the Material Editor. Rebuilt when the
     /// user binds a new library material (chip click); preserved
     /// across frames so node positions and texture wiring stick.
@@ -851,6 +862,7 @@ impl eframe::App for App {
                                 .and_then(|i| self.browser.materials.get(i)),
                             self.selected_material_inputs.as_mut(),
                         ) {
+                            let browser_sel = self.stage_browser.effective_selection();
                             egui::TopBottomPanel::bottom("material_editor_panel")
                                 .default_height(320.0)
                                 .resizable(true)
@@ -861,6 +873,8 @@ impl eframe::App for App {
                                         inputs,
                                         &mut self.material_graph,
                                         &mut self.material_editor_undocked,
+                                        &mut self.selected_material_target_prims,
+                                        &browser_sel,
                                     );
                                 });
                         }
@@ -898,6 +912,8 @@ impl eframe::App for App {
                                 mat_ref,
                                 mat_inputs,
                                 &mut self.last_material_inputs,
+                                &self.selected_material_target_prims,
+                                &mut self.last_pushed_target_prims,
                                 self.current_usd_path.as_deref(),
                                 &mut swap_renderer,
                             );
@@ -983,12 +999,15 @@ impl eframe::App for App {
                     .default_size(egui::vec2(720.0, 480.0))
                     .resizable(true)
                     .show(ctx, |ui| {
+                        let browser_sel = self.stage_browser.effective_selection();
                         material_editor_body(
                             ui,
                             &mat,
                             inputs,
                             &mut self.material_graph,
                             &mut self.material_editor_undocked,
+                            &mut self.selected_material_target_prims,
+                            &browser_sel,
                         );
                     });
                 if !open {
@@ -1197,12 +1216,15 @@ fn bake_tab(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
 /// followed by the egui-snarl node graph. Reused by both the docked
 /// bottom-strip panel and the floating undocked window so the two
 /// render identically.
+#[allow(clippy::too_many_arguments)]
 fn material_editor_body(
     ui: &mut egui::Ui,
     mat: &crate::assets::MaterialAsset,
     inputs: &mut crate::assets::MaterialInputs,
     graph: &mut crate::material_graph::MaterialGraph,
     undocked: &mut bool,
+    target_prims: &mut Vec<String>,
+    browser_selection: &std::collections::HashSet<String>,
 ) {
     ui.horizontal(|ui| {
         ui.strong(&mat.name);
@@ -1215,6 +1237,43 @@ fn material_editor_body(
             };
             if ui.button(label).on_hover_text(tip).clicked() {
                 *undocked = !*undocked;
+            }
+        });
+    });
+    // Binding scope row — switch between stage-wide and a subset
+    // of prims drawn from the current Stage browser selection.
+    // Empty target_prims = stage-wide (the default after a chip
+    // click). hydra-rs's `set_external_material_on_prims` cascades
+    // selected Xforms/Scopes to descendant meshes.
+    ui.horizontal(|ui| {
+        ui.label("Bound to:");
+        if target_prims.is_empty() {
+            ui.weak("entire stage");
+        } else {
+            ui.weak(format!("{} prim(s)", target_prims.len()));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let have_sel = !browser_selection.is_empty();
+            let assign_label = if have_sel {
+                format!("Assign to selection ({})", browser_selection.len())
+            } else {
+                "Assign to selection".to_string()
+            };
+            if ui
+                .add_enabled(have_sel, egui::Button::new(assign_label))
+                .on_hover_text(
+                    "Restrict this material's binding to the prims highlighted in the Stage browser",
+                )
+                .clicked()
+            {
+                *target_prims = browser_selection.iter().cloned().collect();
+            }
+            if ui
+                .add_enabled(!target_prims.is_empty(), egui::Button::new("Stage-wide"))
+                .on_hover_text("Bind this material to every UsdGeomMesh in the stage")
+                .clicked()
+            {
+                target_prims.clear();
             }
         });
     });
@@ -3059,10 +3118,13 @@ impl App {
                                 Some(i) => {
                                     self.selected_material_idx = Some(i);
                                     self.selected_material_inputs = Some(binding.inputs);
+                                    self.selected_material_target_prims =
+                                        binding.target_prims.clone();
                                     // Force a Hydra push next frame by
                                     // clearing the dirty-tracking
                                     // baseline.
                                     self.last_material_inputs = None;
+                                    self.last_pushed_target_prims.clear();
                                 }
                                 None => log::warn!(
                                     "sidecar bound_material source not in library: {}",
@@ -3134,6 +3196,9 @@ impl App {
                                 inputs: self
                                     .selected_material_inputs
                                     .unwrap_or_default(),
+                                target_prims: self
+                                    .selected_material_target_prims
+                                    .clone(),
                             });
                     }
                 }
@@ -3184,6 +3249,8 @@ impl App {
         selected_material: Option<&crate::assets::MaterialAsset>,
         material_inputs: Option<&crate::assets::MaterialInputs>,
         last_material_inputs: &mut Option<crate::assets::MaterialInputs>,
+        target_prims: &[String],
+        last_target_prims: &mut Vec<String>,
         stage_path: Option<&std::path::Path>,
         request_swap_renderer: &mut bool,
     ) {
@@ -3335,10 +3402,15 @@ impl App {
         // original bindings take over again.
         match selected_material {
             Some(mat) => {
-                if let Err(e) =
-                    hydra.set_external_material(&mat.source, &mat.prim_path)
-                {
-                    log::warn!("Hydra: set_external_material failed: {e:#}");
+                if let Err(e) = hydra.set_external_material_on_prims(
+                    &mat.source,
+                    &mat.prim_path,
+                    target_prims,
+                ) {
+                    log::warn!("Hydra: set_external_material_on_prims failed: {e:#}");
+                }
+                if last_target_prims.as_slice() != target_prims {
+                    *last_target_prims = target_prims.to_vec();
                 }
                 // Push the editor's live input snapshot through to
                 // the bridge, dirty-tracked against the last values
@@ -4272,6 +4344,11 @@ impl App {
                 .and_then(|idx| self.browser.materials.get(idx))
                 .map(|mat| crate::assets::read_material_inputs(&mat.source));
             self.last_material_inputs = None;
+            // New chip means a fresh binding — drop any per-prim
+            // scope the previous material had so we don't silently
+            // restrict the new one to the old material's targets.
+            self.selected_material_target_prims.clear();
+            self.last_pushed_target_prims.clear();
             // Reset the node graph for the new material — fresh
             // Shader+Output pair, any texture nodes the previous
             // binding had get dropped. (Restoring saved graph state
