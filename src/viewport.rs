@@ -123,6 +123,7 @@ pub struct Viewport {
     /// changes; compared against `MeshMaps::baked_at_revision` so the
     /// panel can mark maps stale.
     pub mesh_revision: u64,
+
     /// Optional high-poly source for low→high projection bakes. Loaded
     /// from disk via the Mesh maps panel; pre-converted to texture-
     /// baker's `Mesh` once so the per-tile loop can share the BVH input.
@@ -271,6 +272,17 @@ impl Default for BrushState {
 }
 
 impl Viewport {
+    /// Forward stage-browser selection into the GPU mesh's per-vert
+    /// highlight mask. App dirty-tracks the set so this only runs
+    /// when something actually changed.
+    pub fn set_selection(
+        &self,
+        queue: &wgpu::Queue,
+        selected: &std::collections::HashSet<String>,
+    ) {
+        self.mesh.set_selection(queue, selected);
+    }
+
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, cpu: &CpuMesh) -> Self {
         let renderer = Renderer::new(device);
         // Post now writes to the LDR intermediate; FXAA writes to the
@@ -662,6 +674,10 @@ impl Viewport {
                 ao_intensity: self.ao_intensity,
             },
             layers,
+            // Library-material binding is App-level state — the
+            // caller (App::save_to_work_dir) augments this field
+            // after build_sidecar returns.
+            bound_material: None,
         }
     }
 
@@ -1568,6 +1584,7 @@ impl Viewport {
 
                 pass.set_pipeline(&self.renderer.pipeline);
                 pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.mesh.selection_buffer.slice(..));
                 pass.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.mesh.index_count, 0, 0..1);
 

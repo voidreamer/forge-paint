@@ -106,14 +106,24 @@ pub fn load_stage_merged(path: &Path) -> Result<CpuMesh> {
     let loaded = load_stage(path)?;
     let count = loaded.len();
     let mut iter = loaded.into_iter();
-    let first = iter.next().unwrap().mesh;
+    let LoadedMesh {
+        path: first_path,
+        mesh: first,
+    } = iter.next().unwrap();
+    let mut out = first;
+    let first_count = out.positions.len() as u32;
+    out.prim_ranges.push(crate::mesh::PrimRange {
+        prim_path: first_path,
+        vert_start: 0,
+        vert_count: first_count,
+    });
     if count == 1 {
-        return Ok(first);
+        return Ok(out);
     }
 
-    let mut out = first;
-    for LoadedMesh { mesh, .. } in iter {
+    for LoadedMesh { path: ppath, mesh } in iter {
         let offset = out.positions.len() as u32;
+        let added = mesh.positions.len() as u32;
         out.positions.extend(mesh.positions);
         out.normals.extend(mesh.normals);
         out.uvs.extend(mesh.uvs);
@@ -121,6 +131,11 @@ pub fn load_stage_merged(path: &Path) -> Result<CpuMesh> {
             out.indices
                 .push([tri[0] + offset, tri[1] + offset, tri[2] + offset]);
         }
+        out.prim_ranges.push(crate::mesh::PrimRange {
+            prim_path: ppath,
+            vert_start: offset,
+            vert_count: added,
+        });
     }
     log::info!("merged {count} mesh prims into a single CpuMesh");
     Ok(out)
@@ -368,6 +383,7 @@ fn triangulate(m: &UsdMesh) -> Result<CpuMesh> {
         normals,
         uvs,
         indices,
+        prim_ranges: Vec::new(),
     })
 }
 

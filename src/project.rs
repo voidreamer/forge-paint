@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::assets::MaterialInputs;
 use crate::bake::integration::BakeSettings;
 use crate::paint::smart_mask::SmartMaskParams;
 
@@ -37,6 +38,15 @@ pub struct ProjectSidecar {
     pub material: MaterialSection,
     #[serde(default)]
     pub layers: Vec<LayerSection>,
+    /// Library material the user bound through the Materials pane
+    /// (gallery chip click), plus any per-input slider tweaks. `None`
+    /// means no library material is bound — the stage's authored
+    /// material (or painted-material fallback) takes over. Restored
+    /// at stage load by looking up the matching `MaterialAsset` in
+    /// the freshly-scanned library and replaying the inputs through
+    /// hydra-rs's `set_external_material*` path on the next frame.
+    #[serde(default)]
+    pub bound_material: Option<BoundMaterialBinding>,
 }
 
 impl Default for ProjectSidecar {
@@ -46,8 +56,25 @@ impl Default for ProjectSidecar {
             bake: BakeSection::default(),
             material: MaterialSection::default(),
             layers: Vec::new(),
+            bound_material: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundMaterialBinding {
+    /// Library .usd / .usda / .usdc the binding references. Absolute
+    /// path so the binding survives running forge-paint from a
+    /// different cwd. If the file has moved by the time the sidecar
+    /// is reloaded, the binding is dropped (with a warning) rather
+    /// than crashing.
+    pub source: PathBuf,
+    /// `defaultPrim` (or explicit prim path within `source`) — the
+    /// `Material` prim hydra-rs's `set_external_material` references.
+    pub prim_path: String,
+    /// Snapshot of the live editor inputs at save time. Replayed
+    /// through `set_external_material_input_*` on next-frame draw.
+    pub inputs: MaterialInputs,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

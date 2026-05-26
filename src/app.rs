@@ -38,6 +38,18 @@ pub struct App {
 
     /// Docked 2D UV painting view. Splits the central area when on.
     show_uv_view: bool,
+    /// Left-side dockable stage browser (read-only tree view of the
+    /// loaded USD prim hierarchy). Off by default — switch on via
+    /// View → Stage browser. Dock pattern mirrors the UV view.
+    show_stage_browser: bool,
+    stage_browser_undocked: bool,
+    stage_browser: crate::stage_browser::StageBrowser,
+    /// Last selection set pushed to the viewport's vertex-buffer
+    /// highlight mask. Compared against the browser's current set
+    /// every frame; the GPU write only fires on change so we don't
+    /// re-upload the mask (12+ MB on SimReady-class assets) per
+    /// repaint.
+    last_pushed_selection: std::collections::HashSet<String>,
     /// Which renderer owns the central viewport this frame. Solaris-
     /// style toggle (one viewport, swap between rasteriser and
     /// path-tracer) rather than side-by-side panels — keeps full
@@ -101,6 +113,15 @@ pub struct App {
     /// moved. Hydra authors session-layer overrides on every set, so
     /// per-frame redundant writes would churn the scene index.
     last_material_inputs: Option<crate::assets::MaterialInputs>,
+    /// Node-graph state for the Material Editor. Rebuilt when the
+    /// user binds a new library material (chip click); preserved
+    /// across frames so node positions and texture wiring stick.
+    /// Persisted via the project sidecar.
+    material_graph: crate::material_graph::MaterialGraph,
+    /// Material editor pops out into a floating window when true,
+    /// otherwise it sits as a bottom strip inside the central area
+    /// (same dock pattern as the UV view).
+    material_editor_undocked: bool,
     /// Pixels-per-UV-unit for the UV atlas. Modified by scroll.
     uv_zoom: f32,
     /// Screen-pixel offset applied to the atlas (drag to pan).
@@ -287,6 +308,18 @@ impl eframe::App for App {
             }
         }
 
+        // Stage-browser selection → viewport vertex-highlight mask.
+        // Dirty-tracked against `last_pushed_selection` so we only
+        // write the buffer when the set actually changes (else the
+        // train asset would push 12 MB / frame for no reason).
+        if let (Some(vp), Some(rs)) = (&self.viewport, frame.wgpu_render_state()) {
+            let now = self.stage_browser.selected();
+            if now != &self.last_pushed_selection {
+                vp.set_selection(&rs.queue, now);
+                self.last_pushed_selection = now.clone();
+            }
+        }
+
         // First frame with a live viewport: import bundled stencils +
         // displacement maps into the asset browser.
         if !self.asset_scan_done && self.viewport.is_some() {
@@ -363,6 +396,12 @@ impl eframe::App for App {
                 ui.menu_button("View", |ui| {
                     if ui
                         .checkbox(&mut self.show_uv_view, "UV view")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                    }
+                    if ui
+                        .checkbox(&mut self.show_stage_browser, "Stage browser")
                         .clicked()
                     {
                         ui.close_menu();
@@ -609,6 +648,26 @@ impl eframe::App for App {
             self.switch_tool(t, frame);
         }
 
+        // Stage browser — left of the tool strip (closer to the
+        // viewport's edge). Mounted as its own SidePanel so it has
+        // independent resize handles and doesn't fight the tool
+        // strip's fixed-width layout. Only shown when toggled on
+        // AND docked; the floating Window below handles the
+        // undocked case.
+        if self.show_stage_browser && !self.stage_browser_undocked {
+            if let Some(path) = self.current_usd_path.clone() {
+                self.stage_browser.ensure_loaded(&path);
+            }
+            egui::SidePanel::left("stage_browser_panel")
+                .resizable(true)
+                .default_width(260.0)
+                .min_width(180.0)
+                .show(ctx, |ui| {
+                    self.stage_browser
+                        .show(ui, &mut self.stage_browser_undocked);
+                });
+        }
+
         // Outer tab strip (right-most) — fixed width icon column, same
         // styling as the left tool column so the window reads as a pair
         // of icon strips bracketing the viewport.
@@ -663,11 +722,29 @@ impl eframe::App for App {
                                 //    pane are the path to the other
                                 //    mode.
                                 if let Some(idx) = self.selected_material_idx {
-                                    if let (Some(mat), Some(inputs)) = (
-                                        self.browser.materials.get(idx),
-                                        self.selected_material_inputs.as_mut(),
-                                    ) {
-                                        library_material_editor(ui, mat, inputs);
+                                    if let Some(mat) = self.browser.materials.get(idx)
+                                    {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Library: {}",
+                                                mat.name
+                                            ))
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(180, 220, 180)),
+                                        );
+                                        ui.weak(format!(
+                                            "{} · {}",
+                                            mat.kind.label(),
+                                            mat.source
+                                                .file_name()
+                                                .map(|s| s.to_string_lossy().into_owned())
+                                                .unwrap_or_default()
+                                        ));
+                                        ui.add_space(8.0);
+                                        ui.weak(
+                                            "Live edits live in the Material \
+                                             Editor at the bottom of the viewport.",
+                                        );
                                     } else {
                                         slot_clicked = material_tab(ui, vp);
                                     }
@@ -762,6 +839,32 @@ impl eframe::App for App {
                             apply_uv_channel_to_brush(self.uv_channel, vp);
                         }
                     }
+                    // Material Editor — bottom strip when docked. Same
+                    // pattern as the UV view above. Only renders when
+                    // a library material is bound; otherwise the strip
+                    // would sit empty and steal vertical room.
+                    if self.selected_material_idx.is_some()
+                        && !self.material_editor_undocked
+                    {
+                        if let (Some(mat), Some(inputs)) = (
+                            self.selected_material_idx
+                                .and_then(|i| self.browser.materials.get(i)),
+                            self.selected_material_inputs.as_mut(),
+                        ) {
+                            egui::TopBottomPanel::bottom("material_editor_panel")
+                                .default_height(320.0)
+                                .resizable(true)
+                                .show_inside(ui, |ui| {
+                                    material_editor_body(
+                                        ui,
+                                        mat,
+                                        inputs,
+                                        &mut self.material_graph,
+                                        &mut self.material_editor_undocked,
+                                    );
+                                });
+                        }
+                    }
                     let mut swap_renderer = false;
                     match self.renderer_mode {
                         RendererMode::Wgpu => {
@@ -837,9 +940,63 @@ impl eframe::App for App {
                 }
             });
 
+        // Floating Stage browser. Closing the window via [×] hides
+        // the browser entirely (same as unchecking View → Stage
+        // browser).
+        if self.show_stage_browser && self.stage_browser_undocked {
+            if let Some(path) = self.current_usd_path.clone() {
+                self.stage_browser.ensure_loaded(&path);
+            }
+            let mut open = true;
+            egui::Window::new("Stage browser")
+                .open(&mut open)
+                .default_size(egui::vec2(360.0, 560.0))
+                .resizable(true)
+                .show(ctx, |ui| {
+                    self.stage_browser
+                        .show(ui, &mut self.stage_browser_undocked);
+                });
+            if !open {
+                self.show_stage_browser = false;
+            }
+        }
+
         // Floating UV view — only when the feature is enabled AND the
         // user has undocked it. Closing the window via its [×] hides the
         // UV view entirely (same as unchecking View → UV view).
+        // Floating Material Editor — only when a library material is
+        // bound AND the user has popped it out. Closing the window
+        // re-docks (returns to the bottom strip); to actually drop
+        // the material, use the "Clear material" button in the right-
+        // side properties tab.
+        if self.selected_material_idx.is_some() && self.material_editor_undocked {
+            let mat = self
+                .selected_material_idx
+                .and_then(|i| self.browser.materials.get(i))
+                .cloned();
+            if let (Some(mat), Some(inputs)) =
+                (mat, self.selected_material_inputs.as_mut())
+            {
+                let mut open = true;
+                egui::Window::new(format!("Material — {}", mat.name))
+                    .open(&mut open)
+                    .default_size(egui::vec2(720.0, 480.0))
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        material_editor_body(
+                            ui,
+                            &mat,
+                            inputs,
+                            &mut self.material_graph,
+                            &mut self.material_editor_undocked,
+                        );
+                    });
+                if !open {
+                    self.material_editor_undocked = false;
+                }
+            }
+        }
+
         if self.show_uv_view && self.uv_view_undocked {
             if let Some(vp) = &mut self.viewport {
                 let mut open = true;
@@ -1036,119 +1193,43 @@ fn bake_tab(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
     mesh_maps_panel(ui, vp, frame);
 }
 
-/// Editor for the currently-bound library material's commonly-edited
-/// inputs. Mutates `inputs` in place; the main loop notices the change
-/// and pushes session-layer overrides through the bridge.
-///
-/// Shape is intentionally minimal — one color picker + three sliders.
-/// Mirrors what a user wants right after applying a library material
-/// ("a touch redder, less metallic, rougher"). Extending to per-shader
-/// custom inputs (clearcoat, IOR, emission, MaterialX-specific stuff)
-/// is a follow-up that needs shader-id-aware UI dispatch.
-fn library_material_editor(
+/// Material Editor body — header row (dock toggle + material name)
+/// followed by the egui-snarl node graph. Reused by both the docked
+/// bottom-strip panel and the floating undocked window so the two
+/// render identically.
+fn material_editor_body(
     ui: &mut egui::Ui,
     mat: &crate::assets::MaterialAsset,
     inputs: &mut crate::assets::MaterialInputs,
+    graph: &mut crate::material_graph::MaterialGraph,
+    undocked: &mut bool,
 ) {
-    ui.label(
-        egui::RichText::new(format!("Library: {}", mat.name))
-            .strong()
-            .color(egui::Color32::from_rgb(180, 220, 180)),
-    );
-    ui.weak(format!(
-        "{} · {}",
-        mat.kind.label(),
-        mat.source
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
-    ui.add_space(4.0);
-
-    // Each row only renders when the active shader kind has an input
-    // name for that concept (e.g. UsdPreviewSurface has no separate
-    // `emission_intensity` — its emission magnitude is folded into
-    // the `emissiveColor` channel values, so the row stays hidden).
-    let names = mat.kind.input_names();
-
-    if names.diffuse_color.is_some() {
-        ui.horizontal(|ui| {
-            ui.label("diffuse");
-            let mut color = inputs.diffuse_color;
-            if ui.color_edit_button_rgb(&mut color).changed() {
-                inputs.diffuse_color = color;
+    ui.horizontal(|ui| {
+        ui.strong(&mat.name);
+        ui.weak(format!(" · {}", mat.kind.label()));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (label, tip) = if *undocked {
+                ("⮌ Dock", "Dock the Material Editor back into the main layout")
+            } else {
+                ("⮎ Undock", "Pop out the Material Editor into a floating window")
+            };
+            if ui.button(label).on_hover_text(tip).clicked() {
+                *undocked = !*undocked;
             }
         });
-    }
-    if names.metallic.is_some() {
-        ui.add(
-            egui::Slider::new(&mut inputs.metallic, 0.0..=1.0)
-                .text("metallic")
-                .show_value(true),
-        );
-    }
-    if names.roughness.is_some() {
-        ui.add(
-            egui::Slider::new(&mut inputs.roughness, 0.04..=1.0)
-                .text("roughness")
-                .show_value(true),
-        );
-    }
-    if names.opacity.is_some() {
-        ui.add(
-            egui::Slider::new(&mut inputs.opacity, 0.0..=1.0)
-                .text("opacity")
-                .show_value(true),
-        );
-    }
-
-    // Clearcoat + emission live behind a collapsing section so the
-    // editor stays compact for "just dial roughness" cases.
-    let has_clearcoat = names.clearcoat.is_some();
-    let has_emission = names.emission_color.is_some();
-    if has_clearcoat || has_emission {
-        ui.add_space(6.0);
-        egui::CollapsingHeader::new("Advanced")
-            .id_salt("library_material_advanced")
-            .default_open(false)
-            .show(ui, |ui| {
-                if has_clearcoat {
-                    ui.add(
-                        egui::Slider::new(&mut inputs.clearcoat, 0.0..=1.0)
-                            .text("clearcoat")
-                            .show_value(true),
-                    );
-                }
-                if names.clearcoat_roughness.is_some() {
-                    ui.add(
-                        egui::Slider::new(&mut inputs.clearcoat_roughness, 0.0..=1.0)
-                            .text("clearcoat roughness")
-                            .show_value(true),
-                    );
-                }
-                if has_emission {
-                    ui.horizontal(|ui| {
-                        ui.label("emission");
-                        let mut color = inputs.emission_color;
-                        if ui.color_edit_button_rgb(&mut color).changed() {
-                            inputs.emission_color = color;
-                        }
-                    });
-                }
-                if names.emission_intensity.is_some() {
-                    ui.add(
-                        egui::Slider::new(&mut inputs.emission_intensity, 0.0..=10.0)
-                            .text("emission intensity")
-                            .show_value(true),
-                    );
-                }
-            });
-    }
-
-    ui.add_space(4.0);
-    if ui.button("Reset to library defaults").clicked() {
-        *inputs = crate::assets::read_material_inputs(&mat.source);
-    }
+    });
+    ui.separator();
+    let mut viewer = crate::material_graph::GraphViewer {
+        material_title: mat.name.clone(),
+        shader_inputs: mat.kind.input_names(),
+        inputs,
+    };
+    graph.snarl.show(
+        &mut viewer,
+        &egui_snarl::ui::SnarlStyle::default(),
+        "material_graph",
+        ui,
+    );
 }
 
 fn material_tab(ui: &mut egui::Ui, vp: &mut Viewport) -> Option<MaterialSlot> {
@@ -2958,6 +3039,37 @@ impl App {
                             }
                         }
                         vp.apply_sidecar(&render_state.device, &render_state.queue, &side);
+
+                        // Restore the library-material binding.
+                        // Match by absolute source path against the
+                        // freshly-scanned library. The per-frame
+                        // draw_hydra_central call will push the
+                        // reference + replay overrides on the next
+                        // tick once the hydra view is active.
+                        if let Some(binding) = side.bound_material.as_ref() {
+                            let target = std::fs::canonicalize(&binding.source)
+                                .unwrap_or_else(|_| binding.source.clone());
+                            let idx = self.browser.materials.iter().position(|m| {
+                                std::fs::canonicalize(&m.source)
+                                    .map(|p| p == target)
+                                    .unwrap_or(false)
+                                    || m.source == binding.source
+                            });
+                            match idx {
+                                Some(i) => {
+                                    self.selected_material_idx = Some(i);
+                                    self.selected_material_inputs = Some(binding.inputs);
+                                    // Force a Hydra push next frame by
+                                    // clearing the dirty-tracking
+                                    // baseline.
+                                    self.last_material_inputs = None;
+                                }
+                                None => log::warn!(
+                                    "sidecar bound_material source not in library: {}",
+                                    binding.source.display()
+                                ),
+                            }
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => log::warn!("project sidecar parse failed: {e:#}"),
@@ -3008,7 +3120,23 @@ impl App {
                 // Project sidecar — JSON metadata that travels next to
                 // the PNGs (HP / cage paths, bake settings, smart-mask
                 // params, material factors).
-                let sidecar = vp.build_sidecar();
+                let mut sidecar = vp.build_sidecar();
+                // Fold the currently-bound library material (if any)
+                // into the sidecar so it round-trips across sessions.
+                // The viewport doesn't own the binding state (it's
+                // app-level), hence the post-build augment here.
+                if let Some(idx) = self.selected_material_idx {
+                    if let Some(mat) = self.browser.materials.get(idx) {
+                        sidecar.bound_material =
+                            Some(crate::project::BoundMaterialBinding {
+                                source: mat.source.clone(),
+                                prim_path: mat.prim_path.clone(),
+                                inputs: self
+                                    .selected_material_inputs
+                                    .unwrap_or_default(),
+                            });
+                    }
+                }
                 if let Err(e) = crate::project::save_sidecar(&dir, &sidecar) {
                     log::warn!("project sidecar save failed: {e:#}");
                 }
@@ -4144,6 +4272,13 @@ impl App {
                 .and_then(|idx| self.browser.materials.get(idx))
                 .map(|mat| crate::assets::read_material_inputs(&mat.source));
             self.last_material_inputs = None;
+            // Reset the node graph for the new material — fresh
+            // Shader+Output pair, any texture nodes the previous
+            // binding had get dropped. (Restoring saved graph state
+            // happens through the sidecar load path, not here.)
+            if self.selected_material_idx.is_some() {
+                self.material_graph.rebuild_for_material();
+            }
             // Materials only matter in Hydra mode; nudge the user if
             // they pick a material while in wgpu.
             if self.renderer_mode == RendererMode::Wgpu

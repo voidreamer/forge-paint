@@ -345,7 +345,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::LAYOUT],
+                buffers: &[Vertex::LAYOUT, crate::mesh::SELECTION_LAYOUT],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {

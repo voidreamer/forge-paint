@@ -816,7 +816,7 @@ pub fn discover_materials(root: &Path) -> Vec<MaterialAsset> {
 /// values so the user starts from what the library says rather than
 /// mid-range guesses. Any change authors an override session-layer-
 /// side via the bridge.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct MaterialInputs {
     pub diffuse_color: [f32; 3],
     pub metallic: f32,

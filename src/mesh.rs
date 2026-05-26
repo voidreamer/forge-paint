@@ -31,6 +31,20 @@ pub struct CpuMesh {
     pub normals: Vec<Vec3>,
     pub uvs: Vec<Vec2>,
     pub indices: Vec<[u32; 3]>,
+    /// Origin tracking for per-source-prim ranges in the merged
+    /// vertex / index buffers. Populated by `load_stage_merged`;
+    /// empty after non-merging loaders. The stage browser uses
+    /// this to mark verts as "selected" by their owning UsdGeomMesh
+    /// path so the wgpu shader can highlight them.
+    pub prim_ranges: Vec<PrimRange>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrimRange {
+    pub prim_path: String,
+    /// First vertex index in `CpuMesh::positions` owned by this prim.
+    pub vert_start: u32,
+    pub vert_count: u32,
 }
 
 pub struct GpuMesh {
@@ -43,6 +57,14 @@ pub struct GpuMesh {
     pub line_index_count: u32,
     pub center: Vec3,
     pub radius: f32,
+    /// One f32 per vertex — 1.0 if the vertex's source prim is
+    /// currently selected in the stage browser, 0.0 otherwise. Bound
+    /// as a second vertex buffer; the PBR shader brightens flagged
+    /// verts via interpolation (constant across triangle since all 3
+    /// corners share the source prim). Updated via `set_selection`.
+    pub selection_buffer: wgpu::Buffer,
+    pub vertex_count: u32,
+    pub prim_ranges: Vec<PrimRange>,
 }
 
 impl GpuMesh {
@@ -91,6 +113,16 @@ impl GpuMesh {
             usage: wgpu::BufferUsages::INDEX,
         });
 
+        // Default everyone unselected — a fresh load shows no
+        // highlight. set_selection writes the diff when the user
+        // picks a prim in the stage browser.
+        let zero_selection = vec![0.0_f32; cpu.positions.len()];
+        let selection_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("forge_paint_mesh_selection_vb"),
+            contents: bytemuck::cast_slice(&zero_selection),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
+
         Self {
             vertex_buffer,
             index_buffer,
@@ -99,9 +131,73 @@ impl GpuMesh {
             line_index_count: line_indices.len() as u32,
             center,
             radius,
+            selection_buffer,
+            vertex_count: cpu.positions.len() as u32,
+            prim_ranges: cpu.prim_ranges.clone(),
         }
     }
+
+    /// Rewrites the per-vertex selection mask: 1.0 for any vertex
+    /// whose owning `prim_path` is in `selected` OR whose path lives
+    /// under a selected ancestor (so picking an Xform cascades to
+    /// all the Mesh leaves it contains, matching Solaris/Houdini
+    /// outliner behaviour). No-op if the mesh has no `prim_ranges`
+    /// populated (i.e. came from a non-merging load path).
+    pub fn set_selection(
+        &self,
+        queue: &wgpu::Queue,
+        selected: &std::collections::HashSet<String>,
+    ) {
+        if self.prim_ranges.is_empty() {
+            return;
+        }
+        let mut mask = vec![0.0_f32; self.vertex_count as usize];
+        for range in &self.prim_ranges {
+            if !is_selected_or_descendant(&range.prim_path, selected) {
+                continue;
+            }
+            let start = range.vert_start as usize;
+            let end = start + range.vert_count as usize;
+            for v in &mut mask[start..end] {
+                *v = 1.0;
+            }
+        }
+        queue.write_buffer(&self.selection_buffer, 0, bytemuck::cast_slice(&mask));
+    }
 }
+
+/// `prim_path` is selected iff the set holds it directly OR holds
+/// an ancestor (any prefix that ends at a `/` boundary, so
+/// `/World/F` doesn't match `/World/Foo`).
+fn is_selected_or_descendant(
+    prim_path: &str,
+    selected: &std::collections::HashSet<String>,
+) -> bool {
+    selected.iter().any(|sel| {
+        if sel == prim_path {
+            return true;
+        }
+        // Pseudo-root "/" is selected → everything matches.
+        if sel == "/" {
+            return true;
+        }
+        prim_path.starts_with(sel.as_str())
+            && prim_path.as_bytes().get(sel.len()) == Some(&b'/')
+    })
+}
+
+/// Vertex-buffer layout for the per-vertex selection flag (slot 1
+/// in the PBR pipeline). One f32 per vertex; matches `@location(4)
+/// selected_in: f32` in pbr.wgsl.
+pub const SELECTION_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<f32>() as u64,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &[wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32,
+        offset: 0,
+        shader_location: 4,
+    }],
+};
 
 /// Midpoint-subdivide `mesh` `levels` times. Each level splits every
 /// triangle into 4 via edge midpoints, quadrupling the triangle count.
@@ -123,6 +219,7 @@ fn subdivide_once(mesh: &CpuMesh) -> CpuMesh {
         normals: Vec::with_capacity(tri_count * 6),
         uvs: Vec::with_capacity(tri_count * 6),
         indices: Vec::with_capacity(tri_count * 4),
+        prim_ranges: Vec::new(),
     };
     for &[i0, i1, i2] in &mesh.indices {
         let (p0, p1, p2) = (
@@ -216,5 +313,11 @@ pub fn cube() -> CpuMesh {
         indices.push([base, base + 2, base + 3]);
     }
 
-    CpuMesh { positions, normals, uvs, indices }
+    CpuMesh {
+        positions,
+        normals,
+        uvs,
+        indices,
+        prim_ranges: Vec::new(),
+    }
 }

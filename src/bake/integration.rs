@@ -166,6 +166,7 @@ pub fn load_cage(path: &std::path::Path) -> Result<CpuMesh, String> {
             .map(|uv| glam::Vec2::new(uv[0], uv[1]))
             .collect(),
         indices: merged.indices,
+        prim_ranges: Vec::new(),
     })
 }
 

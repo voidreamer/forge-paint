@@ -85,6 +85,11 @@ struct VsIn {
     @location(1) normal: vec3<f32>,
     @location(2) tangent: vec4<f32>,
     @location(3) uv: vec2<f32>,
+    // Per-vertex selection flag from the second vertex buffer (slot
+    // 1). All three corners of a triangle share the same flag since
+    // prim ranges line up on vertex boundaries, so interpolation
+    // delivers a constant 0.0 or 1.0 to the fragment.
+    @location(4) selected_in: f32,
 };
 
 struct VsOut {
@@ -93,6 +98,7 @@ struct VsOut {
     @location(1) world_normal: vec3<f32>,
     @location(2) world_tangent: vec4<f32>,
     @location(3) uv: vec2<f32>,
+    @location(4) selected: f32,
 };
 
 @vertex
@@ -122,6 +128,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.world_normal = in.normal;
     out.world_tangent = in.tangent;
     out.uv = in.uv;
+    out.selected = in.selected_in;
     return out;
 }
 
@@ -535,5 +542,12 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
             out_rgb = lit;
         }
     }
+    // Stage-browser selection highlight — blend a warm orange tint
+    // into the lit output. `in.selected` interpolates at 1.0 across
+    // every triangle that belongs to a selected source prim and 0.0
+    // elsewhere, so this collapses to `lit + tint` on selected verts
+    // and a no-op everywhere else.
+    let highlight = vec3<f32>(1.0, 0.55, 0.15);
+    out_rgb = mix(out_rgb, out_rgb * 0.6 + highlight * 0.6, clamp(in.selected, 0.0, 1.0));
     return vec4<f32>(out_rgb, 1.0);
 }
