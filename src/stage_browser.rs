@@ -108,6 +108,30 @@ impl StageBrowser {
         &self.selected
     }
 
+    /// Apply the same selection semantics as clicking a row in the
+    /// hierarchy, but driven by another surface such as viewport picking.
+    pub fn select_path(&mut self, path: &str, multi: bool) -> bool {
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        if find_node(root, path).is_none() {
+            return false;
+        }
+
+        let was_selected = self.selected.contains(path);
+        if !multi {
+            self.selected.clear();
+        }
+        if was_selected && multi {
+            self.selected.remove(path);
+        } else {
+            self.selected.insert(path.to_string());
+        }
+        self.last_focused = Some(path.to_string());
+        expand_ancestors(path, &mut self.expanded);
+        true
+    }
+
     /// Expand the directly-clicked selection set with every
     /// descendant prim of each selected ancestor. Mirrors what the
     /// wgpu mask-build does via prefix matching, but produces an
@@ -276,6 +300,21 @@ fn collect_descendants(node: &PrimNode, out: &mut HashSet<String>) {
     for child in &node.children {
         out.insert(child.path.clone());
         collect_descendants(child, out);
+    }
+}
+
+fn expand_ancestors(path: &str, expanded: &mut HashSet<String>) {
+    expanded.insert("/".to_string());
+    let mut start = 1;
+    while start < path.len() {
+        let Some(rel_idx) = path[start..].find('/') else {
+            break;
+        };
+        let idx = start + rel_idx;
+        if idx > 0 {
+            expanded.insert(path[..idx].to_string());
+        }
+        start = idx + 1;
     }
 }
 

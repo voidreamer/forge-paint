@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::{
     assets::{self, AssetBrowser},
     mesh,
-    viewport::{Tool, Viewport},
+    viewport::{Tool, Viewport, ViewportSelection},
 };
 
 #[derive(Default)]
@@ -50,6 +50,12 @@ pub struct App {
     /// re-upload the mask (12+ MB on SimReady-class assets) per
     /// repaint.
     last_pushed_selection: std::collections::HashSet<String>,
+    /// Last expanded selection set pushed to Hydra/Storm. Tracked
+    /// separately from `last_pushed_selection` because the wgpu path
+    /// consumes the raw clicked set, while Storm needs explicit
+    /// descendants and may be constructed after the user selected
+    /// something in the stage browser.
+    last_pushed_hydra_selection: std::collections::HashSet<String>,
     /// Which renderer owns the central viewport this frame. Solaris-
     /// style toggle (one viewport, swap between rasteriser and
     /// path-tracer) rather than side-by-side panels — keeps full
@@ -96,38 +102,34 @@ pub struct App {
     /// without the user needing to click `↻ Sync paint`. Cleared
     /// after the sync (or after a failure that won't repeat).
     hydra_paint_sync_pending: bool,
-    /// Index into `browser.materials` of the currently-applied
-    /// library material, or `None` for "no library material — fall
-    /// back to whatever the stage authored or the painted-material
-    /// override". Pushed to Hydra each frame (dirty-tracked) so the
-    /// session-layer reference re-asserts itself after stage changes.
-    selected_material_idx: Option<usize>,
-    /// Live values of the bound library material's editable inputs.
-    /// Seeded from the source's authored values when a material is
-    /// picked, then mutated by the editor sliders. Any change goes
-    /// through to Hydra via `set_external_material_input_*`, which
-    /// authors a session-layer override on top of the reference.
-    selected_material_inputs: Option<crate::assets::MaterialInputs>,
-    /// Last values pushed to the bridge — comparison gate so we only
-    /// fire `set_external_material_input_*` when the slider actually
-    /// moved. Hydra authors session-layer overrides on every set, so
-    /// per-frame redundant writes would churn the scene index.
-    last_material_inputs: Option<crate::assets::MaterialInputs>,
-    /// Scope of the current library-material binding. Empty = the
-    /// binding is stage-wide (every UsdGeomMesh, the legacy
-    /// default after clicking a chip). Non-empty = restricted to
-    /// these SdfPaths; Xform / Scope entries cascade to their
-    /// Mesh descendants in hydra-rs. Edited via the "Bound to:"
-    /// controls in the bottom material editor.
-    selected_material_target_prims: Vec<String>,
-    /// Last `target_prims` pushed through to Hydra, so we can dirty-
-    /// check and avoid re-authoring the binding network every
-    /// frame when nothing has changed.
-    last_pushed_target_prims: Vec<String>,
+    /// Concurrent material bindings authored against this stage.
+    /// Each entry references a library material and binds it to
+    /// either a set of target prims or the whole stage. Pushed to
+    /// hydra-rs each frame via apply_material_binding (dirty-checked
+    /// against `last_pushed_bindings`).
+    material_bindings: Vec<MaterialBindingInstance>,
+    /// Which entry of `material_bindings` is currently focused in
+    /// the Material Editor (slider edits target this binding's
+    /// `inputs`). `None` = no binding active; editor shows a
+    /// placeholder prompt.
+    active_binding_id: Option<u64>,
+    /// Monotonic generator for new MaterialBindingInstance ids.
+    /// Stable across the session so the hydra-rs side can key
+    /// `apply_material_binding`/`remove_material_binding` calls
+    /// without re-authoring the whole binding network when a
+    /// single binding moves.
+    next_binding_id: u64,
+    /// Snapshot of each binding last pushed to hydra-rs, keyed by
+    /// id. Used per-frame to figure out which bindings are new
+    /// (apply_material_binding), which had their target_prims /
+    /// source changed (re-apply), which had only input edits
+    /// (set_binding_input_*), and which were removed
+    /// (remove_material_binding).
+    last_pushed_bindings: std::collections::HashMap<u64, MaterialBindingSnapshot>,
     /// Node-graph state for the Material Editor. Rebuilt when the
-    /// user binds a new library material (chip click); preserved
-    /// across frames so node positions and texture wiring stick.
-    /// Persisted via the project sidecar.
+    /// active binding changes (so each binding's graph layout is
+    /// independent); preserved across frames so node positions and
+    /// texture wiring stick within a binding's lifetime.
     material_graph: crate::material_graph::MaterialGraph,
     /// Material editor pops out into a floating window when true,
     /// otherwise it sits as a bottom strip inside the central area
@@ -261,6 +263,54 @@ impl MaterialSlot {
     ];
 }
 
+/// One concurrent material binding. The library material at `source`
+/// is referenced into the stage and bound either to every
+/// UsdGeomMesh (target_prims empty) or to the listed SdfPaths
+/// (Xform / Scope entries cascade to descendants hydra-rs-side).
+#[derive(Debug, Clone)]
+pub struct MaterialBindingInstance {
+    pub id: u64,
+    pub source: PathBuf,
+    pub prim_path: String,
+    pub kind: crate::assets::MaterialKind,
+    pub inputs: crate::assets::MaterialInputs,
+    /// SdfPaths the binding restricts itself to when `assigned`.
+    /// Empty + `assigned == true` ⇒ stage-wide. Empty +
+    /// `assigned == false` ⇒ shader node sits in the graph but
+    /// hasn't been bound to anything yet (chip click default).
+    pub target_prims: Vec<String>,
+    /// False when the binding only exists in the node editor as a
+    /// staged-but-unbound shader; true after the user picked
+    /// "Assign to selection" / "Assign to stage" from the node's
+    /// right-click menu. Per-frame Hydra push skips unassigned.
+    pub assigned: bool,
+}
+
+/// What we last sent to hydra-rs for a given binding id, used to
+/// figure out per-frame what changed. Stored separately from
+/// `MaterialBindingInstance` so the snapshot stays Eq-comparable
+/// independently of UI fields we may add later.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterialBindingSnapshot {
+    pub source: PathBuf,
+    pub prim_path: String,
+    pub inputs: crate::assets::MaterialInputs,
+    pub target_prims: Vec<String>,
+    pub assigned: bool,
+}
+
+impl MaterialBindingSnapshot {
+    pub fn of(b: &MaterialBindingInstance) -> Self {
+        Self {
+            source: b.source.clone(),
+            prim_path: b.prim_path.clone(),
+            inputs: b.inputs,
+            target_prims: b.target_prims.clone(),
+            assigned: b.assigned,
+        }
+    }
+}
+
 impl App {
     pub fn new(initial_usd: Option<PathBuf>) -> Self {
         // CLI path wins. Otherwise fall back to a user-provided default
@@ -328,6 +378,19 @@ impl eframe::App for App {
             if now != &self.last_pushed_selection {
                 vp.set_selection(&rs.queue, now);
                 self.last_pushed_selection = now.clone();
+            }
+        }
+        if let Some(hydra) = self.hydra.as_mut() {
+            // Push the expanded set (with descendants of selected
+            // Xforms) to Storm too: Storm doesn't auto-cascade
+            // selection like our wgpu prefix logic. This is tracked
+            // independently so selection made before Hydra is lazily
+            // constructed still appears on its first frame.
+            let effective = self.stage_browser.effective_selection();
+            if effective != self.last_pushed_hydra_selection {
+                let paths: Vec<&str> = effective.iter().map(|s| s.as_str()).collect();
+                hydra.set_selection(&paths);
+                self.last_pushed_hydra_selection = effective;
             }
         }
 
@@ -629,7 +692,7 @@ impl eframe::App for App {
                     ui.label(&self.status);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("LMB paint · Ctrl+LMB orbit · Shift+LMB / MMB pan · wheel zoom · S/D/F+LMB brush size/hardness/opacity · M/R/T+LMB stencil move/rotate/scale");
+                    ui.weak("V select / Alt+LMB quick select · LMB paint · Ctrl+LMB orbit · Shift+LMB / MMB pan · wheel zoom · S/D/F+LMB brush size/hardness/opacity · M/R/T+LMB stencil move/rotate/scale");
                 });
             });
         });
@@ -732,35 +795,34 @@ impl eframe::App for App {
                                 //    Library cards in the bottom
                                 //    pane are the path to the other
                                 //    mode.
-                                if let Some(idx) = self.selected_material_idx {
-                                    if let Some(mat) = self.browser.materials.get(idx)
-                                    {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "Library: {}",
-                                                mat.name
-                                            ))
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(180, 220, 180)),
-                                        );
-                                        ui.weak(format!(
-                                            "{} · {}",
-                                            mat.kind.label(),
-                                            mat.source
-                                                .file_name()
-                                                .map(|s| s.to_string_lossy().into_owned())
-                                                .unwrap_or_default()
-                                        ));
-                                        ui.add_space(8.0);
-                                        ui.weak(
-                                            "Live edits live in the Material \
-                                             Editor at the bottom of the viewport.",
-                                        );
-                                    } else {
-                                        slot_clicked = material_tab(ui, vp);
-                                    }
-                                } else {
+                                if self.material_bindings.is_empty() {
                                     slot_clicked = material_tab(ui, vp);
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} binding(s) active",
+                                            self.material_bindings.len()
+                                        ))
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(180, 220, 180)),
+                                    );
+                                    for b in &self.material_bindings {
+                                        let scope = if b.target_prims.is_empty() {
+                                            "stage-wide".to_string()
+                                        } else {
+                                            format!("{} prim(s)", b.target_prims.len())
+                                        };
+                                        let name = b
+                                            .source
+                                            .file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("(material)");
+                                        ui.weak(format!("· {name} → {scope}"));
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.weak(
+                                        "Live edits live in the Material Editor at the bottom of the viewport.",
+                                    );
                                 }
                             }
                             PropertiesTab::Project => {
@@ -788,6 +850,7 @@ impl eframe::App for App {
             .unwrap_or(1.0);
         let stencil_tex_id = stencil_asset.map(|a| a.thumb_id);
 
+        let mut pending_viewport_selection: Option<ViewportSelection> = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 22)))
             .show(ctx, |ui| {
@@ -851,36 +914,29 @@ impl eframe::App for App {
                         }
                     }
                     // Material Editor — bottom strip when docked. Same
-                    // pattern as the UV view above. Only renders when
-                    // a library material is bound; otherwise the strip
-                    // would sit empty and steal vertical room.
-                    if self.selected_material_idx.is_some()
-                        && !self.material_editor_undocked
-                    {
-                        if let (Some(mat), Some(inputs)) = (
-                            self.selected_material_idx
-                                .and_then(|i| self.browser.materials.get(i)),
-                            self.selected_material_inputs.as_mut(),
-                        ) {
-                            let browser_sel = self.stage_browser.effective_selection();
-                            egui::TopBottomPanel::bottom("material_editor_panel")
-                                .default_height(320.0)
-                                .resizable(true)
-                                .show_inside(ui, |ui| {
-                                    material_editor_body(
-                                        ui,
-                                        mat,
-                                        inputs,
-                                        &mut self.material_graph,
-                                        &mut self.material_editor_undocked,
-                                        &mut self.selected_material_target_prims,
-                                        &browser_sel,
-                                    );
-                                });
-                        }
+                    // pattern as the UV view above. Renders whenever
+                    // there's at least one active binding OR the user
+                    // has picked a chip and may want to assign it
+                    // (so the "Assign…" buttons are reachable from a
+                    // fresh stage).
+                    let editor_visible = !self.material_bindings.is_empty();
+                    if editor_visible && !self.material_editor_undocked {
+                        let browser_sel = self.stage_browser.effective_selection();
+                        egui::TopBottomPanel::bottom("material_editor_panel")
+                            .default_height(320.0)
+                            .resizable(true)
+                            .show_inside(ui, |ui| {
+                                material_editor_body(
+                                    ui,
+                                    &mut self.material_bindings,
+                                    &mut self.material_graph,
+                                    &browser_sel,
+                                    &mut self.material_editor_undocked,
+                                );
+                            });
                     }
                     let mut swap_renderer = false;
-                    match self.renderer_mode {
+                    let viewport_selection = match self.renderer_mode {
                         RendererMode::Wgpu => {
                             vp.show(
                                 ui,
@@ -888,13 +944,9 @@ impl eframe::App for App {
                                 stencil_view,
                                 stencil_aspect,
                                 stencil_tex_id,
-                            );
+                            )
                         }
                         RendererMode::Hydra => {
-                            let mat_ref = self
-                                .selected_material_idx
-                                .and_then(|i| self.browser.materials.get(i));
-                            let mat_inputs = self.selected_material_inputs.as_ref();
                             Self::draw_hydra_central(
                                 ui,
                                 frame,
@@ -909,15 +961,15 @@ impl eframe::App for App {
                                 &mut self.hydra_show_render,
                                 &mut self.hydra_show_proxy,
                                 &mut self.hydra_show_guides,
-                                mat_ref,
-                                mat_inputs,
-                                &mut self.last_material_inputs,
-                                &self.selected_material_target_prims,
-                                &mut self.last_pushed_target_prims,
+                                &self.material_bindings,
+                                &mut self.last_pushed_bindings,
                                 self.current_usd_path.as_deref(),
                                 &mut swap_renderer,
-                            );
+                            )
                         }
+                    };
+                    if let Some(selection) = viewport_selection {
+                        pending_viewport_selection = Some(selection);
                     }
                     // Renderer / delegate picker — single combo
                     // overlay covering both modes. Placed top-right
@@ -955,6 +1007,9 @@ impl eframe::App for App {
                     ui.centered_and_justified(|ui| ui.label("Initializing GPU…"));
                 }
             });
+        if let Some(selection) = pending_viewport_selection {
+            self.apply_viewport_selection(selection, ctx);
+        }
 
         // Floating Stage browser. Closing the window via [×] hides
         // the browser entirely (same as unchecking View → Stage
@@ -985,34 +1040,25 @@ impl eframe::App for App {
         // re-docks (returns to the bottom strip); to actually drop
         // the material, use the "Clear material" button in the right-
         // side properties tab.
-        if self.selected_material_idx.is_some() && self.material_editor_undocked {
-            let mat = self
-                .selected_material_idx
-                .and_then(|i| self.browser.materials.get(i))
-                .cloned();
-            if let (Some(mat), Some(inputs)) =
-                (mat, self.selected_material_inputs.as_mut())
-            {
-                let mut open = true;
-                egui::Window::new(format!("Material — {}", mat.name))
-                    .open(&mut open)
-                    .default_size(egui::vec2(720.0, 480.0))
-                    .resizable(true)
-                    .show(ctx, |ui| {
-                        let browser_sel = self.stage_browser.effective_selection();
-                        material_editor_body(
-                            ui,
-                            &mat,
-                            inputs,
-                            &mut self.material_graph,
-                            &mut self.material_editor_undocked,
-                            &mut self.selected_material_target_prims,
-                            &browser_sel,
-                        );
-                    });
-                if !open {
-                    self.material_editor_undocked = false;
-                }
+        let editor_visible = !self.material_bindings.is_empty();
+        if editor_visible && self.material_editor_undocked {
+            let browser_sel = self.stage_browser.effective_selection();
+            let mut open = true;
+            egui::Window::new("Material Editor")
+                .open(&mut open)
+                .default_size(egui::vec2(720.0, 480.0))
+                .resizable(true)
+                .show(ctx, |ui| {
+                    material_editor_body(
+                        ui,
+                        &mut self.material_bindings,
+                        &mut self.material_graph,
+                        &browser_sel,
+                        &mut self.material_editor_undocked,
+                    );
+                });
+            if !open {
+                self.material_editor_undocked = false;
             }
         }
 
@@ -1099,7 +1145,9 @@ impl eframe::App for App {
         // focus — text fields intercept before these fire.
         let tool_change = ctx.input_mut(|i| {
             use egui::{Key, Modifiers};
-            if i.consume_key(Modifiers::NONE, Key::B) {
+            if i.consume_key(Modifiers::NONE, Key::V) {
+                Some(Tool::Select)
+            } else if i.consume_key(Modifiers::NONE, Key::B) {
                 Some(Tool::Paint)
             } else if i.consume_key(Modifiers::NONE, Key::E) {
                 Some(Tool::Erase)
@@ -1216,19 +1264,17 @@ fn bake_tab(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
 /// followed by the egui-snarl node graph. Reused by both the docked
 /// bottom-strip panel and the floating undocked window so the two
 /// render identically.
-#[allow(clippy::too_many_arguments)]
 fn material_editor_body(
     ui: &mut egui::Ui,
-    mat: &crate::assets::MaterialAsset,
-    inputs: &mut crate::assets::MaterialInputs,
+    bindings: &mut Vec<MaterialBindingInstance>,
     graph: &mut crate::material_graph::MaterialGraph,
-    undocked: &mut bool,
-    target_prims: &mut Vec<String>,
     browser_selection: &std::collections::HashSet<String>,
+    undocked: &mut bool,
 ) {
     ui.horizontal(|ui| {
-        ui.strong(&mat.name);
-        ui.weak(format!(" · {}", mat.kind.label()));
+        let n = bindings.len();
+        ui.strong(format!("Material network ({n} shader(s))"));
+        ui.weak("Right-click a shader node to assign / remove.");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let (label, tip) = if *undocked {
                 ("⮌ Dock", "Dock the Material Editor back into the main layout")
@@ -1240,55 +1286,100 @@ fn material_editor_body(
             }
         });
     });
-    // Binding scope row — switch between stage-wide and a subset
-    // of prims drawn from the current Stage browser selection.
-    // Empty target_prims = stage-wide (the default after a chip
-    // click). hydra-rs's `set_external_material_on_prims` cascades
-    // selected Xforms/Scopes to descendant meshes.
-    ui.horizontal(|ui| {
-        ui.label("Bound to:");
-        if target_prims.is_empty() {
-            ui.weak("entire stage");
-        } else {
-            ui.weak(format!("{} prim(s)", target_prims.len()));
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let have_sel = !browser_selection.is_empty();
-            let assign_label = if have_sel {
-                format!("Assign to selection ({})", browser_selection.len())
-            } else {
-                "Assign to selection".to_string()
-            };
-            if ui
-                .add_enabled(have_sel, egui::Button::new(assign_label))
-                .on_hover_text(
-                    "Restrict this material's binding to the prims highlighted in the Stage browser",
-                )
-                .clicked()
-            {
-                *target_prims = browser_selection.iter().cloned().collect();
-            }
-            if ui
-                .add_enabled(!target_prims.is_empty(), egui::Button::new("Stage-wide"))
-                .on_hover_text("Bind this material to every UsdGeomMesh in the stage")
-                .clicked()
-            {
-                target_prims.clear();
-            }
-        });
-    });
     ui.separator();
+
+    let mut pending: Vec<crate::material_graph::GraphAction> = Vec::new();
     let mut viewer = crate::material_graph::GraphViewer {
-        material_title: mat.name.clone(),
-        shader_inputs: mat.kind.input_names(),
-        inputs,
+        bindings,
+        browser_selection,
+        pending_actions: &mut pending,
     };
-    graph.snarl.show(
-        &mut viewer,
-        &egui_snarl::ui::SnarlStyle::default(),
-        "material_graph",
-        ui,
+    let graph_rect = ui.available_rect_before_wrap();
+    let graph_size = egui::vec2(graph_rect.width().max(1.0), graph_rect.height().max(160.0));
+    let (graph_rect, _) = ui.allocate_exact_size(graph_size, egui::Sense::hover());
+    let mut graph_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("material_graph_canvas")
+            .max_rect(graph_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
     );
+    let style = material_graph_style(&graph_ui);
+    graph
+        .snarl
+        .show(&mut viewer, &style, "material_graph", &mut graph_ui);
+    material_graph_canvas_nav(ui, graph_rect, graph);
+
+    // Apply right-click menu actions emitted by the viewer. Done
+    // here (outside the snarl.show borrow) so we can mutate the
+    // bindings Vec freely without aliasing the &mut Vec the
+    // viewer is holding.
+    for act in pending {
+        match act {
+            crate::material_graph::GraphAction::AssignToSelection(id) => {
+                if let Some(b) = bindings.iter_mut().find(|b| b.id == id) {
+                    b.target_prims =
+                        browser_selection.iter().cloned().collect();
+                    b.assigned = true;
+                }
+            }
+            crate::material_graph::GraphAction::AssignToStage(id) => {
+                if let Some(b) = bindings.iter_mut().find(|b| b.id == id) {
+                    b.target_prims.clear();
+                    b.assigned = true;
+                }
+            }
+            crate::material_graph::GraphAction::Unassign(id) => {
+                if let Some(b) = bindings.iter_mut().find(|b| b.id == id) {
+                    b.assigned = false;
+                }
+            }
+            crate::material_graph::GraphAction::Remove(id) => {
+                bindings.retain(|b| b.id != id);
+                graph.remove_shader_node(id);
+            }
+        }
+    }
+}
+
+fn material_graph_style(ui: &egui::Ui) -> egui_snarl::ui::SnarlStyle {
+    let visuals = ui.visuals();
+    egui_snarl::ui::SnarlStyle {
+        min_scale: Some(0.12),
+        max_scale: Some(3.5),
+        animate_zoom: Some(0.06),
+        bg_pattern: Some(egui_snarl::ui::BackgroundPattern::grid(
+            egui::vec2(44.0, 44.0),
+            0.0,
+        )),
+        bg_pattern_stroke: Some(egui::Stroke::new(
+            1.0,
+            visuals.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.55),
+        )),
+        pin_size: Some(10.0),
+        wire_width: Some(3.0),
+        header_drag_space: Some(egui::vec2(18.0, 18.0)),
+        ..Default::default()
+    }
+}
+
+fn material_graph_canvas_nav(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    graph: &mut crate::material_graph::MaterialGraph,
+) {
+    let (inside, middle_down, delta) = ui.ctx().input(|i| {
+        let pos = i.pointer.hover_pos().or(i.pointer.interact_pos());
+        (
+            pos.map(|p| rect.contains(p)).unwrap_or(false),
+            i.pointer.button_down(egui::PointerButton::Middle),
+            i.pointer.delta(),
+        )
+    });
+    if inside && middle_down && delta != egui::Vec2::ZERO {
+        graph.pan_nodes_by(delta);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        ui.ctx().request_repaint();
+    }
 }
 
 fn material_tab(ui: &mut egui::Ui, vp: &mut Viewport) -> Option<MaterialSlot> {
@@ -1314,6 +1405,7 @@ fn tool_strip(ui: &mut egui::Ui, vp: &Viewport) -> Option<Tool> {
     let mut clicked: Option<Tool> = None;
     ui.vertical_centered(|ui| {
         let entries = [
+            (Tool::Select, egui_phosphor::regular::CURSOR_CLICK),
             (Tool::Paint, egui_phosphor::regular::PAINT_BRUSH),
             (Tool::Erase, egui_phosphor::regular::ERASER),
             (Tool::Fill, egui_phosphor::regular::PAINT_BUCKET),
@@ -3105,39 +3197,62 @@ impl App {
                         // draw_hydra_central call will push the
                         // reference + replay overrides on the next
                         // tick once the hydra view is active.
-                        if let Some(binding) = side.bound_material.as_ref() {
+                        // Restore concurrent material bindings. Prefer
+                        // the new `bound_materials` Vec; fall back to
+                        // the legacy single `bound_material` so v1
+                        // sidecars keep working after the C2b migration.
+                        let to_restore: Vec<&crate::project::BoundMaterialBinding> =
+                            if !side.bound_materials.is_empty() {
+                                side.bound_materials.iter().collect()
+                            } else if let Some(b) = side.bound_material.as_ref() {
+                                vec![b]
+                            } else {
+                                Vec::new()
+                            };
+                        for binding in to_restore {
                             let target = std::fs::canonicalize(&binding.source)
                                 .unwrap_or_else(|_| binding.source.clone());
-                            let idx = self.browser.materials.iter().position(|m| {
+                            let asset = self.browser.materials.iter().find(|m| {
                                 std::fs::canonicalize(&m.source)
                                     .map(|p| p == target)
                                     .unwrap_or(false)
                                     || m.source == binding.source
                             });
-                            match idx {
-                                Some(i) => {
-                                    self.selected_material_idx = Some(i);
-                                    self.selected_material_inputs = Some(binding.inputs);
-                                    self.selected_material_target_prims =
-                                        binding.target_prims.clone();
-                                    // Force a Hydra push next frame by
-                                    // clearing the dirty-tracking
-                                    // baseline.
-                                    self.last_material_inputs = None;
-                                    self.last_pushed_target_prims.clear();
+                            match asset {
+                                Some(mat) => {
+                                    let new_id = self.next_binding_id;
+                                    self.next_binding_id += 1;
+                                    self.material_bindings.push(MaterialBindingInstance {
+                                        id: new_id,
+                                        source: mat.source.clone(),
+                                        prim_path: mat.prim_path.clone(),
+                                        kind: mat.kind,
+                                        inputs: binding.inputs,
+                                        target_prims: binding.target_prims.clone(),
+                                        // Sidecar entries were assigned at save
+                                        // time — restore them as such so the
+                                        // user doesn't have to re-assign.
+                                        assigned: true,
+                                    });
+                                    self.material_graph
+                                        .spawn_shader_node(new_id);
+                                    self.active_binding_id = Some(new_id);
                                 }
                                 None => log::warn!(
-                                    "sidecar bound_material source not in library: {}",
+                                    "sidecar bound material source not in library: {}",
                                     binding.source.display()
                                 ),
                             }
                         }
+                        // Force a Hydra push next frame.
+                        self.last_pushed_bindings.clear();
                     }
                     Ok(None) => {}
                     Err(e) => log::warn!("project sidecar parse failed: {e:#}"),
                 }
 
                 self.current_usd_path = Some(path.clone());
+                self.stage_browser.ensure_loaded(&path);
                 let sidecar_msg = if loaded_n > 0 {
                     format!(" — loaded {loaded_n} sidecar(s) from {}", work_dir.display())
                 } else {
@@ -3154,6 +3269,16 @@ impl App {
                 self.status = format!("Failed to load {}: {e:#}", path.display());
                 log::error!("{}", self.status);
             }
+        }
+    }
+
+    fn apply_viewport_selection(&mut self, selection: ViewportSelection, ctx: &egui::Context) {
+        if self
+            .stage_browser
+            .select_path(&selection.prim_path, selection.multi)
+        {
+            self.status = format!("Selected {}", selection.prim_path);
+            ctx.request_repaint();
         }
     }
 
@@ -3187,21 +3312,23 @@ impl App {
                 // into the sidecar so it round-trips across sessions.
                 // The viewport doesn't own the binding state (it's
                 // app-level), hence the post-build augment here.
-                if let Some(idx) = self.selected_material_idx {
-                    if let Some(mat) = self.browser.materials.get(idx) {
-                        sidecar.bound_material =
-                            Some(crate::project::BoundMaterialBinding {
-                                source: mat.source.clone(),
-                                prim_path: mat.prim_path.clone(),
-                                inputs: self
-                                    .selected_material_inputs
-                                    .unwrap_or_default(),
-                                target_prims: self
-                                    .selected_material_target_prims
-                                    .clone(),
-                            });
-                    }
-                }
+                sidecar.bound_materials = self
+                    .material_bindings
+                    .iter()
+                    // Only persist bindings that have actually been
+                    // assigned via the right-click menu. Unassigned
+                    // shader nodes are session-only scratch.
+                    .filter(|b| b.assigned)
+                    .map(|b| crate::project::BoundMaterialBinding {
+                        source: b.source.clone(),
+                        prim_path: b.prim_path.clone(),
+                        inputs: b.inputs,
+                        target_prims: b.target_prims.clone(),
+                    })
+                    .collect();
+                // Clear the legacy single-binding field on save so we
+                // don't double-restore on next reopen.
+                sidecar.bound_material = None;
                 if let Err(e) = crate::project::save_sidecar(&dir, &sidecar) {
                     log::warn!("project sidecar save failed: {e:#}");
                 }
@@ -3246,14 +3373,11 @@ impl App {
         show_render: &mut bool,
         show_proxy: &mut bool,
         show_guides: &mut bool,
-        selected_material: Option<&crate::assets::MaterialAsset>,
-        material_inputs: Option<&crate::assets::MaterialInputs>,
-        last_material_inputs: &mut Option<crate::assets::MaterialInputs>,
-        target_prims: &[String],
-        last_target_prims: &mut Vec<String>,
+        material_bindings: &[MaterialBindingInstance],
+        last_pushed_bindings: &mut std::collections::HashMap<u64, MaterialBindingSnapshot>,
         stage_path: Option<&std::path::Path>,
         request_swap_renderer: &mut bool,
-    ) {
+    ) -> Option<ViewportSelection> {
         let available = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
         let w = (rect.width() as u32).max(64);
@@ -3299,7 +3423,7 @@ impl App {
             );
             let _ = request_swap_renderer;
             let _ = frame;
-            return;
+            return None;
         };
 
         // Drop the previous `HydraView` if the user has loaded a
@@ -3328,8 +3452,10 @@ impl App {
         if hydra_slot.is_none() {
             log::info!("Hydra: opening stage {}", path.display());
             match crate::hydra_view::HydraView::new(path) {
-                Ok(v) => {
+                Ok(mut v) => {
                     log::info!("Hydra: stage opened OK, size {}x{}", w, h);
+                    // Match the wgpu side's warm-orange selection tint.
+                    v.set_selection_color([1.0, 0.55, 0.15, 1.0]);
                     *hydra_slot = Some(v);
                 }
                 Err(e) => {
@@ -3342,7 +3468,7 @@ impl App {
                     );
                     let _ = request_swap_renderer;
                     let _ = frame;
-                    return;
+                    return None;
                 }
             }
         }
@@ -3355,6 +3481,7 @@ impl App {
         // 0.01 / 1000 defaults if Hydra was the first mode used).
         // Re-using the wgpu helper keeps the formula in lock-step.
         vp.refresh_clip_planes();
+        let viewport_selection = vp.selection_from_response(&response, rect, true);
         let view = vp.camera.view().to_cols_array_2d();
         let view_row = crate::hydra_view::glam_to_hydra(&view);
         let proj_row = crate::hydra_view::perspective_for_hydra(
@@ -3396,94 +3523,81 @@ impl App {
         if let Err(e) = hydra.set_user_lights(&vp.lights) {
             log::warn!("Hydra: set_user_lights failed: {e:#}");
         }
-        // External library material — if the user picked one in the
-        // Materials pane, reference it into the session layer; if
-        // they clear the pick, drop the reference so the stage's
-        // original bindings take over again.
-        match selected_material {
-            Some(mat) => {
-                if let Err(e) = hydra.set_external_material_on_prims(
-                    &mat.source,
-                    &mat.prim_path,
-                    target_prims,
+        // Concurrent material bindings — diff the current binding
+        // list against what we last pushed, then call hydra-rs once
+        // per change (apply_material_binding for new/scope-changed,
+        // set_binding_input_* for slider edits, remove_material_
+        // binding for vanished ids).
+        let mut current_ids: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
+        for b in material_bindings {
+            // Skip shader nodes the user has staged but not yet
+            // assigned — those exist in the graph only and shouldn't
+            // touch the Hydra session layer.
+            if !b.assigned {
+                continue;
+            }
+            current_ids.insert(b.id);
+            let new_snap = MaterialBindingSnapshot::of(b);
+            let prev = last_pushed_bindings.get(&b.id).cloned();
+            let scope_or_source_changed = match prev.as_ref() {
+                Some(p) => p.source != new_snap.source
+                    || p.prim_path != new_snap.prim_path
+                    || p.target_prims != new_snap.target_prims,
+                None => true,
+            };
+            if scope_or_source_changed {
+                if let Err(e) = hydra.apply_material_binding(
+                    b.id,
+                    &b.source,
+                    &b.prim_path,
+                    &b.target_prims,
                 ) {
-                    log::warn!("Hydra: set_external_material_on_prims failed: {e:#}");
-                }
-                if last_target_prims.as_slice() != target_prims {
-                    *last_target_prims = target_prims.to_vec();
-                }
-                // Push the editor's live input snapshot through to
-                // the bridge, dirty-tracked against the last values
-                // we sent. Authoring session-layer overrides every
-                // frame would re-trigger a delegate Sync each time,
-                // so we only call when a slider has moved.
-                if let Some(inputs) = material_inputs {
-                    let dirty = match last_material_inputs {
-                        Some(prev) => prev.diffuse_color != inputs.diffuse_color
-                            || prev.metallic != inputs.metallic
-                            || prev.roughness != inputs.roughness
-                            || prev.opacity != inputs.opacity
-                            || prev.clearcoat != inputs.clearcoat
-                            || prev.clearcoat_roughness != inputs.clearcoat_roughness
-                            || prev.emission_color != inputs.emission_color
-                            || prev.emission_intensity != inputs.emission_intensity,
-                        None => true,
-                    };
-                    if dirty {
-                        // Use shader-id-specific input names so each
-                        // shader sees the override on the attribute
-                        // its network actually consumes. The bridge
-                        // is generic — it just sets `inputs:<name>`
-                        // on the first Shader child of the external
-                        // material — so picking the right `<name>`
-                        // per kind is the consumer's job here.
-                        // `None` means the shader doesn't expose
-                        // that concept; skip the call entirely.
-                        let names = mat.kind.input_names();
-                        if let Some(n) = names.diffuse_color {
-                            hydra.set_external_material_input_color3(
-                                n,
-                                inputs.diffuse_color,
-                            );
-                        }
-                        if let Some(n) = names.metallic {
-                            hydra.set_external_material_input_f(n, inputs.metallic);
-                        }
-                        if let Some(n) = names.roughness {
-                            hydra.set_external_material_input_f(n, inputs.roughness);
-                        }
-                        if let Some(n) = names.opacity {
-                            hydra.set_external_material_input_f(n, inputs.opacity);
-                        }
-                        if let Some(n) = names.clearcoat {
-                            hydra.set_external_material_input_f(n, inputs.clearcoat);
-                        }
-                        if let Some(n) = names.clearcoat_roughness {
-                            hydra.set_external_material_input_f(
-                                n,
-                                inputs.clearcoat_roughness,
-                            );
-                        }
-                        if let Some(n) = names.emission_color {
-                            hydra.set_external_material_input_color3(
-                                n,
-                                inputs.emission_color,
-                            );
-                        }
-                        if let Some(n) = names.emission_intensity {
-                            hydra.set_external_material_input_f(
-                                n,
-                                inputs.emission_intensity,
-                            );
-                        }
-                        *last_material_inputs = Some(*inputs);
-                    }
+                    log::warn!("Hydra: apply_material_binding failed: {e:#}");
                 }
             }
-            None => {
-                hydra.clear_external_material();
-                *last_material_inputs = None;
+            let inputs_changed = match prev.as_ref() {
+                Some(p) => p.inputs != new_snap.inputs,
+                None => true,
+            };
+            if inputs_changed || scope_or_source_changed {
+                let names = b.kind.input_names();
+                if let Some(n) = names.diffuse_color {
+                    hydra.set_binding_input_color3(b.id, n, b.inputs.diffuse_color);
+                }
+                if let Some(n) = names.metallic {
+                    hydra.set_binding_input_f(b.id, n, b.inputs.metallic);
+                }
+                if let Some(n) = names.roughness {
+                    hydra.set_binding_input_f(b.id, n, b.inputs.roughness);
+                }
+                if let Some(n) = names.opacity {
+                    hydra.set_binding_input_f(b.id, n, b.inputs.opacity);
+                }
+                if let Some(n) = names.clearcoat {
+                    hydra.set_binding_input_f(b.id, n, b.inputs.clearcoat);
+                }
+                if let Some(n) = names.clearcoat_roughness {
+                    hydra.set_binding_input_f(b.id, n, b.inputs.clearcoat_roughness);
+                }
+                if let Some(n) = names.emission_color {
+                    hydra.set_binding_input_color3(b.id, n, b.inputs.emission_color);
+                }
+                if let Some(n) = names.emission_intensity {
+                    hydra.set_binding_input_f(b.id, n, b.inputs.emission_intensity);
+                }
             }
+            last_pushed_bindings.insert(b.id, new_snap);
+        }
+        // Drop any bindings that disappeared from the App-side Vec.
+        let dropped: Vec<u64> = last_pushed_bindings
+            .keys()
+            .copied()
+            .filter(|id| !current_ids.contains(id))
+            .collect();
+        for id in dropped {
+            hydra.remove_material_binding(id);
+            last_pushed_bindings.remove(&id);
         }
         hydra.set_purposes(*show_render, *show_proxy, *show_guides);
         if let Err(e) = hydra.set_environment(env.as_ref()) {
@@ -3506,7 +3620,7 @@ impl App {
         // session layer alone.
         if *hydra_paint_sync_pending {
             *hydra_paint_sync_pending = false;
-            if selected_material.is_none() {
+            if material_bindings.is_empty() {
                 let status = Self::sync_painted_material(
                     frame,
                     vp,
@@ -3698,6 +3812,7 @@ impl App {
         draw_chip(2, "guides", show_guides);
 
         let _ = frame;
+        viewport_selection
     }
 
     /// Exports the current paint target to a cache dir as per-tile
@@ -4232,25 +4347,21 @@ impl App {
             ui.with_layout(
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
-                    let bound = self.selected_material_idx.is_some();
+                    let bound_n = self.material_bindings.len();
                     if ui
-                        .add_enabled(bound, egui::Button::new("Clear material"))
+                        .add_enabled(
+                            bound_n > 0,
+                            egui::Button::new(format!("Clear bindings ({bound_n})")),
+                        )
                         .on_hover_text(
-                            "Drop the library material binding; stage's authored materials take over again.",
+                            "Remove every library-material binding from the stage. The stage's authored materials take over again.",
                         )
                         .clicked()
                     {
-                        self.selected_material_idx = None;
+                        self.material_bindings.clear();
+                        self.active_binding_id = None;
                     }
-                    if let Some(idx) = self.selected_material_idx {
-                        if let Some(mat) = self.browser.materials.get(idx) {
-                            ui.label(
-                                egui::RichText::new(format!("Bound: {}", mat.name))
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(180, 220, 180)),
-                            );
-                        }
-                    }
+                    ui.weak("Click a chip to add its shader node to the editor.");
                 },
             );
         });
@@ -4281,19 +4392,22 @@ impl App {
                             continue;
                         }
                         ui.vertical(|ui| {
-                            // Card body: a 80×80 phosphor glyph button.
-                            // Real previews (offscreen-rendered swatches)
-                            // are a follow-up; sphere glyph reads as
-                            // "material" well enough for v1.
-                            let glyph = egui::RichText::new(
-                                egui_phosphor::regular::SPHERE,
-                            )
-                            .size(40.0);
-                            let active = self.selected_material_idx == Some(i);
-                            let btn = egui::Button::new(glyph)
-                                .min_size(egui::vec2(80.0, 80.0))
-                                .selected(active);
-                            let resp = ui.add(btn).on_hover_text(format!(
+                            let (rect, resp) =
+                                ui.allocate_exact_size(egui::vec2(84.0, 84.0), egui::Sense::click());
+                            let visuals = ui.style().interact(&resp);
+                            ui.painter().rect(
+                                rect,
+                                6.0,
+                                visuals.bg_fill,
+                                visuals.bg_stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                            crate::assets::paint_material_preview_ball(
+                                ui,
+                                rect.shrink(5.0),
+                                mat.preview_inputs,
+                            );
+                            let resp = resp.on_hover_text(format!(
                                 "{}\n{}\n{}",
                                 mat.name,
                                 mat.kind.label(),
@@ -4327,41 +4441,24 @@ impl App {
             });
 
         if let Some(i) = clicked {
-            // Toggle: clicking the active card clears the selection.
-            self.selected_material_idx =
-                if self.selected_material_idx == Some(i) {
-                    None
-                } else {
-                    Some(i)
-                };
-            // Seed (or clear) the editable input snapshot so the
-            // settings pane shows the material's authored values
-            // immediately. Skipping the source-read on clear keeps
-            // the Hydra-side overrides cleared automatically by the
-            // dirty-tracker.
-            self.selected_material_inputs = self
-                .selected_material_idx
-                .and_then(|idx| self.browser.materials.get(idx))
-                .map(|mat| crate::assets::read_material_inputs(&mat.source));
-            self.last_material_inputs = None;
-            // New chip means a fresh binding — drop any per-prim
-            // scope the previous material had so we don't silently
-            // restrict the new one to the old material's targets.
-            self.selected_material_target_prims.clear();
-            self.last_pushed_target_prims.clear();
-            // Reset the node graph for the new material — fresh
-            // Shader+Output pair, any texture nodes the previous
-            // binding had get dropped. (Restoring saved graph state
-            // happens through the sidecar load path, not here.)
-            if self.selected_material_idx.is_some() {
-                self.material_graph.rebuild_for_material();
-            }
-            // Materials only matter in Hydra mode; nudge the user if
-            // they pick a material while in wgpu.
-            if self.renderer_mode == RendererMode::Wgpu
-                && self.selected_material_idx.is_some()
-            {
-                self.status = "Material bound in Hydra session layer — switch to Hydra to preview.".to_string();
+            // Chip click → spawn a fresh Shader node in the Material
+            // Editor for this library material, unassigned. The
+            // user wires up the assignment via the node's right-
+            // click menu ("Assign to selection" / "Assign to stage").
+            if let Some(mat) = self.browser.materials.get(i) {
+                let new_id = self.next_binding_id;
+                self.next_binding_id += 1;
+                self.material_bindings.push(MaterialBindingInstance {
+                    id: new_id,
+                    source: mat.source.clone(),
+                    prim_path: mat.prim_path.clone(),
+                    kind: mat.kind,
+                    inputs: crate::assets::read_material_inputs(&mat.source),
+                    target_prims: Vec::new(),
+                    assigned: false,
+                });
+                self.material_graph.spawn_shader_node(new_id);
+                self.active_binding_id = Some(new_id);
             }
         }
     }

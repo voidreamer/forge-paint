@@ -1,40 +1,35 @@
 //! egui-snarl-based material network editor.
 //!
-//! Renders the currently-bound library material as a node graph in the
-//! Material properties tab. v1 scope:
+//! C2b model: each `Shader` node in the graph represents one
+//! `MaterialBindingInstance` from the App's `material_bindings`
+//! Vec — `binding_id` is the back-reference. Clicking a chip in
+//! the gallery spawns a new Shader node (unassigned); right-clicking
+//! a Shader node opens an assignment menu ("Assign to selection",
+//! "Assign to stage-wide", "Unassign", "Remove"). The per-frame
+//! draw_hydra_central loop reads the bindings Vec back out and
+//! pushes only the assigned ones through hydra-rs.
 //!
-//! - **Shader** node — the bound material, one input pin per editable
-//!   slot (Base Color, Metallic, Roughness, …) with the existing
-//!   inline slider / colour-picker controls. Slots the shader doesn't
-//!   expose for its kind render disabled.
-//! - **Output** node — sink for the shader's surface terminal.
-//! - **Texture** nodes — file picker + UV-scale knobs, single RGB
-//!   output. Added through the right-click "Add → Texture" menu;
-//!   wires from a texture's RGB output to a shader-input pin are
-//!   captured visually and persisted via the project sidecar.
-//!
-//! Texture connections are visual-only in v1 — hooking them up to
-//! Hydra requires a `set_external_material_input_texture` entry
-//! point on hydra-rs which lands in a follow-up. Scalar / colour
-//! pin edits work today; they mutate the shared `MaterialInputs`
-//! buffer that the per-frame `draw_hydra_central` override push
-//! already consumes, so live preview keeps working unchanged.
+//! Texture nodes are visual-only in v1 — full Hydra wiring lands in
+//! a follow-up once hydra-rs gains a `set_binding_input_texture` API.
 
 use std::path::PathBuf;
 
 use eframe::egui;
 use egui_snarl::{
     ui::{PinInfo, SnarlViewer},
-    InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
+    InPin, NodeId, OutPin, Snarl,
 };
 
-use crate::assets::{MaterialInputs, ShaderInputNames};
+use crate::assets::ShaderInputNames;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum MaterialNode {
-    Shader,
+    /// Backed by `App.material_bindings[binding_id]`. Inputs are
+    /// rendered as port rows with inline sliders / colour pickers
+    /// that mutate the binding's `MaterialInputs` directly.
+    Shader { binding_id: u64 },
+    /// Texture node — visual only in v1.
     Texture(TextureNode),
-    Output,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -52,54 +47,73 @@ impl Default for TextureNode {
     }
 }
 
-/// Per-material-binding graph state. Persisted via the project
-/// sidecar so node positions + texture wiring round-trip.
+/// Per-stage material network. Lives on `App`; persists across
+/// renderer switches and binding edits within a session.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MaterialGraph {
     pub snarl: Snarl<MaterialNode>,
-    pub shader_node: Option<NodeId>,
-    pub output_node: Option<NodeId>,
+    /// Auto-placement cursor for new Shader nodes — advances on
+    /// each spawn so chips dropped in quick succession don't all
+    /// pile up at the same position.
+    next_node_pos: [f32; 2],
 }
 
 impl Default for MaterialGraph {
     fn default() -> Self {
         Self {
             snarl: Snarl::new(),
-            shader_node: None,
-            output_node: None,
+            next_node_pos: [40.0, 40.0],
         }
     }
 }
 
 impl MaterialGraph {
-    /// Wipe and recreate the graph for a freshly-bound material:
-    /// a Shader node wired through to an Output node. Texture
-    /// nodes the user adds afterwards stay in `snarl`.
-    pub fn rebuild_for_material(&mut self) {
-        self.snarl = Snarl::new();
-        let shader = self
+    /// Spawn a Shader node for the given binding at the next auto-
+    /// layout position. Caller is responsible for adding the
+    /// matching MaterialBindingInstance to the App's Vec first.
+    pub fn spawn_shader_node(&mut self, binding_id: u64) {
+        let pos = egui::pos2(self.next_node_pos[0], self.next_node_pos[1]);
+        self.snarl
+            .insert_node(pos, MaterialNode::Shader { binding_id });
+        self.next_node_pos[0] += 220.0;
+        if self.next_node_pos[0] > 800.0 {
+            self.next_node_pos[0] = 40.0;
+            self.next_node_pos[1] += 260.0;
+        }
+    }
+
+    /// Drop the Shader node backing `binding_id`, if any. Used when
+    /// the user explicitly removes a binding from the graph's
+    /// right-click menu.
+    pub fn remove_shader_node(&mut self, binding_id: u64) {
+        let ids: Vec<NodeId> = self
             .snarl
-            .insert_node(egui::pos2(40.0, 80.0), MaterialNode::Shader);
-        let output = self
-            .snarl
-            .insert_node(egui::pos2(420.0, 80.0), MaterialNode::Output);
-        let _ = self.snarl.connect(
-            OutPinId {
-                node: shader,
-                output: 0,
-            },
-            InPinId {
-                node: output,
-                input: 0,
-            },
-        );
-        self.shader_node = Some(shader);
-        self.output_node = Some(output);
+            .node_ids()
+            .filter_map(|(id, node)| match node {
+                MaterialNode::Shader { binding_id: b } if *b == binding_id => Some(id),
+                _ => None,
+            })
+            .collect();
+        for id in ids {
+            self.snarl.remove_node(id);
+        }
+    }
+
+    /// Pan the visible graph by moving every node together. egui-snarl's
+    /// built-in viewport transform is private, so this gives us reliable
+    /// middle-mouse canvas panning even when the cursor is over a node body.
+    pub fn pan_nodes_by(&mut self, delta: egui::Vec2) {
+        if delta == egui::Vec2::ZERO {
+            return;
+        }
+        for node in self.snarl.nodes_info_mut() {
+            node.pos += delta;
+        }
+        self.next_node_pos[0] += delta.x;
+        self.next_node_pos[1] += delta.y;
     }
 }
 
-/// User-facing slot order on the Shader node. Indexed by input pin
-/// number, so `show_input` reads `SHADER_PINS[pin.id.input]`.
 #[derive(Copy, Clone, Debug)]
 pub enum ShaderPin {
     DiffuseColor,
@@ -151,39 +165,111 @@ impl ShaderPin {
     }
 }
 
+/// Action the graph viewer emits as the user interacts with the
+/// right-click menu on a Shader node. App drains the Vec after
+/// snarl.show returns.
+#[derive(Debug, Clone)]
+pub enum GraphAction {
+    AssignToSelection(u64),
+    AssignToStage(u64),
+    Unassign(u64),
+    Remove(u64),
+}
+
 pub struct GraphViewer<'a> {
-    pub material_title: String,
-    pub shader_inputs: ShaderInputNames,
-    pub inputs: &'a mut MaterialInputs,
+    pub bindings: &'a mut Vec<crate::app::MaterialBindingInstance>,
+    pub browser_selection: &'a std::collections::HashSet<String>,
+    pub pending_actions: &'a mut Vec<GraphAction>,
+}
+
+impl<'a> GraphViewer<'a> {
+    fn binding_for(
+        &self,
+        binding_id: u64,
+    ) -> Option<&crate::app::MaterialBindingInstance> {
+        self.bindings.iter().find(|b| b.id == binding_id)
+    }
+
+    fn binding_for_mut(
+        &mut self,
+        binding_id: u64,
+    ) -> Option<&mut crate::app::MaterialBindingInstance> {
+        self.bindings.iter_mut().find(|b| b.id == binding_id)
+    }
 }
 
 impl<'a> SnarlViewer<MaterialNode> for GraphViewer<'a> {
     fn title(&mut self, node: &MaterialNode) -> String {
         match node {
-            MaterialNode::Shader => self.material_title.clone(),
+            MaterialNode::Shader { binding_id } => {
+                let b = self.binding_for(*binding_id);
+                let stem = b
+                    .map(|b| {
+                        b.source
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("material#{binding_id}"))
+                    })
+                    .unwrap_or_else(|| format!("material#{binding_id} (missing)"));
+                let scope = b.map(|b| {
+                    if !b.assigned {
+                        "unassigned".to_string()
+                    } else if b.target_prims.is_empty() {
+                        "stage".to_string()
+                    } else {
+                        format!("{} prim(s)", b.target_prims.len())
+                    }
+                }).unwrap_or_default();
+                if scope.is_empty() {
+                    stem
+                } else {
+                    format!("{stem} · {scope}")
+                }
+            }
             MaterialNode::Texture(t) => t
                 .path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("texture")
                 .to_string(),
-            MaterialNode::Output => "Output".to_string(),
         }
     }
 
     fn inputs(&mut self, node: &MaterialNode) -> usize {
         match node {
-            MaterialNode::Shader => SHADER_PINS.len(),
+            MaterialNode::Shader { .. } => SHADER_PINS.len(),
             MaterialNode::Texture(_) => 0,
-            MaterialNode::Output => 1,
         }
     }
 
     fn outputs(&mut self, node: &MaterialNode) -> usize {
         match node {
-            MaterialNode::Shader => 1,
+            MaterialNode::Shader { .. } => 1,
             MaterialNode::Texture(_) => 1,
-            MaterialNode::Output => 0,
+        }
+    }
+
+    fn has_body(&mut self, node: &MaterialNode) -> bool {
+        matches!(node, MaterialNode::Shader { .. })
+    }
+
+    fn show_body(
+        &mut self,
+        node: NodeId,
+        _inputs: &[InPin],
+        _outputs: &[OutPin],
+        ui: &mut egui::Ui,
+        _scale: f32,
+        snarl: &mut Snarl<MaterialNode>,
+    ) {
+        let binding_id = match &snarl[node] {
+            MaterialNode::Shader { binding_id } => *binding_id,
+            MaterialNode::Texture(_) => return,
+        };
+        if let Some(binding) = self.binding_for(binding_id) {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(76.0, 76.0), egui::Sense::hover());
+            crate::assets::paint_material_preview_ball(ui, rect, binding.inputs);
         }
     }
 
@@ -194,73 +280,75 @@ impl<'a> SnarlViewer<MaterialNode> for GraphViewer<'a> {
         _scale: f32,
         snarl: &mut Snarl<MaterialNode>,
     ) -> PinInfo {
-        match &snarl[pin.id.node] {
-            MaterialNode::Shader => {
+        match snarl[pin.id.node].clone() {
+            MaterialNode::Shader { binding_id } => {
                 let slot = SHADER_PINS
                     .get(pin.id.input)
                     .copied()
                     .unwrap_or(ShaderPin::DiffuseColor);
-                let supported = slot.shader_input_name(&self.shader_inputs).is_some();
-                ui.add_enabled_ui(supported, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(slot.label());
-                        match slot {
-                            ShaderPin::DiffuseColor => {
-                                ui.color_edit_button_rgb(&mut self.inputs.diffuse_color);
-                            }
-                            ShaderPin::Metallic => {
-                                ui.add(
-                                    egui::Slider::new(&mut self.inputs.metallic, 0.0..=1.0)
+                let mut supported = false;
+                if let Some(b) = self.binding_for_mut(binding_id) {
+                    let names = b.kind.input_names();
+                    supported = slot.shader_input_name(&names).is_some();
+                    ui.add_enabled_ui(supported, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(slot.label());
+                            match slot {
+                                ShaderPin::DiffuseColor => {
+                                    ui.color_edit_button_rgb(&mut b.inputs.diffuse_color);
+                                }
+                                ShaderPin::Metallic => {
+                                    ui.add(
+                                        egui::Slider::new(&mut b.inputs.metallic, 0.0..=1.0)
+                                            .show_value(false),
+                                    );
+                                }
+                                ShaderPin::Roughness => {
+                                    ui.add(
+                                        egui::Slider::new(&mut b.inputs.roughness, 0.0..=1.0)
+                                            .show_value(false),
+                                    );
+                                }
+                                ShaderPin::Opacity => {
+                                    ui.add(
+                                        egui::Slider::new(&mut b.inputs.opacity, 0.0..=1.0)
+                                            .show_value(false),
+                                    );
+                                }
+                                ShaderPin::Clearcoat => {
+                                    ui.add(
+                                        egui::Slider::new(&mut b.inputs.clearcoat, 0.0..=2.0)
+                                            .show_value(false),
+                                    );
+                                }
+                                ShaderPin::ClearcoatRoughness => {
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut b.inputs.clearcoat_roughness,
+                                            0.0..=1.0,
+                                        )
                                         .show_value(false),
-                                );
-                            }
-                            ShaderPin::Roughness => {
-                                ui.add(
-                                    egui::Slider::new(&mut self.inputs.roughness, 0.0..=1.0)
+                                    );
+                                }
+                                ShaderPin::EmissionColor => {
+                                    ui.color_edit_button_rgb(&mut b.inputs.emission_color);
+                                }
+                                ShaderPin::EmissionIntensity => {
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut b.inputs.emission_intensity,
+                                            0.0..=10.0,
+                                        )
                                         .show_value(false),
-                                );
+                                    );
+                                }
                             }
-                            ShaderPin::Opacity => {
-                                ui.add(
-                                    egui::Slider::new(&mut self.inputs.opacity, 0.0..=1.0)
-                                        .show_value(false),
-                                );
-                            }
-                            ShaderPin::Clearcoat => {
-                                ui.add(
-                                    egui::Slider::new(&mut self.inputs.clearcoat, 0.0..=2.0)
-                                        .show_value(false),
-                                );
-                            }
-                            ShaderPin::ClearcoatRoughness => {
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.inputs.clearcoat_roughness,
-                                        0.0..=1.0,
-                                    )
-                                    .show_value(false),
-                                );
-                            }
-                            ShaderPin::EmissionColor => {
-                                ui.color_edit_button_rgb(&mut self.inputs.emission_color);
-                            }
-                            ShaderPin::EmissionIntensity => {
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.inputs.emission_intensity,
-                                        0.0..=10.0,
-                                    )
-                                    .show_value(false),
-                                );
-                            }
-                        }
+                        });
                     });
-                });
+                } else {
+                    ui.weak("(binding gone)");
+                }
                 pin_color(supported)
-            }
-            MaterialNode::Output => {
-                ui.label("Surface");
-                PinInfo::square().with_fill(egui::Color32::from_rgb(120, 200, 120))
             }
             MaterialNode::Texture(_) => PinInfo::circle(),
         }
@@ -274,7 +362,7 @@ impl<'a> SnarlViewer<MaterialNode> for GraphViewer<'a> {
         snarl: &mut Snarl<MaterialNode>,
     ) -> PinInfo {
         match &snarl[pin.id.node] {
-            MaterialNode::Shader => {
+            MaterialNode::Shader { .. } => {
                 ui.label("Surface");
                 PinInfo::square().with_fill(egui::Color32::from_rgb(120, 200, 120))
             }
@@ -282,11 +370,63 @@ impl<'a> SnarlViewer<MaterialNode> for GraphViewer<'a> {
                 ui.label("RGB");
                 PinInfo::circle().with_fill(egui::Color32::from_rgb(240, 200, 120))
             }
-            MaterialNode::Output => PinInfo::circle(),
         }
     }
 
-    /// Right-click on empty graph background → "Add" menu.
+    fn has_node_menu(&mut self, _node: &MaterialNode) -> bool {
+        true
+    }
+
+    fn show_node_menu(
+        &mut self,
+        node: NodeId,
+        _inputs: &[InPin],
+        _outputs: &[OutPin],
+        ui: &mut egui::Ui,
+        _scale: f32,
+        snarl: &mut Snarl<MaterialNode>,
+    ) {
+        match &snarl[node] {
+            MaterialNode::Shader { binding_id } => {
+                let id = *binding_id;
+                let sel_n = self.browser_selection.len();
+                let label = if sel_n > 0 {
+                    format!("Assign to selection ({sel_n})")
+                } else {
+                    "Assign to selection".to_string()
+                };
+                if ui
+                    .add_enabled(sel_n > 0, egui::Button::new(label))
+                    .clicked()
+                {
+                    self.pending_actions
+                        .push(GraphAction::AssignToSelection(id));
+                    ui.close_menu();
+                }
+                if ui.button("Assign to entire stage").clicked() {
+                    self.pending_actions.push(GraphAction::AssignToStage(id));
+                    ui.close_menu();
+                }
+                if ui.button("Unassign").clicked() {
+                    self.pending_actions.push(GraphAction::Unassign(id));
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Remove").clicked() {
+                    self.pending_actions.push(GraphAction::Remove(id));
+                    ui.close_menu();
+                }
+            }
+            MaterialNode::Texture(_) => {
+                if ui.button("Remove").clicked() {
+                    snarl.remove_node(node);
+                    ui.close_menu();
+                }
+            }
+        }
+    }
+
+    /// Right-click on empty graph background → "Add Texture".
     fn has_graph_menu(&mut self, _pos: egui::Pos2, _snarl: &mut Snarl<MaterialNode>) -> bool {
         true
     }
@@ -315,9 +455,6 @@ impl<'a> SnarlViewer<MaterialNode> for GraphViewer<'a> {
         }
     }
 
-    /// Restrict wiring: only Texture-RGB → Shader-input is meaningful
-    /// in v1. Anything else (texture→output, shader→shader, …) gets
-    /// silently rejected.
     fn connect(
         &mut self,
         from: &OutPin,
@@ -325,12 +462,8 @@ impl<'a> SnarlViewer<MaterialNode> for GraphViewer<'a> {
         snarl: &mut Snarl<MaterialNode>,
     ) {
         let from_is_texture = matches!(snarl[from.id.node], MaterialNode::Texture(_));
-        let to_is_shader = matches!(snarl[to.id.node], MaterialNode::Shader);
-        let surface_terminal = matches!(snarl[from.id.node], MaterialNode::Shader)
-            && matches!(snarl[to.id.node], MaterialNode::Output);
-        if (from_is_texture && to_is_shader) || surface_terminal {
-            // Replace any existing wire on the destination input —
-            // shader inputs are single-valued.
+        let to_is_shader = matches!(snarl[to.id.node], MaterialNode::Shader { .. });
+        if from_is_texture && to_is_shader {
             for existing in &to.remotes {
                 snarl.disconnect(*existing, to.id);
             }

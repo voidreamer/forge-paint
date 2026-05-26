@@ -166,6 +166,24 @@ impl GpuMesh {
     }
 }
 
+impl CpuMesh {
+    /// Source USD prim that owns `tri_index`, when this mesh came from a
+    /// merged USD stage. The loader emits each source mesh into a
+    /// contiguous vertex range, so checking all three triangle corners is
+    /// enough to avoid false positives on malformed data.
+    pub fn prim_path_for_triangle(&self, tri_index: usize) -> Option<&str> {
+        let tri = self.indices.get(tri_index)?;
+        self.prim_ranges
+            .iter()
+            .find(|range| {
+                let start = range.vert_start;
+                let end = start + range.vert_count;
+                tri.iter().all(|&v| v >= start && v < end)
+            })
+            .map(|range| range.prim_path.as_str())
+    }
+}
+
 /// `prim_path` is selected iff the set holds it directly OR holds
 /// an ancestor (any prefix that ends at a `/` boundary, so
 /// `/World/F` doesn't match `/World/Foo`).

@@ -322,6 +322,59 @@ impl HydraView {
             .set_external_material_input_i(input_name, value);
     }
 
+    /// Push Storm's selection-highlight set. Storm bakes the
+    /// outline into the color AOV via HdxColorizeSelectionTask
+    /// (only active when `color` is registered as the viewport
+    /// AOV, which hydra-rs does at construction).
+    pub fn set_selection<S: AsRef<str>>(&mut self, paths: &[S]) {
+        self.renderer.set_selection(paths);
+    }
+
+    pub fn set_selection_color(&mut self, color: [f32; 4]) {
+        self.renderer.set_selection_color(color);
+    }
+
+    /// Concurrent multi-material binding (C2b) — apply or update
+    /// the binding identified by `binding_id`. Idempotent; the bridge
+    /// re-authors only the affected SdfPaths.
+    pub fn apply_material_binding(
+        &mut self,
+        binding_id: u64,
+        source: &Path,
+        prim_path: &str,
+        target_prims: &[String],
+    ) -> Result<()> {
+        self.renderer
+            .apply_material_binding(binding_id, source, prim_path, target_prims)
+            .map_err(|e| anyhow::anyhow!("apply_material_binding failed: {}", e.what()))
+    }
+
+    pub fn remove_material_binding(&mut self, binding_id: u64) {
+        self.renderer.remove_material_binding(binding_id);
+    }
+
+    pub fn clear_all_material_bindings(&mut self) {
+        self.renderer.clear_all_material_bindings();
+    }
+
+    pub fn set_binding_input_f(&mut self, binding_id: u64, input_name: &str, value: f32) {
+        self.renderer.set_binding_input_f(binding_id, input_name, value);
+    }
+
+    pub fn set_binding_input_color3(
+        &mut self,
+        binding_id: u64,
+        input_name: &str,
+        color: [f32; 3],
+    ) {
+        self.renderer
+            .set_binding_input_color3(binding_id, input_name, color);
+    }
+
+    pub fn set_binding_input_i(&mut self, binding_id: u64, input_name: &str, value: i32) {
+        self.renderer.set_binding_input_i(binding_id, input_name, value);
+    }
+
     /// Push the consumer's analytic-light list into the Hydra
     /// session layer. Each `Light` becomes either a
     /// `UsdLuxDistantLight` (directional) or a `UsdLuxSphereLight`

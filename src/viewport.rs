@@ -22,6 +22,7 @@ use crate::wireframe::WireframePipeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
+    Select,
     Paint,
     Erase,
     Fill,
@@ -55,6 +56,7 @@ impl Default for StencilTransform {
 impl Tool {
     pub fn label(self) -> &'static str {
         match self {
+            Tool::Select => "Select",
             Tool::Paint => "Paint",
             Tool::Erase => "Erase",
             Tool::Fill => "Fill",
@@ -64,6 +66,7 @@ impl Tool {
     }
     pub fn shortcut(self) -> &'static str {
         match self {
+            Tool::Select => "V",
             Tool::Paint => "B",
             Tool::Erase => "E",
             Tool::Fill => "G",
@@ -242,6 +245,12 @@ pub struct BakeStatus {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ViewportSelection {
+    pub prim_path: String,
+    pub multi: bool,
+}
+
 pub struct BrushState {
     pub channel: PaintChannel,
     /// Single-source color for the brush. Drives base color directly, and
@@ -281,6 +290,52 @@ impl Viewport {
         selected: &std::collections::HashSet<String>,
     ) {
         self.mesh.set_selection(queue, selected);
+    }
+
+    pub fn selection_from_response(
+        &self,
+        response: &egui::Response,
+        rect: egui::Rect,
+        allow_plain_click: bool,
+    ) -> Option<ViewportSelection> {
+        if !response.clicked_by(egui::PointerButton::Primary) {
+            return None;
+        }
+        let modifiers = response.ctx.input(|i| i.modifiers);
+        if modifiers.shift {
+            return None;
+        }
+        let modifier_select = modifiers.alt;
+        let tool_select = self.tool == Tool::Select;
+        let plain_select = allow_plain_click && !modifiers.alt;
+        if !tool_select && !modifier_select && !plain_select {
+            return None;
+        }
+        let pos = response.interact_pointer_pos()?;
+        if !rect.contains(pos) {
+            return None;
+        }
+        let aspect = rect.width() / rect.height().max(1.0);
+        let path = self.prim_path_at_screen_pos(pos, rect, aspect)?;
+        Some(ViewportSelection {
+            prim_path: path,
+            multi: modifiers.command || modifiers.ctrl || modifiers.mac_cmd,
+        })
+    }
+
+    pub fn prim_path_at_screen_pos(
+        &self,
+        screen_pos: egui::Pos2,
+        rect: egui::Rect,
+        aspect: f32,
+    ) -> Option<String> {
+        let view_proj = self.camera.view_proj(aspect);
+        let eye = self.camera.eye();
+        let (orig, dir) = pick::screen_to_ray(screen_pos, rect, view_proj, eye);
+        let hit = pick::pick(&self.cpu_mesh, orig, dir)?;
+        self.cpu_mesh
+            .prim_path_for_triangle(hit.tri)
+            .map(str::to_string)
     }
 
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, cpu: &CpuMesh) -> Self {
@@ -678,6 +733,7 @@ impl Viewport {
             // caller (App::save_to_work_dir) augments this field
             // after build_sidecar returns.
             bound_material: None,
+            bound_materials: Vec::new(),
         }
     }
 
@@ -893,7 +949,7 @@ impl Viewport {
         stencil_view: Option<&wgpu::TextureView>,
         stencil_aspect: f32,
         stencil_egui_tex: Option<egui::TextureId>,
-    ) {
+    ) -> Option<ViewportSelection> {
         let available = ui.available_size();
         let (rect, response) =
             ui.allocate_exact_size(available, egui::Sense::click_and_drag());
@@ -908,7 +964,7 @@ impl Viewport {
                 egui::FontId::proportional(14.0),
                 egui::Color32::WHITE,
             );
-            return;
+            return None;
         };
 
         // Paint input detection — plain LMB (no modifiers) drag or click.
@@ -988,8 +1044,19 @@ impl Viewport {
             self.adjust_anchor = None;
         }
 
-        let paint_pos = if primary_active && no_mods && !adjust_mode && !stencil_xf_mode {
+        let paint_pos = if primary_active
+            && no_mods
+            && self.tool != Tool::Select
+            && !adjust_mode
+            && !stencil_xf_mode
+        {
             response.interact_pointer_pos()
+        } else {
+            None
+        };
+
+        let viewport_selection = if !adjust_mode && !stencil_xf_mode {
+            self.selection_from_response(&response, rect, false)
         } else {
             None
         };
@@ -1852,6 +1919,8 @@ impl Viewport {
         {
             ui.ctx().request_repaint();
         }
+
+        viewport_selection
     }
 
     fn ensure_color(

@@ -38,15 +38,18 @@ pub struct ProjectSidecar {
     pub material: MaterialSection,
     #[serde(default)]
     pub layers: Vec<LayerSection>,
-    /// Library material the user bound through the Materials pane
-    /// (gallery chip click), plus any per-input slider tweaks. `None`
-    /// means no library material is bound — the stage's authored
-    /// material (or painted-material fallback) takes over. Restored
-    /// at stage load by looking up the matching `MaterialAsset` in
-    /// the freshly-scanned library and replaying the inputs through
-    /// hydra-rs's `set_external_material*` path on the next frame.
+    /// Single-binding field from sidecar v1 (B1a). Loaders treat
+    /// it as a one-element seed for `bound_materials` below when
+    /// the new field is empty — keeps old project sidecars working
+    /// after the C2b multi-binding migration.
     #[serde(default)]
     pub bound_material: Option<BoundMaterialBinding>,
+    /// Concurrent library-material bindings authored through the
+    /// Materials gallery + Material Editor (C2b). Each entry binds
+    /// a library .usd to either a target prim list or the whole
+    /// stage; sliders edits live per-entry.
+    #[serde(default)]
+    pub bound_materials: Vec<BoundMaterialBinding>,
 }
 
 impl Default for ProjectSidecar {
@@ -57,6 +60,7 @@ impl Default for ProjectSidecar {
             material: MaterialSection::default(),
             layers: Vec::new(),
             bound_material: None,
+            bound_materials: Vec::new(),
         }
     }
 }

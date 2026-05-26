@@ -415,6 +415,11 @@ pub struct MaterialAsset {
     /// pipeline convention most material libraries follow.
     pub prim_path: String,
     pub kind: MaterialKind,
+    /// Cached preview inputs for the gallery chip and material-graph
+    /// node preview. Read at discovery time from the material's
+    /// authored diffuse / base / `i_color` input plus common scalar
+    /// controls.
+    pub preview_inputs: MaterialInputs,
 }
 
 /// Reference to a USD file on disk — thumbnail comes later; for now we
@@ -789,6 +794,7 @@ pub fn discover_materials(root: &Path) -> Vec<MaterialAsset> {
                 .unwrap_or("material")
                 .to_string();
             let kind = classify_material_file(&path);
+            let preview_inputs = read_material_inputs(&path);
             out.push(MaterialAsset {
                 name,
                 source: path,
@@ -797,6 +803,7 @@ pub fn discover_materials(root: &Path) -> Vec<MaterialAsset> {
                 // per-entry later if needed — keeps v1 shape simple.
                 prim_path: String::new(),
                 kind,
+                preview_inputs,
             });
         }
         if !out.is_empty() {
@@ -816,7 +823,7 @@ pub fn discover_materials(root: &Path) -> Vec<MaterialAsset> {
 /// values so the user starts from what the library says rather than
 /// mid-range guesses. Any change authors an override session-layer-
 /// side via the bridge.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MaterialInputs {
     pub diffuse_color: [f32; 3],
     pub metallic: f32,
@@ -906,13 +913,26 @@ pub fn read_material_inputs(path: &Path) -> MaterialInputs {
         None
     };
 
-    if let Some(c) = scan_color(&["diffuseColor", "base_color", "i_color"]) {
+    let is_dl_glass = text.contains("info:id = \"dlGlass\"");
+
+    if let Some(c) = scan_color(&[
+        "diffuseColor",
+        "base_color",
+        "i_color",
+        "reflect_color",
+        "refract_color",
+    ]) {
         inputs.diffuse_color = c;
     }
     if let Some(v) = scan_float(&["metallic", "metalness"]) {
         inputs.metallic = v;
     }
-    if let Some(v) = scan_float(&["roughness", "specular_roughness"]) {
+    if let Some(v) = scan_float(&[
+        "roughness",
+        "specular_roughness",
+        "reflect_roughness",
+        "refract_roughness",
+    ]) {
         inputs.roughness = v;
     }
     if let Some(v) = scan_float(&["opacity"]) {
@@ -941,7 +961,167 @@ pub fn read_material_inputs(path: &Path) -> MaterialInputs {
     if let Some(v) = scan_float(&["emission", "incandescence_intensity"]) {
         inputs.emission_intensity = v;
     }
+    if is_dl_glass {
+        inputs.opacity = inputs.opacity.min(0.28);
+        inputs.metallic = 0.0;
+    }
     inputs
+}
+
+/// Paint a small, self-contained material preview ball. It is not a
+/// renderer thumbnail, but it does read the same scalar inputs the editor
+/// mutates, so swatches and shader nodes show metal/roughness/opacity
+/// differences instead of a flat colour glyph.
+pub fn paint_material_preview_ball(ui: &egui::Ui, rect: egui::Rect, inputs: MaterialInputs) {
+    let painter = ui.painter();
+    painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(24, 25, 28));
+
+    let pad = rect.width().min(rect.height()) * 0.11;
+    let side = (rect.width().min(rect.height()) - pad * 2.0).max(8.0);
+    let ball_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+    let center = ball_rect.center();
+    let radius = side * 0.5;
+
+    if inputs.opacity < 0.98 {
+        paint_checker(ui, ball_rect, radius);
+    }
+
+    let base = shade_base(inputs.diffuse_color, inputs.opacity);
+    painter.circle_filled(center, radius, base);
+
+    let mut mesh = egui::epaint::Mesh::default();
+    let steps = 30;
+    for y in 0..steps {
+        for x in 0..steps {
+            let x0 = -1.0 + 2.0 * x as f32 / steps as f32;
+            let y0 = -1.0 + 2.0 * y as f32 / steps as f32;
+            let x1 = -1.0 + 2.0 * (x + 1) as f32 / steps as f32;
+            let y1 = -1.0 + 2.0 * (y + 1) as f32 / steps as f32;
+            let cx = (x0 + x1) * 0.5;
+            let cy = (y0 + y1) * 0.5;
+            if cx * cx + cy * cy > 1.0 {
+                continue;
+            }
+
+            let idx = mesh.vertices.len() as u32;
+            for (sx, sy) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+                let r2 = (sx * sx + sy * sy).min(0.995);
+                let z = (1.0 - r2).sqrt();
+                let color = material_preview_color(sx, sy, z, inputs);
+                mesh.colored_vertex(
+                    egui::pos2(center.x + sx * radius, center.y + sy * radius),
+                    color,
+                );
+            }
+            mesh.add_triangle(idx, idx + 1, idx + 2);
+            mesh.add_triangle(idx, idx + 2, idx + 3);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+
+    let gloss = (1.0 - inputs.roughness.clamp(0.0, 1.0)).powf(2.0);
+    if gloss > 0.08 || inputs.clearcoat > 0.05 {
+        let highlight = egui::pos2(center.x - radius * 0.33, center.y - radius * 0.42);
+        let r = radius * (0.09 + 0.1 * inputs.roughness.clamp(0.0, 1.0));
+        painter.circle_filled(
+            highlight,
+            r,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, (120.0 * gloss) as u8),
+        );
+    }
+    painter.circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90)),
+    );
+}
+
+fn paint_checker(ui: &egui::Ui, rect: egui::Rect, radius: f32) {
+    let painter = ui.painter();
+    let cell = (rect.width() / 7.0).max(4.0);
+    let center = rect.center();
+    let mut y = rect.top();
+    let mut row = 0;
+    while y < rect.bottom() {
+        let mut x = rect.left();
+        let mut col = 0;
+        while x < rect.right() {
+            let mid = egui::pos2((x + cell * 0.5).min(rect.right()), (y + cell * 0.5).min(rect.bottom()));
+            let d = mid - center;
+            if d.length_sq() <= radius * radius {
+                let color = if (row + col) % 2 == 0 {
+                    egui::Color32::from_rgb(66, 68, 72)
+                } else {
+                    egui::Color32::from_rgb(42, 44, 48)
+                };
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x, y),
+                        egui::pos2((x + cell).min(rect.right()), (y + cell).min(rect.bottom())),
+                    ),
+                    0.0,
+                    color,
+                );
+            }
+            x += cell;
+            col += 1;
+        }
+        y += cell;
+        row += 1;
+    }
+}
+
+fn material_preview_color(nx: f32, ny: f32, nz: f32, inputs: MaterialInputs) -> egui::Color32 {
+    let base = inputs.diffuse_color.map(|v| v.clamp(0.0, 1.0));
+    let metallic = inputs.metallic.clamp(0.0, 1.0);
+    let roughness = inputs.roughness.clamp(0.02, 1.0);
+    let opacity = inputs.opacity.clamp(0.08, 1.0);
+
+    let n = glam::Vec3::new(nx, -ny, nz).normalize_or_zero();
+    let light = glam::Vec3::new(-0.45, 0.62, 0.78).normalize();
+    let view = glam::Vec3::Z;
+    let half = (light + view).normalize();
+    let ndotl = n.dot(light).max(0.0);
+    let ndoth = n.dot(half).max(0.0);
+    let rim = (1.0 - nz).clamp(0.0, 1.0).powf(2.0);
+
+    let diffuse_energy = 1.0 - metallic * 0.72;
+    let diffuse = 0.13 + 0.78 * ndotl;
+    let spec_power = 3.0 + (1.0 - roughness).powf(2.2) * 180.0;
+    let spec = ndoth.powf(spec_power) * (1.15 - roughness * 0.72);
+    let coat = ndoth.powf(260.0) * inputs.clearcoat.clamp(0.0, 2.0) * 0.32;
+    let emission = inputs.emission_intensity.clamp(0.0, 12.0) * 0.08;
+
+    let mut rgb = [0.0; 3];
+    for i in 0..3 {
+        let f0 = 0.045 * (1.0 - metallic) + base[i] * metallic;
+        let env = 0.08 + 0.13 * rim + 0.06 * (1.0 - roughness);
+        rgb[i] = base[i] * diffuse * diffuse_energy
+            + f0 * spec * (0.75 + 1.35 * metallic)
+            + env * (0.7 + metallic * 0.4)
+            + coat
+            + inputs.emission_color[i].clamp(0.0, 1.0) * emission;
+    }
+
+    egui::Color32::from_rgba_unmultiplied(
+        to_u8(rgb[0]),
+        to_u8(rgb[1]),
+        to_u8(rgb[2]),
+        (opacity * 255.0) as u8,
+    )
+}
+
+fn shade_base(rgb: [f32; 3], opacity: f32) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        to_u8(rgb[0] * 0.28),
+        to_u8(rgb[1] * 0.28),
+        to_u8(rgb[2] * 0.28),
+        (opacity.clamp(0.08, 1.0) * 255.0) as u8,
+    )
+}
+
+fn to_u8(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8
 }
 
 /// Cheap shader-id sniff of a USD material file. Filename hints
