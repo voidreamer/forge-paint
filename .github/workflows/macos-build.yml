@@ -151,6 +151,9 @@ jobs:
           # Bundled brushes, stencils, env maps. The asset browser
           # starts empty without these.
           cp -R assets "$stage/"
+          if [ -d tools ]; then
+            cp -R tools "$stage/"
+          fi
           if [ -d test_assets ]; then
             cp -R test_assets "$stage/"
           fi
@@ -173,9 +176,11 @@ jobs:
 
             xattr -dr com.apple.quarantine forge-paint usd/
 
-          Opening files: drag-and-drop a .usda/.usdc/.usdz onto the
-          window, or use File > Open. forge:// URIs only resolve when
-          launched through anvil; standalone runs are filesystem-only.
+          Opening files: drag-and-drop a .usd/.usda/.usdc/.usdz or .obj
+          onto the window, or use File > Open Model / USD. OBJ files
+          are converted to a .usda file before loading. forge:// URIs
+          only resolve when launched through anvil; standalone runs are
+          filesystem-only.
 
           Hydra/Storm is bundled through OpenUSD. 3Delight is optional:
           install 3Delight separately and add a compatible hdNSI plugin

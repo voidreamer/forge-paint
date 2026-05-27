@@ -19,6 +19,7 @@ pub struct App {
     // Open URI dialog state
     show_uri_dialog: bool,
     uri_buffer: String,
+    pending_conversion: Option<PendingModelConversion>,
 
     browser: AssetBrowser,
 
@@ -171,6 +172,44 @@ pub struct App {
     /// Mirrors how the left tool column works — one focused view at a
     /// time, switched via the icon strip on the right edge.
     props_tab: PropertiesTab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvertibleModelKind {
+    Obj,
+}
+
+impl ConvertibleModelKind {
+    fn from_path(path: &Path) -> Option<Self> {
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("obj") => Some(Self::Obj),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Obj => "OBJ",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingModelConversion {
+    source: PathBuf,
+    kind: ConvertibleModelKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversionDialogAction {
+    None,
+    Convert,
+    Cancel,
 }
 
 /// Which renderer owns the central viewport. Toggled by clicking the
@@ -484,8 +523,19 @@ impl eframe::App for App {
         // If a path was passed on the CLI, open it now that the viewport exists.
         if self.viewport.is_some() {
             if let Some(path) = self.pending_open.take() {
-                self.load_usd(frame, path);
+                self.open_stage_or_offer_conversion(frame, path);
             }
+        }
+
+        let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if let Some(path) = dropped_paths.into_iter().next() {
+            self.open_stage_or_offer_conversion(frame, path);
         }
 
         // Stage-browser selection → viewport vertex-highlight mask.
@@ -545,8 +595,8 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("File", |ui| {
-                    if ui.button("Open USD…").clicked() {
-                        self.open_usd_dialog(frame);
+                    if ui.button("Open Model / USD…").clicked() {
+                        self.open_stage_dialog(frame);
                         ui.close_menu();
                     }
                     if ui.button("Open URI…").clicked() {
@@ -650,7 +700,47 @@ impl eframe::App for App {
             }
             if let Some(uri) = load_requested {
                 self.show_uri_dialog = false;
-                self.load_usd(frame, PathBuf::from(uri));
+                self.open_stage_or_offer_conversion(frame, PathBuf::from(uri));
+            }
+        }
+
+        if let Some(request) = self.pending_conversion.clone() {
+            let mut open = true;
+            let mut action = ConversionDialogAction::None;
+            egui::Window::new(format!("Convert {} to USD?", request.kind.label()))
+                .open(&mut open)
+                .resizable(false)
+                .default_width(460.0)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "{} files need to be converted to USD before forge-paint can open them.",
+                        request.kind.label()
+                    ));
+                    ui.add_space(6.0);
+                    ui.weak(request.source.display().to_string());
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Convert…").clicked() {
+                            action = ConversionDialogAction::Convert;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            action = ConversionDialogAction::Cancel;
+                        }
+                    });
+                });
+            if !open {
+                action = ConversionDialogAction::Cancel;
+            }
+            match action {
+                ConversionDialogAction::None => {}
+                ConversionDialogAction::Cancel => {
+                    self.pending_conversion = None;
+                    self.status = "Conversion cancelled.".to_string();
+                }
+                ConversionDialogAction::Convert => {
+                    self.pending_conversion = None;
+                    self.convert_model_dialog(frame, request);
+                }
             }
         }
 
@@ -3232,6 +3322,24 @@ fn is_usdz_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_usd_stage_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "usd" | "usda" | "usdc" | "usdz"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn default_converted_usd_path(source: &Path) -> PathBuf {
+    let mut out = source.to_path_buf();
+    out.set_extension("usda");
+    out
+}
+
 fn extracted_texture_lookup(
     extracted: &[crate::usdz::ExtractedTexture],
 ) -> std::collections::HashMap<String, PathBuf> {
@@ -3636,15 +3744,78 @@ impl App {
         }
     }
 
-    fn open_usd_dialog(&mut self, frame: &eframe::Frame) {
+    fn open_stage_dialog(&mut self, frame: &eframe::Frame) {
         let Some(path) = rfd::FileDialog::new()
+            .add_filter("USD / OBJ", &["usd", "usda", "usdc", "usdz", "obj"])
             .add_filter("USD", &["usd", "usda", "usdc", "usdz"])
-            .set_title("Open USD stage")
+            .add_filter("OBJ", &["obj"])
+            .set_title("Open model or USD stage")
             .pick_file()
         else {
             return;
         };
-        self.load_usd(frame, path);
+        self.open_stage_or_offer_conversion(frame, path);
+    }
+
+    fn open_stage_or_offer_conversion(&mut self, frame: &eframe::Frame, path: PathBuf) {
+        if is_usd_stage_path(&path) || path.to_string_lossy().contains("://") {
+            self.load_usd(frame, path);
+            return;
+        }
+        if let Some(kind) = ConvertibleModelKind::from_path(&path) {
+            self.pending_conversion = Some(PendingModelConversion { source: path, kind });
+            self.status = format!("{} needs USD conversion.", kind.label());
+            return;
+        }
+        self.status = format!(
+            "Unsupported file type: {}. Open USD directly or convert OBJ to USD.",
+            path.display()
+        );
+    }
+
+    fn convert_model_dialog(&mut self, frame: &eframe::Frame, request: PendingModelConversion) {
+        let suggested = default_converted_usd_path(&request.source);
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("USDA", &["usda"])
+            .add_filter("USD", &["usd", "usda", "usdc"])
+            .set_title("Save converted USD");
+        if let Some(parent) = suggested.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(name) = suggested.file_name().and_then(|n| n.to_str()) {
+            dialog = dialog.set_file_name(name);
+        }
+        let Some(dest) = dialog.save_file() else {
+            self.status = "Conversion cancelled.".to_string();
+            return;
+        };
+
+        self.status = format!(
+            "Converting {} to {}…",
+            request.source.display(),
+            dest.display()
+        );
+        match request.kind {
+            ConvertibleModelKind::Obj => {
+                match crate::obj_to_usd::convert_obj_to_usd(&request.source, &dest) {
+                    Ok(summary) => {
+                        self.status = format!(
+                            "Converted {} to {} — {} verts, {} tris",
+                            request.source.display(),
+                            dest.display(),
+                            summary.vertices,
+                            summary.triangles
+                        );
+                        log::info!("{}", self.status);
+                        self.load_usd(frame, dest);
+                    }
+                    Err(e) => {
+                        self.status = format!("OBJ conversion failed: {e:#}");
+                        log::error!("{}", self.status);
+                    }
+                }
+            }
+        }
     }
 
     fn reset_stage_material_bindings(&mut self) {

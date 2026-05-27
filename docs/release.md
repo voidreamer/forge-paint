@@ -5,6 +5,7 @@ The release zips are self-contained for the default renderer set:
 - `forge-paint(.exe)`
 - `usd/` with OpenUSD runtime libraries, plugInfo files, file-format plugins, and Hydra/Storm
 - `assets/` with starter meshes, materials, HDRI, stencils, and displacement textures
+- `tools/` with small utility scripts such as `obj_to_usd.py`
 - `README.txt`
 
 ## Build
@@ -25,6 +26,21 @@ CI uses the published `rust-usd` and `hydra-rs` crates. The repository keeps a
 local `[patch.crates-io]` block for day-to-day development against
 `../rust-usd`; the workflows strip that block before building so they do not
 need access to a private sibling checkout.
+
+## OBJ Import
+
+forge-paint is still USD-first. When the user opens or drops an `.obj`, the app
+asks where to save a converted `.usda`, runs the built-in static OBJ converter,
+and opens the result. FBX and other interchange formats are intentionally not
+handled yet; convert those externally to USD.
+
+The built-in converter supports positions, normals, UVs, polygon faces, negative
+OBJ indices, and fan triangulation. It ignores `.mtl` material libraries for
+now. The same minimal converter is available as:
+
+```bash
+python3 tools/obj_to_usd.py model.obj model.usda
+```
 
 ## 3Delight
 

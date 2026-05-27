@@ -209,6 +209,9 @@ jobs:
           # Bundled brushes, stencils, env maps. The asset browser
           # starts empty without these.
           Copy-Item -Recurse assets $stage
+          if (Test-Path tools) {
+            Copy-Item -Recurse tools $stage
+          }
           if (Test-Path test_assets) {
             Copy-Item -Recurse test_assets $stage
           }
@@ -232,9 +235,11 @@ jobs:
           Redistributable from
           https://aka.ms/vs/17/release/vc_redist.x64.exe.
 
-          Opening files: drag-and-drop a .usda/.usdc/.usdz onto the
-          window, or use File > Open. forge:// URIs only resolve when
-          launched through anvil; standalone runs are filesystem-only.
+          Opening files: drag-and-drop a .usd/.usda/.usdc/.usdz or .obj
+          onto the window, or use File > Open Model / USD. OBJ files
+          are converted to a .usda file before loading. forge:// URIs
+          only resolve when launched through anvil; standalone runs are
+          filesystem-only.
 
           Hydra/Storm is bundled through OpenUSD.
 

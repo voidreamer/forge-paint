@@ -14,6 +14,7 @@ mod hydra_view;
 mod lights;
 mod material_graph;
 mod mesh;
+mod obj_to_usd;
 mod paint;
 mod persist;
 mod pick;
