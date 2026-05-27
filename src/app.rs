@@ -595,7 +595,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("File", |ui| {
-                    if ui.button("Open Model / USD…").clicked() {
+                    if ui.button("Open…").clicked() {
                         self.open_stage_dialog(frame);
                         ui.close_menu();
                     }
@@ -3749,7 +3749,7 @@ impl App {
             .add_filter("USD / OBJ", &["usd", "usda", "usdc", "usdz", "obj"])
             .add_filter("USD", &["usd", "usda", "usdc", "usdz"])
             .add_filter("OBJ", &["obj"])
-            .set_title("Open model or USD stage")
+            .set_title("Open")
             .pick_file()
         else {
             return;
@@ -3768,7 +3768,7 @@ impl App {
             return;
         }
         self.status = format!(
-            "Unsupported file type: {}. Open USD directly or convert OBJ to USD.",
+            "Unsupported file type: {}. Choose a USD file directly, or choose OBJ to convert.",
             path.display()
         );
     }

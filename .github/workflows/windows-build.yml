@@ -236,7 +236,7 @@ jobs:
           https://aka.ms/vs/17/release/vc_redist.x64.exe.
 
           Opening files: drag-and-drop a .usd/.usda/.usdc/.usdz or .obj
-          onto the window, or use File > Open Model / USD. OBJ files
+          onto the window, or use File > Open. OBJ files
           are converted to a .usda file before loading. forge:// URIs
           only resolve when launched through anvil; standalone runs are
           filesystem-only.
