@@ -9,6 +9,11 @@ name: windows-build
 # under 10 min — bump the cache key suffix below to invalidate.
 on:
   workflow_dispatch:
+    inputs:
+      include_hdnsi:
+        description: 'Build and package the optional 3Delight hdNSI delegate. Requires DELIGHT on the runner or DELIGHT_WINDOWS_ARCHIVE_URL secret.'
+        type: boolean
+        default: false
   push:
     tags: ['v*']
 
@@ -27,23 +32,20 @@ env:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - name: Checkout forge-paint
         uses: actions/checkout@v4
 
-      - name: Checkout rust-usd bindings
-        uses: actions/checkout@v4
-        with:
-          repository: voidreamer/rust-usd
-          path: rust-usd
-
-      - name: Point Cargo patches at CI checkout
+      - name: Use published USD bindings
         shell: pwsh
         run: |
           $toml = Get-Content Cargo.toml -Raw
-          $toml = $toml.Replace('path = "../rust-usd"', 'path = "rust-usd"')
-          $toml = $toml.Replace('path = "../rust-usd/hydra-rs"', 'path = "rust-usd/hydra-rs"')
+          $toml = [regex]::Replace(
+            $toml,
+            '(?ms)\r?\n# Local-dev source overrides.*?\[patch\.crates-io\].*\z',
+            "`n"
+          )
           Set-Content Cargo.toml $toml -NoNewline
 
       # build_usd.py is a Python script. We don't need Python at link
@@ -141,6 +143,20 @@ jobs:
         # rpath emission on cfg(unix).
         run: cargo build --release
 
+      - name: Setup MSVC shell for hdNSI
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.include_hdnsi }}
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build optional hdNSI delegate
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.include_hdnsi }}
+        shell: pwsh
+        env:
+          DELIGHT_WINDOWS_ARCHIVE_URL: ${{ secrets.DELIGHT_WINDOWS_ARCHIVE_URL }}
+        run: |
+          .github\scripts\package-hdnsi-windows.ps1 `
+            -UsdInstallDir "$env:USD_INSTALL_DIR" `
+            -OutputDir "$env:GITHUB_WORKSPACE\hdnsi-package"
+
       - name: Stage Windows zip
         shell: pwsh
         run: |
@@ -199,6 +215,10 @@ jobs:
           if (Test-Path docs\release.md) {
             Copy-Item docs\release.md "$stage\RELEASE.md"
           }
+          if (Test-Path hdnsi-package) {
+            New-Item -ItemType Directory -Path "$stage\plugins\usd" -Force | Out-Null
+            Copy-Item -Recurse hdnsi-package\* "$stage\plugins\usd"
+          }
 
           @'
           forge-paint Windows test build.
@@ -216,10 +236,13 @@ jobs:
           window, or use File > Open. forge:// URIs only resolve when
           launched through anvil; standalone runs are filesystem-only.
 
-          Hydra/Storm is bundled through OpenUSD. 3Delight is optional:
-          install 3Delight separately and add a compatible hdNSI plugin
-          built against this OpenUSD bundle if you want the 3Delight
-          render delegate to appear.
+          Hydra/Storm is bundled through OpenUSD.
+
+          3Delight: if this zip contains plugins\usd\hdNSI, install
+          3Delight on this machine and restart forge-paint. The app
+          self-locates the hdNSI plugInfo and common 3Delight runtime
+          folders at startup. Without plugins\usd\hdNSI, the delegate
+          picker will show Storm only.
           '@ | Out-File "$stage\README.txt" -Encoding utf8
 
           Compress-Archive -Path "$stage\*" `

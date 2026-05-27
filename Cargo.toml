@@ -22,9 +22,8 @@ rust-usd = "0.0.4"
 # hydra-rs is the sibling Hydra (Storm) binding from the same repo.
 # Public dep is a version range; `[patch.crates-io]` at the bottom of
 # this file redirects to the local ../rust-usd/hydra-rs checkout, so
-# day-to-day dev uses the source tree. Release CI checks out that
-# same repo under `rust-usd/` and rewrites these patch paths for the
-# runner before building.
+# day-to-day dev uses the source tree. Release CI strips the local
+# patch block and builds from these published crates.
 hydra-rs = "0.0.7"
 
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu"] }

@@ -34,15 +34,9 @@ jobs:
       - name: Checkout forge-paint
         uses: actions/checkout@v4
 
-      - name: Checkout rust-usd bindings
-        uses: actions/checkout@v4
-        with:
-          repository: voidreamer/rust-usd
-          path: rust-usd
-
-      - name: Point Cargo patches at CI checkout
+      - name: Use published USD bindings
         run: |
-          perl -0pi -e 's#path = "../rust-usd"#path = "rust-usd"#g; s#path = "../rust-usd/hydra-rs"#path = "rust-usd/hydra-rs"#g' Cargo.toml
+          perl -0pi -e 's/\n# Local-dev source overrides.*?\[patch\.crates-io\].*\z/\n/s' Cargo.toml
 
       # build_usd.py is a Python script. We don't need Python at link
       # time (USD itself is built --no-python), only as a build driver.

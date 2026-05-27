@@ -125,6 +125,58 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn push_usd_plugin_path_dirs(plugin_paths: &mut Vec<PathBuf>, root: &std::path::Path) {
+    if !root.is_dir() {
+        return;
+    }
+
+    plugin_paths.push(root.to_path_buf());
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if dir.join("plugInfo.json").is_file() {
+            plugin_paths.push(dir.clone());
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn dedup_paths(paths: &mut Vec<PathBuf>) {
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|p| seen.insert(p.clone()));
+}
+
+#[cfg(windows)]
+fn delight_runtime_dirs(bundle_dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(delight) = std::env::var_os("DELIGHT") {
+        roots.push(PathBuf::from(delight));
+    }
+    roots.push(bundle_dir.join("3Delight"));
+    roots.push(PathBuf::from(r"C:\Program Files\3Delight"));
+    roots.push(PathBuf::from(r"C:\Program Files (x86)\3Delight"));
+
+    let mut dirs = Vec::new();
+    for root in roots {
+        if root.is_dir() {
+            dirs.push(root.join("bin"));
+            dirs.push(root.join("lib"));
+        }
+    }
+    dirs.retain(|p| p.is_dir());
+    dedup_paths(&mut dirs);
+    dirs
+}
+
 /// Self-locating env setup for the Windows / macOS hand-off bundles.
 ///
 /// USD's plugin discovery reads `PXR_PLUGINPATH_NAME` lazily, the
@@ -159,9 +211,8 @@ fn setup_bundled_usd_env() {
         let sep = ":";
         let mut plugin_paths = vec![usd.join("plugin").join("usd"), usd.join("lib").join("usd")];
         let optional_plugins = dir.join("plugins").join("usd");
-        if optional_plugins.is_dir() {
-            plugin_paths.push(optional_plugins);
-        }
+        push_usd_plugin_path_dirs(&mut plugin_paths, &optional_plugins);
+        dedup_paths(&mut plugin_paths);
         let mut plugin_path = plugin_paths
             .iter()
             .map(|p| p.display().to_string())
@@ -182,18 +233,17 @@ fn setup_bundled_usd_env() {
         }
         #[cfg(windows)]
         {
+            let mut path_dirs = vec![usd.join("lib"), usd.join("bin")];
+            path_dirs.extend(delight_runtime_dirs(dir));
+            dedup_paths(&mut path_dirs);
+            let prefix = path_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(";");
             let new_path = match std::env::var("PATH") {
-                Ok(p) => format!(
-                    "{};{};{}",
-                    usd.join("lib").display(),
-                    usd.join("bin").display(),
-                    p,
-                ),
-                Err(_) => format!(
-                    "{};{}",
-                    usd.join("lib").display(),
-                    usd.join("bin").display(),
-                ),
+                Ok(p) if !p.is_empty() => format!("{prefix};{p}"),
+                _ => prefix,
             };
             unsafe {
                 std::env::set_var("PATH", new_path);
