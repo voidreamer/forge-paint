@@ -156,11 +156,22 @@ fn setup_bundled_usd_env() {
         let sep = ";";
         #[cfg(not(windows))]
         let sep = ":";
-        let plugin_path = format!(
-            "{}{sep}{}",
-            usd.join("plugin").join("usd").display(),
-            usd.join("lib").join("usd").display(),
-        );
+        let mut plugin_paths = vec![usd.join("plugin").join("usd"), usd.join("lib").join("usd")];
+        let optional_plugins = dir.join("plugins").join("usd");
+        if optional_plugins.is_dir() {
+            plugin_paths.push(optional_plugins);
+        }
+        let mut plugin_path = plugin_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(sep);
+        if let Ok(existing) = std::env::var("PXR_PLUGINPATH_NAME") {
+            if !existing.is_empty() {
+                plugin_path.push_str(sep);
+                plugin_path.push_str(&existing);
+            }
+        }
         // SAFETY: called from main before any threads spawn — eframe's
         // render thread only starts inside run_native(). Edition 2024
         // marks env::set_var unsafe because of cross-thread races; we

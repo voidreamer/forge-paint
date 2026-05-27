@@ -6,6 +6,7 @@
 # skip the heavy binaries.
 /assets/hdri/*.hdr
 /assets/hdri/*.exr
+!/assets/hdri/forge_studio_4x2.hdr
 # 3Delight regenerates `.auto.tdl` texture caches next to the source
 # .hdr / .exr the first time hdNSI samples them. Build artifacts.
 /assets/hdri/*.tdl
@@ -16,6 +17,7 @@
 /assets/default_mesh/*.usd
 /assets/default_mesh/*.usda
 /assets/default_mesh/*.usdc
+!/assets/default_mesh/default.usda
 # Nested asset folders (Poly Haven downloads etc.) under default_mesh/ —
 # these hold multi-gigabyte EXR textures and USDs per asset; never commit.
 /assets/default_mesh/*/
@@ -26,10 +28,12 @@
 /assets/stencils/*.jpg
 /assets/stencils/*.jpeg
 /assets/stencils/*.exr
+!/assets/stencils/forge_soft_round.png
 /assets/displacement/*.png
 /assets/displacement/*.jpg
 /assets/displacement/*.jpeg
 /assets/displacement/*.exr
+!/assets/displacement/forge_checker_height.png
 
 # Editor
 .vscode/

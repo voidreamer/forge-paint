@@ -14,9 +14,8 @@ on:
     tags: ['v*']
 
 env:
-  # rust-usd 0.0.3 (forge-paint's pinned binding) is verified against
-  # upstream OpenUSD 25.05. Bump together if forge-paint upgrades the
-  # crate, otherwise the ABI may not match.
+  # rust-usd / hydra-rs are verified against upstream OpenUSD 25.05.
+  # Bump together if the bindings upgrade, otherwise the ABI may not match.
   USD_VERSION: v25.05
   # build_usd.py installs into this prefix; rust-usd's build.rs reads it.
   USD_INSTALL_DIR: ${{ github.workspace }}/usd-install
@@ -34,6 +33,16 @@ jobs:
     steps:
       - name: Checkout forge-paint
         uses: actions/checkout@v4
+
+      - name: Checkout rust-usd bindings
+        uses: actions/checkout@v4
+        with:
+          repository: voidreamer/rust-usd
+          path: rust-usd
+
+      - name: Point Cargo patches at CI checkout
+        run: |
+          perl -0pi -e 's#path = "../rust-usd"#path = "rust-usd"#g; s#path = "../rust-usd/hydra-rs"#path = "rust-usd/hydra-rs"#g' Cargo.toml
 
       # build_usd.py is a Python script. We don't need Python at link
       # time (USD itself is built --no-python), only as a build driver.
@@ -58,7 +67,7 @@ jobs:
         with:
           path: ${{ env.USD_INSTALL_DIR }}
           # Bump the trailing -vN any time the build flags below change.
-          key: openusd-${{ env.USD_VERSION }}-macos-arm64-no-python-no-imaging-v1
+          key: openusd-${{ env.USD_VERSION }}-macos-arm64-no-python-imaging-v1
 
       - name: Checkout OpenUSD source
         if: steps.cache-usd.outputs.cache-hit != 'true'
@@ -70,15 +79,13 @@ jobs:
 
       - name: Build OpenUSD
         if: steps.cache-usd.outputs.cache-hit != 'true'
-        # build_usd.py vendors boost + tbb itself. With --no-imaging /
-        # --no-python / --no-usdview we skip Hydra, the Python bindings,
-        # and the Qt-based viewer — none of which forge-paint links.
-        # rust-usd only needs the core libs (usd, usdGeom, usdShade,
-        # sdf, ar, pcp, plug, kind, vt, gf, tf, work, trace, js, arch,
-        # ts), all of which live under pxr/usd/.
+        # build_usd.py vendors boost + tbb itself. Keep imaging enabled:
+        # hydra-rs links Hydra / UsdImagingGL and the release bundle must
+        # include hdStorm. We still skip Python, tests, examples, docs and
+        # usdview to keep the CI runtime and artifact size under control.
         run: |
           python openusd-src/build_scripts/build_usd.py \
-            --no-python --no-imaging --no-tests \
+            --no-python --no-tests \
             --no-examples --no-tutorials --no-docs --no-usdview \
             "$USD_INSTALL_DIR"
 
@@ -87,7 +94,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.USD_INSTALL_DIR }}
-          key: openusd-${{ env.USD_VERSION }}-macos-arm64-no-python-no-imaging-v1
+          key: openusd-${{ env.USD_VERSION }}-macos-arm64-no-python-imaging-v1
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -153,6 +160,9 @@ jobs:
           if [ -d test_assets ]; then
             cp -R test_assets "$stage/"
           fi
+          if [ -f docs/release.md ]; then
+            cp docs/release.md "$stage/RELEASE.md"
+          fi
 
           cat > "$stage/README.txt" <<'EOF'
           forge-paint macOS arm64 (Apple Silicon) test build.
@@ -172,6 +182,11 @@ jobs:
           Opening files: drag-and-drop a .usda/.usdc/.usdz onto the
           window, or use File > Open. forge:// URIs only resolve when
           launched through anvil; standalone runs are filesystem-only.
+
+          Hydra/Storm is bundled through OpenUSD. 3Delight is optional:
+          install 3Delight separately and add a compatible hdNSI plugin
+          built against this OpenUSD bundle if you want the 3Delight
+          render delegate to appear.
           EOF
 
           cd "$GITHUB_WORKSPACE/dist"

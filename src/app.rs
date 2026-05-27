@@ -1,5 +1,5 @@
 use eframe::egui;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{
     assets::{self, AssetBrowser},
@@ -311,12 +311,51 @@ impl MaterialBindingSnapshot {
     }
 }
 
+fn bundled_asset_candidates(rel: impl AsRef<Path>) -> Vec<PathBuf> {
+    let rel = rel.as_ref();
+    let mut candidates = Vec::new();
+
+    candidates.push(PathBuf::from(rel));
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(rel));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join(rel));
+            if let Some(p2) = parent.parent() {
+                candidates.push(p2.join(rel));
+            }
+            if let Some(p3) = parent.parent().and_then(|p| p.parent()) {
+                candidates.push(p3.join(rel));
+            }
+        }
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel));
+
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|p| seen.insert(p.clone()));
+    candidates
+}
+
+fn resolve_bundled_asset_dir(rel: impl AsRef<Path>) -> PathBuf {
+    let rel = rel.as_ref();
+    bundled_asset_candidates(rel)
+        .into_iter()
+        .find(|p| p.is_dir())
+        .unwrap_or_else(|| PathBuf::from(rel))
+}
+
+fn resolve_bundled_asset_file(rel: impl AsRef<Path>) -> Option<PathBuf> {
+    bundled_asset_candidates(rel)
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
 impl App {
     pub fn new(initial_usd: Option<PathBuf>) -> Self {
         // CLI path wins. Otherwise fall back to a user-provided default
-        // mesh at assets/default_mesh/default.usda (relative to CWD).
-        // Override the location via FORGE_PAINT_DEFAULT_MESH if you run
-        // the binary from elsewhere.
+        // mesh at assets/default_mesh/default.usda. Override the location via
+        // FORGE_PAINT_DEFAULT_MESH if you run the binary from elsewhere.
         let pending_open = initial_usd.or_else(|| {
             if let Some(override_path) = std::env::var_os("FORGE_PAINT_DEFAULT_MESH") {
                 let p = PathBuf::from(override_path);
@@ -324,12 +363,7 @@ impl App {
                     return Some(p);
                 }
             }
-            let default_path = PathBuf::from("assets/default_mesh/default.usda");
-            if default_path.exists() {
-                Some(default_path)
-            } else {
-                None
-            }
+            resolve_bundled_asset_file("assets/default_mesh/default.usda")
         });
         Self {
             pending_open,
@@ -4131,20 +4165,9 @@ impl App {
     /// right-click → Project with stencil without first clicking
     /// "+ Import" for bundled content.
     fn scan_bundled_assets(&mut self, rs: &eframe::egui_wgpu::RenderState) {
-        // Resolve `assets/…` first relative to cwd, then fall back to
-        // the path baked at compile time so the scan still works when
-        // the binary is launched from an unexpected working directory.
-        let resolve = |rel: &str| -> std::path::PathBuf {
-            let cwd = std::path::PathBuf::from(rel);
-            if cwd.is_dir() {
-                return cwd;
-            }
-            let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
-            manifest
-        };
         let dirs = [
-            resolve("assets/stencils"),
-            resolve("assets/displacement"),
+            resolve_bundled_asset_dir("assets/stencils"),
+            resolve_bundled_asset_dir("assets/displacement"),
         ];
         let mut count = 0usize;
         for dir in &dirs {
@@ -4172,14 +4195,10 @@ impl App {
 
         // Also scan for USD meshes — populate the Meshes tab so the
         // default mesh is available without hunting through File > Open.
-        let resolve = |rel: &str| -> std::path::PathBuf {
-            let cwd = std::path::PathBuf::from(rel);
-            if cwd.is_dir() {
-                return cwd;
-            }
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
-        };
-        for dir in &[resolve("assets/default_mesh"), resolve("assets/meshes")] {
+        for dir in &[
+            resolve_bundled_asset_dir("assets/default_mesh"),
+            resolve_bundled_asset_dir("assets/meshes"),
+        ] {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
             };
