@@ -59,7 +59,8 @@ pub fn export_tiles(
 
     // Stage 1: allocate one readback buffer per (tile × channel) and queue all
     // copies into a single encoder submission.
-    let mut readbacks: Vec<Readback> = Vec::with_capacity(paint_target.tiles.len() * CHANNELS.len());
+    let mut readbacks: Vec<Readback> =
+        Vec::with_capacity(paint_target.tiles.len() * CHANNELS.len());
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("export_copy_enc"),
     });

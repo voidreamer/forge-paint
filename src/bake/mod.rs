@@ -107,11 +107,9 @@ impl MeshMaps {
     /// valid until the user explicitly bakes).
     pub fn new_empty(device: &wgpu::Device, queue: &wgpu::Queue, tile_count: u32) -> Self {
         let tile_count = tile_count.max(1);
-        let world_normal =
-            make_array(device, "mesh_maps.world_normal", 1, tile_count, FORMAT);
+        let world_normal = make_array(device, "mesh_maps.world_normal", 1, tile_count, FORMAT);
         let world_normal_view = array_view(&world_normal, "mesh_maps.world_normal.array_view");
-        let world_position =
-            make_array(device, "mesh_maps.world_position", 1, tile_count, FORMAT);
+        let world_position = make_array(device, "mesh_maps.world_position", 1, tile_count, FORMAT);
         let world_position_view =
             array_view(&world_position, "mesh_maps.world_position.array_view");
 
@@ -125,7 +123,11 @@ impl MeshMaps {
                 wgpu::TexelCopyTextureInfo {
                     texture: &world_normal,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer,
+                    },
                     aspect: wgpu::TextureAspect::All,
                 },
                 bytemuck::cast_slice(&flat_normal),
@@ -134,13 +136,21 @@ impl MeshMaps {
                     bytes_per_row: Some(8),
                     rows_per_image: Some(1),
                 },
-                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
             );
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &world_position,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer,
+                    },
                     aspect: wgpu::TextureAspect::All,
                 },
                 bytemuck::cast_slice(&zero_pos),
@@ -149,7 +159,11 @@ impl MeshMaps {
                     bytes_per_row: Some(8),
                     rows_per_image: Some(1),
                 },
-                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
             );
         }
 
@@ -185,7 +199,11 @@ impl MeshMaps {
                 wgpu::TexelCopyTextureInfo {
                     texture: &r8_ones_tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer,
+                    },
                     aspect: wgpu::TextureAspect::All,
                 },
                 &[255u8],
@@ -194,7 +212,11 @@ impl MeshMaps {
                     bytes_per_row: Some(1),
                     rows_per_image: Some(1),
                 },
-                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
             );
         }
         let r8_ones_view = r8_ones_tex.create_view(&wgpu::TextureViewDescriptor {
@@ -223,7 +245,11 @@ impl MeshMaps {
                 wgpu::TexelCopyTextureInfo {
                     texture: &flat_normal_tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer,
+                    },
                     aspect: wgpu::TextureAspect::All,
                 },
                 &[128u8, 128, 255, 255],
@@ -232,7 +258,11 @@ impl MeshMaps {
                     bytes_per_row: Some(4),
                     rows_per_image: Some(1),
                 },
-                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
             );
         }
         let flat_normal_view = flat_normal_tex.create_view(&wgpu::TextureViewDescriptor {
@@ -391,10 +421,7 @@ impl MeshMaps {
                 pass.set_pipeline(&baker.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.set_vertex_buffer(0, gpu_mesh.vertex_buffer.slice(..));
-                pass.set_index_buffer(
-                    gpu_mesh.index_buffer.slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
+                pass.set_index_buffer(gpu_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..gpu_mesh.index_count, 0, 0..1);
             }
         }

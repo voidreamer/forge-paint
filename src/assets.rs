@@ -145,8 +145,7 @@ fn load_exr_rgba8(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
                     }
                 }
             } else {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("read EXR {}", path.display())));
+                return Err(anyhow::Error::new(e).context(format!("read EXR {}", path.display())));
             }
         }
     };
@@ -189,7 +188,9 @@ fn load_exr_rgba8(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     let g_idx = find("G");
     let b_idx = find("B");
     let a_idx = find("A");
-    let y_idx = find("Y").or_else(|| find("L")).or_else(|| find("Luminance"));
+    let y_idx = find("Y")
+        .or_else(|| find("L"))
+        .or_else(|| find("Luminance"));
 
     // Single-channel fallback: if no R/G/B and no Y, replicate the first
     // channel as grayscale. Matches ArmorPaint's behavior for arbitrary
@@ -218,9 +219,15 @@ fn load_exr_rgba8(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
             (v, v, v)
         } else {
             (
-                r_idx.map(|ci| channel_f32[ci].1.get(i).copied().unwrap_or(0.0)).unwrap_or(0.0),
-                g_idx.map(|ci| channel_f32[ci].1.get(i).copied().unwrap_or(0.0)).unwrap_or(0.0),
-                b_idx.map(|ci| channel_f32[ci].1.get(i).copied().unwrap_or(0.0)).unwrap_or(0.0),
+                r_idx
+                    .map(|ci| channel_f32[ci].1.get(i).copied().unwrap_or(0.0))
+                    .unwrap_or(0.0),
+                g_idx
+                    .map(|ci| channel_f32[ci].1.get(i).copied().unwrap_or(0.0))
+                    .unwrap_or(0.0),
+                b_idx
+                    .map(|ci| channel_f32[ci].1.get(i).copied().unwrap_or(0.0))
+                    .unwrap_or(0.0),
             )
         };
         let af = a_idx
@@ -349,6 +356,8 @@ impl MaterialKind {
                 clearcoat: Some("clearcoat"),
                 clearcoat_roughness: Some("clearcoatRoughness"),
                 emission_color: Some("emissiveColor"),
+                normal: Some("normal"),
+                occlusion: Some("occlusion"),
                 // UsdPreviewSurface folds emission magnitude into the
                 // emissiveColor's components — no separate scalar.
                 emission_intensity: None,
@@ -364,6 +373,8 @@ impl MaterialKind {
                 clearcoat: Some("coat"),
                 clearcoat_roughness: Some("coat_roughness"),
                 emission_color: Some("emission_color"),
+                normal: Some("normal"),
+                occlusion: None,
                 emission_intensity: Some("emission"),
             },
             MaterialKind::DlPrincipled => ShaderInputNames {
@@ -379,6 +390,8 @@ impl MaterialKind {
                 clearcoat: Some("coating_thickness"),
                 clearcoat_roughness: Some("coating_roughness"),
                 emission_color: Some("incandescence"),
+                normal: None,
+                occlusion: None,
                 emission_intensity: Some("incandescence_intensity"),
             },
         }
@@ -398,6 +411,8 @@ pub struct ShaderInputNames {
     pub clearcoat: Option<&'static str>,
     pub clearcoat_roughness: Option<&'static str>,
     pub emission_color: Option<&'static str>,
+    pub normal: Option<&'static str>,
+    pub occlusion: Option<&'static str>,
     pub emission_intensity: Option<&'static str>,
 }
 
@@ -517,6 +532,30 @@ impl AssetBrowser {
         });
         Ok(())
     }
+
+    pub fn texture_index_for_source(&self, path: &Path) -> Option<usize> {
+        let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.textures.iter().position(|asset| {
+            asset.source == path
+                || std::fs::canonicalize(&asset.source)
+                    .map(|p| p == target)
+                    .unwrap_or(false)
+        })
+    }
+
+    pub fn import_texture_once(
+        &mut self,
+        path: &Path,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut egui_wgpu::Renderer,
+    ) -> Result<usize> {
+        if let Some(idx) = self.texture_index_for_source(path) {
+            return Ok(idx);
+        }
+        self.import_texture(path, device, queue, renderer)?;
+        Ok(self.textures.len() - 1)
+    }
 }
 
 /// Resize sRGB RGBA8 pixels using a triangle filter — cheap, good enough for
@@ -527,8 +566,12 @@ fn resize_rgba8(src: &[u8], src_w: u32, src_h: u32, target_w: u32, target_h: u32
     }
     let buf = image::RgbaImage::from_raw(src_w, src_h, src.to_vec())
         .expect("RgbaImage from_raw size mismatch");
-    let resized =
-        image::imageops::resize(&buf, target_w, target_h, image::imageops::FilterType::Triangle);
+    let resized = image::imageops::resize(
+        &buf,
+        target_w,
+        target_h,
+        image::imageops::FilterType::Triangle,
+    );
     resized.into_raw()
 }
 
@@ -558,7 +601,13 @@ pub fn apply_as_base_color(
     if tile_count == 0 {
         return Err(anyhow!("layer has no tiles"));
     }
-    let mut pixels = resize_rgba8(&asset.pixels, asset.width, asset.height, tile_resolution, tile_resolution);
+    let mut pixels = resize_rgba8(
+        &asset.pixels,
+        asset.width,
+        asset.height,
+        tile_resolution,
+        tile_resolution,
+    );
     flip_rows_rgba8(&mut pixels, tile_resolution, tile_resolution);
     for tile_idx in 0..tile_count {
         queue.write_texture(
@@ -588,6 +637,47 @@ pub fn apply_as_base_color(
     Ok(())
 }
 
+pub fn apply_as_base_color_tile(
+    queue: &wgpu::Queue,
+    asset: &TextureAsset,
+    layer: &Layer,
+    tile_layer: u32,
+    tile_resolution: u32,
+) -> Result<()> {
+    let mut pixels = resize_rgba8(
+        &asset.pixels,
+        asset.width,
+        asset.height,
+        tile_resolution,
+        tile_resolution,
+    );
+    flip_rows_rgba8(&mut pixels, tile_resolution, tile_resolution);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &layer.base_color,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: tile_layer,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(tile_resolution * 4),
+            rows_per_image: Some(tile_resolution),
+        },
+        wgpu::Extent3d {
+            width: tile_resolution,
+            height: tile_resolution,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(())
+}
+
 /// Upload `asset` into `layer.normal` across every tile. Normal maps are
 /// RGBA8 direct — no channel conversion, just resize + V-flip.
 pub fn apply_as_normal(
@@ -600,14 +690,24 @@ pub fn apply_as_normal(
     if tile_count == 0 {
         return Err(anyhow!("layer has no tiles"));
     }
-    let mut pixels = resize_rgba8(&asset.pixels, asset.width, asset.height, tile_resolution, tile_resolution);
+    let mut pixels = resize_rgba8(
+        &asset.pixels,
+        asset.width,
+        asset.height,
+        tile_resolution,
+        tile_resolution,
+    );
     flip_rows_rgba8(&mut pixels, tile_resolution, tile_resolution);
     for tile_idx in 0..tile_count {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &layer.normal,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: tile_idx },
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: tile_idx,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             &pixels,
@@ -626,6 +726,47 @@ pub fn apply_as_normal(
     Ok(())
 }
 
+pub fn apply_as_normal_tile(
+    queue: &wgpu::Queue,
+    asset: &TextureAsset,
+    layer: &Layer,
+    tile_layer: u32,
+    tile_resolution: u32,
+) -> Result<()> {
+    let mut pixels = resize_rgba8(
+        &asset.pixels,
+        asset.width,
+        asset.height,
+        tile_resolution,
+        tile_resolution,
+    );
+    flip_rows_rgba8(&mut pixels, tile_resolution, tile_resolution);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &layer.normal,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: tile_layer,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(tile_resolution * 4),
+            rows_per_image: Some(tile_resolution),
+        },
+        wgpu::Extent3d {
+            width: tile_resolution,
+            height: tile_resolution,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(())
+}
+
 fn apply_as_single_channel(
     queue: &wgpu::Queue,
     asset: &TextureAsset,
@@ -636,7 +777,13 @@ fn apply_as_single_channel(
     if tile_count == 0 {
         return Err(anyhow!("layer has no tiles"));
     }
-    let mut pixels = resize_rgba8(&asset.pixels, asset.width, asset.height, tile_resolution, tile_resolution);
+    let mut pixels = resize_rgba8(
+        &asset.pixels,
+        asset.width,
+        asset.height,
+        tile_resolution,
+        tile_resolution,
+    );
     flip_rows_rgba8(&mut pixels, tile_resolution, tile_resolution);
     let mut r8 = vec![0u8; (tile_resolution * tile_resolution) as usize];
     for (i, chunk) in pixels.chunks_exact(4).enumerate() {
@@ -650,7 +797,11 @@ fn apply_as_single_channel(
             wgpu::TexelCopyTextureInfo {
                 texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: tile_idx },
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: tile_idx,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             &r8,
@@ -666,6 +817,54 @@ fn apply_as_single_channel(
             },
         );
     }
+    Ok(())
+}
+
+fn apply_as_single_channel_tile(
+    queue: &wgpu::Queue,
+    asset: &TextureAsset,
+    texture: &wgpu::Texture,
+    tile_layer: u32,
+    tile_resolution: u32,
+) -> Result<()> {
+    let mut pixels = resize_rgba8(
+        &asset.pixels,
+        asset.width,
+        asset.height,
+        tile_resolution,
+        tile_resolution,
+    );
+    flip_rows_rgba8(&mut pixels, tile_resolution, tile_resolution);
+    let mut r8 = vec![0u8; (tile_resolution * tile_resolution) as usize];
+    for (i, chunk) in pixels.chunks_exact(4).enumerate() {
+        let r = chunk[0] as f32;
+        let g = chunk[1] as f32;
+        let b = chunk[2] as f32;
+        r8[i] = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 255.0) as u8;
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: tile_layer,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &r8,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(tile_resolution),
+            rows_per_image: Some(tile_resolution),
+        },
+        wgpu::Extent3d {
+            width: tile_resolution,
+            height: tile_resolution,
+            depth_or_array_layers: 1,
+        },
+    );
     Ok(())
 }
 
@@ -689,6 +888,26 @@ pub fn apply_as_metallic(
     apply_as_single_channel(queue, asset, &layer.metallic, tile_count, tile_resolution)
 }
 
+pub fn apply_as_roughness_tile(
+    queue: &wgpu::Queue,
+    asset: &TextureAsset,
+    layer: &Layer,
+    tile_layer: u32,
+    tile_resolution: u32,
+) -> Result<()> {
+    apply_as_single_channel_tile(queue, asset, &layer.roughness, tile_layer, tile_resolution)
+}
+
+pub fn apply_as_metallic_tile(
+    queue: &wgpu::Queue,
+    asset: &TextureAsset,
+    layer: &Layer,
+    tile_layer: u32,
+    tile_resolution: u32,
+) -> Result<()> {
+    apply_as_single_channel_tile(queue, asset, &layer.metallic, tile_layer, tile_resolution)
+}
+
 /// Upload `asset` into the active layer's mask (single-channel R8). Takes
 /// the luminance of each pixel. Caller must ensure the layer has a mask.
 pub fn apply_as_mask(
@@ -704,7 +923,13 @@ pub fn apply_as_mask(
     if tile_count == 0 {
         return Err(anyhow!("layer has no tiles"));
     }
-    let mut pixels = resize_rgba8(&asset.pixels, asset.width, asset.height, tile_resolution, tile_resolution);
+    let mut pixels = resize_rgba8(
+        &asset.pixels,
+        asset.width,
+        asset.height,
+        tile_resolution,
+        tile_resolution,
+    );
     flip_rows_rgba8(&mut pixels, tile_resolution, tile_resolution);
     // RGBA → luminance (Rec. 709). Cheap approximation — users rarely
     // care about precise colorimetry for mask input.
@@ -944,18 +1169,10 @@ pub fn read_material_inputs(path: &Path) -> MaterialInputs {
     if let Some(v) = scan_float(&["clearcoat", "coat", "coating_thickness"]) {
         inputs.clearcoat = v;
     }
-    if let Some(v) = scan_float(&[
-        "clearcoatRoughness",
-        "coat_roughness",
-        "coating_roughness",
-    ]) {
+    if let Some(v) = scan_float(&["clearcoatRoughness", "coat_roughness", "coating_roughness"]) {
         inputs.clearcoat_roughness = v;
     }
-    if let Some(c) = scan_color(&[
-        "emissiveColor",
-        "emission_color",
-        "incandescence",
-    ]) {
+    if let Some(c) = scan_color(&["emissiveColor", "emission_color", "incandescence"]) {
         inputs.emission_color = c;
     }
     if let Some(v) = scan_float(&["emission", "incandescence_intensity"]) {
@@ -1046,7 +1263,10 @@ fn paint_checker(ui: &egui::Ui, rect: egui::Rect, radius: f32) {
         let mut x = rect.left();
         let mut col = 0;
         while x < rect.right() {
-            let mid = egui::pos2((x + cell * 0.5).min(rect.right()), (y + cell * 0.5).min(rect.bottom()));
+            let mid = egui::pos2(
+                (x + cell * 0.5).min(rect.right()),
+                (y + cell * 0.5).min(rect.bottom()),
+            );
             let d = mid - center;
             if d.length_sq() <= radius * radius {
                 let color = if (row + col) % 2 == 0 {

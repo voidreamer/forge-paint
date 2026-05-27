@@ -85,7 +85,10 @@ pub struct PaintTarget {
 impl PaintTarget {
     /// Index of `tile_id` in the layers array, or None if the tile isn't present.
     pub fn layer_for_tile(&self, tile_id: u32) -> Option<u32> {
-        self.tiles.iter().position(|&t| t == tile_id).map(|i| i as u32)
+        self.tiles
+            .iter()
+            .position(|&t| t == tile_id)
+            .map(|i| i as u32)
     }
 }
 

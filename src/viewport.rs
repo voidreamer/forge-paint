@@ -7,15 +7,15 @@ use crate::background::BackgroundPipeline;
 use crate::bake::{Baker, MeshMaps};
 use crate::camera::OrbitCamera;
 use crate::env::{
-    BrdfLut, Environment, EnvUniforms, IrradianceBaker, PrefilterBaker, SkyboxPipeline,
+    BrdfLut, EnvUniforms, Environment, IrradianceBaker, PrefilterBaker, SkyboxPipeline,
 };
+use crate::fxaa::FxaaPipeline;
 use crate::mesh::{CpuMesh, GpuMesh};
 use crate::paint::{
     target::MaterialUniforms, udim, BrushPipeline, BrushUniforms, Compositor, Layer, LayerStack,
     PaintChannel, PaintTarget, ProjBrushUniforms, ProjectionBrushPipeline,
 };
 use crate::pick;
-use crate::fxaa::FxaaPipeline;
 use crate::post::{PostPipeline, PostUniforms};
 use crate::render::{FrameUniforms, Renderer, TonemapMode, ViewMode, HDR_FORMAT, LDR_FORMAT};
 use crate::wireframe::WireframePipeline;
@@ -217,6 +217,12 @@ pub struct Viewport {
     /// Screen position of the last successful paint stamp, used to interpolate
     /// stamps between frames so fast drags don't leave gaps.
     last_paint_pos: Option<egui::Pos2>,
+    /// Tablet pressure paired with `last_paint_pos`, used to taper
+    /// interpolated stamps instead of snapping pressure per frame.
+    last_paint_pressure: Option<f32>,
+    /// Live pressure reported by egui touch/tablet events while a primary
+    /// pointer stroke is active. `None` means mouse/no pressure signal.
+    input_pressure: Option<f32>,
 
     /// Anchor position for the brush-adjust overlay — captured at the
     /// start of an S/D/F drag so the cursor ring stays put while the
@@ -261,10 +267,40 @@ pub struct BrushState {
     /// via the UV gradient at the hit — this way the ring size is
     /// consistent regardless of how the mesh is UV-unwrapped.
     pub radius: f32,
-    pub hardness: f32,        // 0 soft, 1 hard
-    pub opacity: f32,         // 0..1
+    pub hardness: f32, // 0 soft, 1 hard
+    pub opacity: f32,  // 0..1
+    pub pressure: BrushPressureSettings,
     /// When true and the active layer has a mask, paint routes to the mask.
     pub mask_edit: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BrushPressureSettings {
+    pub size_enabled: bool,
+    pub opacity_enabled: bool,
+    pub hardness_enabled: bool,
+    /// Minimum radius multiplier when pressure is 0.
+    pub min_size: f32,
+    /// Minimum opacity multiplier when pressure is 0.
+    pub min_opacity: f32,
+    /// Absolute hardness value when pressure is 0.
+    pub min_hardness: f32,
+    /// Response curve. 1 = linear, <1 = softer, >1 = firmer.
+    pub curve: f32,
+}
+
+impl Default for BrushPressureSettings {
+    fn default() -> Self {
+        Self {
+            size_enabled: true,
+            opacity_enabled: false,
+            hardness_enabled: false,
+            min_size: 0.18,
+            min_opacity: 0.0,
+            min_hardness: 0.0,
+            curve: 1.0,
+        }
+    }
 }
 
 impl Default for BrushState {
@@ -275,6 +311,7 @@ impl Default for BrushState {
             radius: 40.0,
             hardness: 0.4,
             opacity: 1.0,
+            pressure: BrushPressureSettings::default(),
             mask_edit: false,
         }
     }
@@ -284,12 +321,24 @@ impl Viewport {
     /// Forward stage-browser selection into the GPU mesh's per-vert
     /// highlight mask. App dirty-tracks the set so this only runs
     /// when something actually changed.
-    pub fn set_selection(
-        &self,
-        queue: &wgpu::Queue,
-        selected: &std::collections::HashSet<String>,
-    ) {
+    pub fn set_selection(&self, queue: &wgpu::Queue, selected: &std::collections::HashSet<String>) {
         self.mesh.set_selection(queue, selected);
+    }
+
+    pub fn input_pressure(&self) -> Option<f32> {
+        self.input_pressure
+    }
+
+    pub fn refresh_input_pressure(&mut self, ctx: &egui::Context, pointer_active: bool) -> f32 {
+        if !pointer_active {
+            self.input_pressure = None;
+            return 1.0;
+        }
+
+        if let Some(pressure) = pointer_pressure_from_events(ctx) {
+            self.input_pressure = Some(pressure);
+        }
+        self.input_pressure.unwrap_or(1.0)
     }
 
     pub fn selection_from_response(
@@ -356,13 +405,8 @@ impl Viewport {
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|r| [1024u32, 2048, 4096, 8192].contains(r))
             .unwrap_or(2048);
-        let paint_target = PaintTarget::new(
-            device,
-            queue,
-            &renderer.material_bgl,
-            cpu,
-            tile_resolution,
-        );
+        let paint_target =
+            PaintTarget::new(device, queue, &renderer.material_bgl, cpu, tile_resolution);
         let layer_stack = LayerStack::new_with_initial_layer(
             device,
             queue,
@@ -473,6 +517,8 @@ impl Viewport {
             last_hit_uv: None,
             last_hit_tile: None,
             last_paint_pos: None,
+            last_paint_pressure: None,
+            input_pressure: None,
             adjust_anchor: None,
             undo_stack: crate::undo::UndoStack::default(),
             layer_thumb_cache: Vec::new(),
@@ -525,12 +571,14 @@ impl Viewport {
             .run_and_submit(device, queue, &self.layer_stack, &self.paint_target);
         self.last_hit_uv = None;
         self.last_hit_tile = None;
+        self.last_paint_pos = None;
+        self.last_paint_pressure = None;
+        self.input_pressure = None;
         // Prior undo history references textures from the old layer stack —
         // those are invalid now that we rebuilt it. Drop them.
         self.undo_stack.clear();
         // Reset mesh maps to a neutral placeholder for the new mesh/tile set.
-        self.mesh_maps =
-            MeshMaps::new_empty(device, queue, self.paint_target.tiles.len() as u32);
+        self.mesh_maps = MeshMaps::new_empty(device, queue, self.paint_target.tiles.len() as u32);
         // Thumbnail TextureIds from the old stack point to textures that have
         // been dropped — we leak the egui slots here (rare enough to ignore).
         self.layer_thumb_cache.clear();
@@ -593,6 +641,7 @@ impl Viewport {
         queue: &wgpu::Queue,
         tile_idx: u32,
         local_uv: [f32; 2],
+        pressure: f32,
     ) {
         let active_is_fill = self.layer_stack.active_layer().is_fill();
         if active_is_fill {
@@ -609,13 +658,18 @@ impl Viewport {
         // model view — matches how the main paint path picks
         // pixels-per-UV when the Jacobian probe fails. Clamp to half a
         // tile so extreme brush radii (500 px) don't overshoot.
-        let uv_radius = (self.brush.radius / 400.0).min(0.5);
+        let uv_radius = (self.brush.effective_radius(pressure) / 400.0).min(0.5);
         let color_comp = brush_color_components(&self.brush, channel);
         let uniforms = BrushUniforms {
-            color: [color_comp[0], color_comp[1], color_comp[2], self.brush.opacity],
+            color: [
+                color_comp[0],
+                color_comp[1],
+                color_comp[2],
+                self.brush.effective_opacity(pressure),
+            ],
             center_uv: local_uv,
             radius: uv_radius,
-            hardness: self.brush.hardness,
+            hardness: self.brush.effective_hardness(pressure),
             uniform_fill: 0,
             _pad: [0; 3],
         };
@@ -666,7 +720,9 @@ impl Viewport {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewport.undo"),
         });
-        let did = self.undo_stack.undo(device, &mut encoder, &mut self.layer_stack);
+        let did = self
+            .undo_stack
+            .undo(device, &mut encoder, &mut self.layer_stack);
         queue.submit(Some(encoder.finish()));
         if did {
             self.recomposite(device, queue);
@@ -678,7 +734,9 @@ impl Viewport {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewport.redo"),
         });
-        let did = self.undo_stack.redo(device, &mut encoder, &mut self.layer_stack);
+        let did = self
+            .undo_stack
+            .redo(device, &mut encoder, &mut self.layer_stack);
         queue.submit(Some(encoder.finish()));
         if did {
             self.recomposite(device, queue);
@@ -896,12 +954,8 @@ impl Viewport {
                 .resize(self.layer_stack.layers.len(), None);
         }
         if self.layer_thumb_cache[idx].is_none() {
-            if let Some(view) = self.layer_stack.layers[idx]
-                .base_color_layer_views
-                .first()
-            {
-                let id =
-                    renderer.register_native_texture(device, view, wgpu::FilterMode::Linear);
+            if let Some(view) = self.layer_stack.layers[idx].base_color_layer_views.first() {
+                let id = renderer.register_native_texture(device, view, wgpu::FilterMode::Linear);
                 self.layer_thumb_cache[idx] = Some(id);
             }
         }
@@ -951,8 +1005,7 @@ impl Viewport {
         stencil_egui_tex: Option<egui::TextureId>,
     ) -> Option<ViewportSelection> {
         let available = ui.available_size();
-        let (rect, response) =
-            ui.allocate_exact_size(available, egui::Sense::click_and_drag());
+        let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
         let w = (rect.width() as u32).max(1);
         let h = (rect.height() as u32).max(1);
 
@@ -976,6 +1029,7 @@ impl Viewport {
             && !modifiers.alt;
         let primary_active = response.dragged_by(egui::PointerButton::Primary)
             || response.clicked_by(egui::PointerButton::Primary);
+        let pointer_pressure = self.refresh_input_pressure(ui.ctx(), primary_active);
 
         // Brush-adjust modifier drags — hold S/D/F and drag LMB to scrub
         // radius/hardness/opacity. Mari-ish workflow. Holding any of them
@@ -1078,8 +1132,7 @@ impl Viewport {
             // `Vec::iter().take(MAX_LIGHTS)` silently drops anything
             // past the cap; UI prevents the user from adding more so
             // this is just defensive.
-            let mut gpu_lights = [crate::lights::GpuLight::default();
-                crate::lights::MAX_LIGHTS];
+            let mut gpu_lights = [crate::lights::GpuLight::default(); crate::lights::MAX_LIGHTS];
             let light_count = self.lights.len().min(crate::lights::MAX_LIGHTS);
             for (i, light) in self.lights.iter().take(light_count).enumerate() {
                 gpu_lights[i] = crate::lights::GpuLight::from_light(light);
@@ -1140,77 +1193,72 @@ impl Viewport {
                 Some(m) => &m.array_view,
                 None => &self.paint_target.dummy_mask_view,
             };
-            let material_bg =
-                render_state
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("viewport.material_bg"),
-                        layout: &self.renderer.material_bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.material_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &self.paint_target.base_color_view,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &self.paint_target.roughness_view,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &self.paint_target.metallic_view,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 4,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &self.paint_target.normal_view,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 5,
-                                resource: wgpu::BindingResource::TextureView(active_mask_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 6,
-                                resource: wgpu::BindingResource::Sampler(
-                                    &self.paint_target.sampler,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 7,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &self.mesh_maps.world_normal_view,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 8,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &self.paint_target.displacement_view,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 9,
-                                resource: wgpu::BindingResource::TextureView(
-                                    self.mesh_maps.ao_view(),
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 10,
-                                resource: wgpu::BindingResource::TextureView(
-                                    self.mesh_maps.baked_normal_view(),
-                                ),
-                            },
-                        ],
-                    });
+            let material_bg = render_state
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("viewport.material_bg"),
+                    layout: &self.renderer.material_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.material_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.paint_target.base_color_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.paint_target.roughness_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.paint_target.metallic_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.paint_target.normal_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(active_mask_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::Sampler(&self.paint_target.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.mesh_maps.world_normal_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.paint_target.displacement_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: wgpu::BindingResource::TextureView(self.mesh_maps.ao_view()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 10,
+                            resource: wgpu::BindingResource::TextureView(
+                                self.mesh_maps.baked_normal_view(),
+                            ),
+                        },
+                    ],
+                });
 
             // Try to pick under the cursor (even if not painting — drives UI readout).
             let hover_pos = response
@@ -1234,31 +1282,40 @@ impl Viewport {
             // Interpolate stamp positions in screen space between last frame's
             // cursor and this frame's, at ~2 pixel spacing, so fast drags don't
             // leave gaps. Cap step count as a runaway guard.
-            let stamp_positions: Vec<egui::Pos2> = match (paint_pos, self.last_paint_pos) {
+            let paint_pressure = if paint_pos.is_some() {
+                pointer_pressure
+            } else {
+                1.0
+            };
+            let stamp_points: Vec<(egui::Pos2, f32)> = match (paint_pos, self.last_paint_pos) {
                 (Some(cur), Some(prev)) => {
                     const STEP_PX: f32 = 2.0;
                     const MAX_STEPS: u32 = 128;
                     let delta = cur - prev;
                     let distance = delta.length();
                     let steps = ((distance / STEP_PX).ceil() as u32).clamp(1, MAX_STEPS);
+                    let prev_pressure = self.last_paint_pressure.unwrap_or(paint_pressure);
                     (1..=steps)
-                        .map(|i| prev + delta * (i as f32 / steps as f32))
+                        .map(|i| {
+                            let t = i as f32 / steps as f32;
+                            (prev + delta * t, lerp(prev_pressure, paint_pressure, t))
+                        })
                         .collect()
                 }
-                (Some(cur), None) => vec![cur],
+                (Some(cur), None) => vec![(cur, paint_pressure)],
                 (None, _) => Vec::new(),
             };
 
-            let strokes: Vec<(u32, Vec2, egui::Pos2)> = stamp_positions
+            let strokes: Vec<(u32, Vec2, egui::Pos2, f32)> = stamp_points
                 .iter()
-                .filter_map(|p| {
+                .filter_map(|(p, pressure)| {
                     let (orig, dir) = pick::screen_to_ray(*p, rect, view_proj, eye);
                     let hit = pick::pick(&self.cpu_mesh, orig, dir)?;
                     let tile = udim::tile_id(hit.uv.to_array());
                     let layer = self.paint_target.layer_for_tile(tile)?;
                     let local_uv =
                         Vec2::new(hit.uv.x - hit.uv.x.floor(), hit.uv.y - hit.uv.y.floor());
-                    Some((layer, local_uv, *p))
+                    Some((layer, local_uv, *p, *pressure))
                 })
                 .collect();
 
@@ -1270,18 +1327,20 @@ impl Viewport {
             // Reset when paint_pos becomes None (button released or modifier
             // held) so the next stroke starts fresh instead of sweeping back.
             self.last_paint_pos = paint_pos;
+            self.last_paint_pressure = paint_pos.map(|_| paint_pressure);
 
-            let mut encoder = render_state
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("forge_paint_enc"),
-                });
+            let mut encoder =
+                render_state
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("forge_paint_enc"),
+                    });
 
             // Eyedropper: sample the composited base_color at the hit UV and
             // write it into the brush color. Uses a synchronous readback —
             // acceptable for a one-shot click action.
             if self.tool == Tool::Eyedropper && stroke_starting && !strokes.is_empty() {
-                let (layer, local_uv, _) = strokes[0];
+                let (layer, local_uv, _, _) = strokes[0];
                 let res = self.paint_target.resolution;
                 let px = ((local_uv.x * res as f32) as u32).min(res.saturating_sub(1));
                 let py = ((local_uv.y * res as f32) as u32).min(res.saturating_sub(1));
@@ -1315,8 +1374,10 @@ impl Viewport {
 
             // Stamping tools. Fill layers are parameter-only, so we skip them.
             let active_is_fill = self.layer_stack.active_layer().is_fill();
-            let is_stamping =
-                matches!(self.tool, Tool::Paint | Tool::Erase | Tool::Fill | Tool::Stencil);
+            let is_stamping = matches!(
+                self.tool,
+                Tool::Paint | Tool::Erase | Tool::Fill | Tool::Stencil
+            );
             if is_stamping && !strokes.is_empty() && !active_is_fill {
                 let active_idx = self.layer_stack.active;
                 let active = self.layer_stack.active_layer();
@@ -1356,7 +1417,7 @@ impl Viewport {
                     // Fill is one-shot per stroke; Paint/Erase stamp every
                     // interpolated position along the drag.
                     let fill_stamp;
-                    let stamps: &[(u32, Vec2, egui::Pos2)] = if self.tool == Tool::Fill {
+                    let stamps: &[(u32, Vec2, egui::Pos2, f32)] = if self.tool == Tool::Fill {
                         if stroke_starting {
                             fill_stamp = [strokes[0]];
                             &fill_stamp
@@ -1406,26 +1467,24 @@ impl Viewport {
                         // stamp's screen position and reuse it for the
                         // whole batch — drag interpolation keeps stamps
                         // in the same neighborhood so one Jacobian is fine.
-                        let pixels_per_uv: Option<f32> =
-                            stamp_positions.first().and_then(|p| {
-                                let off = 2.0;
-                                let ray_uv = |sp: egui::Pos2| -> Option<Vec2> {
-                                    if !rect.contains(sp) {
-                                        return None;
-                                    }
-                                    let (orig, dir) =
-                                        pick::screen_to_ray(sp, rect, view_proj, eye);
-                                    pick::pick(&self.cpu_mesh, orig, dir).map(|h| h.uv)
-                                };
-                                let uv_c = ray_uv(*p)?;
-                                let uv_x = ray_uv(*p + egui::vec2(off, 0.0))?;
-                                let uv_y = ray_uv(*p + egui::vec2(0.0, off))?;
-                                let d_x = (uv_x - uv_c) / off;
-                                let d_y = (uv_y - uv_c) / off;
-                                let px_x = 1.0 / d_x.length().max(1e-6);
-                                let px_y = 1.0 / d_y.length().max(1e-6);
-                                Some(0.5 * (px_x + px_y))
-                            });
+                        let pixels_per_uv: Option<f32> = stamp_points.first().and_then(|(p, _)| {
+                            let off = 2.0;
+                            let ray_uv = |sp: egui::Pos2| -> Option<Vec2> {
+                                if !rect.contains(sp) {
+                                    return None;
+                                }
+                                let (orig, dir) = pick::screen_to_ray(sp, rect, view_proj, eye);
+                                pick::pick(&self.cpu_mesh, orig, dir).map(|h| h.uv)
+                            };
+                            let uv_c = ray_uv(*p)?;
+                            let uv_x = ray_uv(*p + egui::vec2(off, 0.0))?;
+                            let uv_y = ray_uv(*p + egui::vec2(0.0, off))?;
+                            let d_x = (uv_x - uv_c) / off;
+                            let d_y = (uv_y - uv_c) / off;
+                            let px_x = 1.0 / d_x.length().max(1e-6);
+                            let px_y = 1.0 / d_y.length().max(1e-6);
+                            Some(0.5 * (px_x + px_y))
+                        });
                         // Convert pixels → UV. Fallback uses a sane default
                         // so a rare Jacobian miss doesn't skip the stamp.
                         //
@@ -1441,11 +1500,6 @@ impl Viewport {
                             .filter(|&p| p >= 16.0)
                             .unwrap_or(rect.height() * 0.5)
                             .max(16.0);
-                        // Hard cap at half a tile regardless — the shader and
-                        // scissor would otherwise cover every texel, and no
-                        // single stamp should ever exceed that footprint.
-                        let uv_radius = (self.brush.radius / sane_ppu).min(0.5);
-
                         // Projection painting: when a stencil is selected
                         // and we're brushing into base color on a paint
                         // layer with a baked position map, route stamps
@@ -1466,7 +1520,14 @@ impl Viewport {
                             && self.tool == Tool::Stencil
                             && self.mesh_maps.baked;
 
-                        for (layer, local_uv, screen_pos) in stamps {
+                        for (layer, local_uv, screen_pos, pressure) in stamps {
+                            let effective_radius = self.brush.effective_radius(*pressure);
+                            let effective_opacity = self.brush.effective_opacity(*pressure);
+                            let effective_hardness = self.brush.effective_hardness(*pressure);
+                            // Hard cap at half a tile regardless — the shader and
+                            // scissor would otherwise cover every texel, and no
+                            // single stamp should ever exceed that footprint.
+                            let uv_radius = (effective_radius / sane_ppu).min(0.5);
                             let layer_view = match channel {
                                 PaintChannel::BaseColor => {
                                     &active.base_color_layer_views[*layer as usize]
@@ -1483,28 +1544,24 @@ impl Viewport {
                                 PaintChannel::Displacement => {
                                     // Displacement lives on PaintTarget
                                     // for v0, not per-Layer.
-                                    &self.paint_target.displacement_layer_views
-                                        [*layer as usize]
+                                    &self.paint_target.displacement_layer_views[*layer as usize]
                                 }
                             };
 
                             if projection_active {
                                 // Screen pos → NDC. rect.left()/top() are the
                                 // viewport origin in screen coords.
-                                let ndc_x =
-                                    2.0 * (screen_pos.x - rect.left()) / rect.width() - 1.0;
-                                let ndc_y =
-                                    1.0 - 2.0 * (screen_pos.y - rect.top()) / rect.height();
+                                let ndc_x = 2.0 * (screen_pos.x - rect.left()) / rect.width() - 1.0;
+                                let ndc_y = 1.0 - 2.0 * (screen_pos.y - rect.top()) / rect.height();
                                 // Brush radius (screen px) → NDC. NDC covers
                                 // [-1, 1] over the viewport height → 2 units.
-                                let radius_ndc =
-                                    self.brush.radius * 2.0 / rect.height();
+                                let radius_ndc = effective_radius * 2.0 / rect.height();
                                 let proj_uniforms = ProjBrushUniforms {
                                     view_proj: view_proj.to_cols_array_2d(),
                                     center_screen: [ndc_x, ndc_y],
                                     radius_screen: radius_ndc,
-                                    opacity: self.brush.opacity,
-                                    hardness: self.brush.hardness,
+                                    opacity: effective_opacity,
+                                    hardness: effective_hardness,
                                     aspect: rect.width() / rect.height(),
                                     stencil_offset: self.stencil_transform.offset,
                                     stencil_scale: self.stencil_transform.scale,
@@ -1523,16 +1580,15 @@ impl Viewport {
                                     },
                                     _pad: [0.0; 3],
                                 };
-                                let position_view = self
-                                    .mesh_maps
-                                    .world_position
-                                    .create_view(&wgpu::TextureViewDescriptor {
+                                let position_view = self.mesh_maps.world_position.create_view(
+                                    &wgpu::TextureViewDescriptor {
                                         label: Some("mesh_maps.world_position.tile_view"),
                                         dimension: Some(wgpu::TextureViewDimension::D2),
                                         base_array_layer: *layer,
                                         array_layer_count: Some(1),
                                         ..Default::default()
-                                    });
+                                    },
+                                );
                                 self.projection_brush.stamp(
                                     &render_state.device,
                                     &render_state.queue,
@@ -1551,11 +1607,11 @@ impl Viewport {
                                         color_comp[0],
                                         color_comp[1],
                                         color_comp[2],
-                                        self.brush.opacity,
+                                        effective_opacity,
                                     ],
                                     center_uv: local_uv.to_array(),
                                     radius: uv_radius,
-                                    hardness: self.brush.hardness,
+                                    hardness: effective_hardness,
                                     uniform_fill,
                                     _pad: [0; 3],
                                 };
@@ -1578,7 +1634,7 @@ impl Viewport {
                         // layer stack, so no composite is needed for it.
                         if channel != PaintChannel::Displacement {
                             let mut dirty: Vec<usize> =
-                                stamps.iter().map(|(l, _, _)| *l as usize).collect();
+                                stamps.iter().map(|(l, _, _, _)| *l as usize).collect();
                             dirty.sort_unstable();
                             dirty.dedup();
                             self.compositor.run_sparse(
@@ -1746,10 +1802,7 @@ impl Viewport {
         // stroke is clearly visible. Shown while idling and while
         // manipulating the transform via M/R/T.
         if let (Some(tex_id), Some(_)) = (stencil_egui_tex, self.active_stencil) {
-            let is_painting_now = primary_active
-                && !adjust_mode
-                && !stencil_xf_mode
-                && no_mods;
+            let is_painting_now = primary_active && !adjust_mode && !stencil_xf_mode && no_mods;
             if !is_painting_now {
                 let xf = self.stencil_transform;
                 let cr = xf.rotation.cos();
@@ -1760,9 +1813,9 @@ impl Viewport {
                 // — "isotropic" units where X and Y have the same
                 // visual scale on screen.
                 let local = [
-                    ([-stencil_aspect,  1.0], [0.0, 0.0]),
-                    ([ stencil_aspect,  1.0], [1.0, 0.0]),
-                    ([ stencil_aspect, -1.0], [1.0, 1.0]),
+                    ([-stencil_aspect, 1.0], [0.0, 0.0]),
+                    ([stencil_aspect, 1.0], [1.0, 0.0]),
+                    ([stencil_aspect, -1.0], [1.0, 1.0]),
                     ([-stencil_aspect, -1.0], [0.0, 1.0]),
                 ];
                 let ndc_to_screen = |nx: f32, ny: f32| -> egui::Pos2 {
@@ -1802,10 +1855,7 @@ impl Viewport {
 
                 // Rectangle outline so the footprint is readable against
                 // busy backgrounds.
-                let outline = egui::Stroke::new(
-                    1.5,
-                    egui::Color32::from_rgb(255, 220, 100),
-                );
+                let outline = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 220, 100));
                 ui.painter().line_segment([pts[0], pts[1]], outline);
                 ui.painter().line_segment([pts[1], pts[2]], outline);
                 ui.painter().line_segment([pts[2], pts[3]], outline);
@@ -1858,7 +1908,15 @@ impl Viewport {
                 // ring is a trivial mapping now. No more UV-gradient
                 // picker dance.
                 let on_mesh = self.last_hit_uv.is_some();
-                let screen_radius = self.brush.radius.clamp(2.0, rect.height() * 0.5);
+                let preview_pressure = if primary_active {
+                    pointer_pressure
+                } else {
+                    1.0
+                };
+                let screen_radius = self
+                    .brush
+                    .effective_radius(preview_pressure)
+                    .clamp(2.0, rect.height() * 0.5);
 
                 let (color, stroke_width) = if adjust_mode {
                     (egui::Color32::from_rgb(255, 220, 100), 2.0)
@@ -1874,7 +1932,11 @@ impl Viewport {
                 let painter = ui.painter();
                 painter.circle_stroke(pos, screen_radius, egui::Stroke::new(stroke_width, color));
                 // Inner ring hints at brush hardness (softer → smaller core).
-                let inner = screen_radius * self.brush.hardness.clamp(0.05, 0.95);
+                let inner = screen_radius
+                    * self
+                        .brush
+                        .effective_hardness(preview_pressure)
+                        .clamp(0.05, 0.95);
                 if inner > 2.0 {
                     painter.circle_stroke(
                         pos,
@@ -1914,9 +1976,7 @@ impl Viewport {
 
         // Keep the redraw going while painting, adjusting brush, or
         // manipulating the stencil transform so drags stay smooth.
-        if paint_pos.is_some()
-            || (primary_active && (adjust_mode || stencil_xf_mode))
-        {
+        if paint_pos.is_some() || (primary_active && (adjust_mode || stencil_xf_mode)) {
             ui.ctx().request_repaint();
         }
 
@@ -1992,6 +2052,43 @@ fn brush_color_components(brush: &BrushState, channel: PaintChannel) -> [f32; 3]
 }
 
 impl BrushState {
+    pub fn effective_radius(&self, pressure: f32) -> f32 {
+        if self.pressure.size_enabled {
+            let p = self.pressure_value(pressure);
+            let min = self.pressure.min_size.clamp(0.0, 1.0);
+            self.radius * lerp(min, 1.0, p)
+        } else {
+            self.radius
+        }
+    }
+
+    pub fn effective_opacity(&self, pressure: f32) -> f32 {
+        if self.pressure.opacity_enabled {
+            let p = self.pressure_value(pressure);
+            let min = self.pressure.min_opacity.clamp(0.0, 1.0);
+            self.opacity * lerp(min, 1.0, p)
+        } else {
+            self.opacity
+        }
+        .clamp(0.0, 1.0)
+    }
+
+    pub fn effective_hardness(&self, pressure: f32) -> f32 {
+        if self.pressure.hardness_enabled {
+            let p = self.pressure_value(pressure);
+            let min = self.pressure.min_hardness.clamp(0.0, 1.0);
+            lerp(min, self.hardness, p)
+        } else {
+            self.hardness
+        }
+        .clamp(0.0, 1.0)
+    }
+
+    fn pressure_value(&self, pressure: f32) -> f32 {
+        let curve = self.pressure.curve.clamp(0.25, 4.0);
+        pressure.clamp(0.0, 1.0).powf(curve)
+    }
+
     pub fn color_linear(&self) -> [f32; 3] {
         [
             srgb_to_linear(self.color_srgb[0]),
@@ -2008,6 +2105,25 @@ impl BrushState {
         let l = self.color_linear();
         0.2126 * l[0] + 0.7152 * l[1] + 0.0722 * l[2]
     }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
+
+fn pointer_pressure_from_events(ctx: &egui::Context) -> Option<f32> {
+    ctx.input(|i| {
+        i.events.iter().rev().find_map(|event| match event {
+            egui::Event::Touch {
+                phase,
+                force: Some(force),
+                ..
+            } if matches!(*phase, egui::TouchPhase::Start | egui::TouchPhase::Move) => {
+                Some((*force).clamp(0.0, 1.0))
+            }
+            _ => None,
+        })
+    })
 }
 
 fn srgb_to_linear(c: f32) -> f32 {
@@ -2043,7 +2159,11 @@ fn sample_srgb_u8(
         wgpu::TexelCopyTextureInfo {
             texture: tex,
             mip_level: 0,
-            origin: wgpu::Origin3d { x: px, y: py, z: layer },
+            origin: wgpu::Origin3d {
+                x: px,
+                y: py,
+                z: layer,
+            },
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::TexelCopyBufferInfo {
@@ -2062,10 +2182,9 @@ fn sample_srgb_u8(
     );
     queue.submit(Some(enc.finish()));
     let (tx, rx) = std::sync::mpsc::channel();
-    buf.slice(..)
-        .map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
+    buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
     let _ = device.poll(wgpu::Maintain::Wait);
     match rx.recv() {
         Ok(Ok(())) => {}

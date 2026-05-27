@@ -160,7 +160,10 @@ impl StageBrowser {
                 let (label, tip) = if *undocked {
                     ("⮌ Dock", "Dock the Stage browser back into the main layout")
                 } else {
-                    ("⮎ Undock", "Pop out the Stage browser into a floating window")
+                    (
+                        "⮎ Undock",
+                        "Pop out the Stage browser into a floating window",
+                    )
                 };
                 if ui.button(label).on_hover_text(tip).clicked() {
                     *undocked = !*undocked;
@@ -258,9 +261,9 @@ impl StageBrowser {
 }
 
 fn subtree_matches(node: &PrimNode, filter: &str) -> bool {
-    node.children.iter().any(|c| {
-        c.name.to_lowercase().contains(filter) || subtree_matches(c, filter)
-    })
+    node.children
+        .iter()
+        .any(|c| c.name.to_lowercase().contains(filter) || subtree_matches(c, filter))
 }
 
 fn snapshot_prim(prim: &rust_usd::Prim) -> PrimNode {

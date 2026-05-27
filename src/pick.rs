@@ -39,13 +39,7 @@ pub fn screen_to_ray(
 /// degenerate. The wgpu pipeline renders double-sided too (paint
 /// workflows always want both sides paintable), so picking matches
 /// what the user sees.
-fn ray_tri(
-    orig: Vec3,
-    dir: Vec3,
-    v0: Vec3,
-    v1: Vec3,
-    v2: Vec3,
-) -> Option<(f32, f32, f32)> {
+fn ray_tri(orig: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> Option<(f32, f32, f32)> {
     const EPS: f32 = 1e-8;
     let edge1 = v1 - v0;
     let edge2 = v2 - v0;

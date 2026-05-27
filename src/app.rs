@@ -1,3 +1,4 @@
+use anyhow::Context;
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
@@ -164,6 +165,8 @@ pub struct App {
     /// fast drags with interpolated stamps, same pattern as the 3D
     /// viewport's `last_paint_pos`. None between strokes.
     uv_last_paint_atlas_uv: Option<egui::Vec2>,
+    /// Tablet pressure paired with `uv_last_paint_atlas_uv`.
+    uv_last_paint_pressure: Option<f32>,
     /// Which page of the right Properties panel is currently visible.
     /// Mirrors how the left tool column works — one focused view at a
     /// time, switched via the icon strip on the right edge.
@@ -238,7 +241,7 @@ impl PropertiesTab {
 
 /// Which channel a material-slot assignment should target on the
 /// active layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum MaterialSlot {
     BaseColor,
     Roughness,
@@ -261,6 +264,85 @@ impl MaterialSlot {
         MaterialSlot::Metallic,
         MaterialSlot::Normal,
     ];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DetectedMaterialTextures {
+    uv_primvar: String,
+    base_color: Option<PathBuf>,
+    roughness: Option<PathBuf>,
+    metallic: Option<PathBuf>,
+    normal: Option<PathBuf>,
+    emission: Option<PathBuf>,
+    occlusion: Option<PathBuf>,
+}
+
+impl DetectedMaterialTextures {
+    fn empty(uv_primvar: impl Into<String>) -> Self {
+        Self {
+            uv_primvar: uv_primvar.into(),
+            base_color: None,
+            roughness: None,
+            metallic: None,
+            normal: None,
+            emission: None,
+            occlusion: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.base_color.is_none()
+            && self.roughness.is_none()
+            && self.metallic.is_none()
+            && self.normal.is_none()
+            && self.emission.is_none()
+            && self.occlusion.is_none()
+    }
+
+    fn set(&mut self, pin: crate::material_graph::ShaderPin, path: PathBuf) {
+        match pin {
+            crate::material_graph::ShaderPin::DiffuseColor => self.base_color = Some(path),
+            crate::material_graph::ShaderPin::Roughness => self.roughness = Some(path),
+            crate::material_graph::ShaderPin::Metallic => self.metallic = Some(path),
+            crate::material_graph::ShaderPin::Normal => self.normal = Some(path),
+            crate::material_graph::ShaderPin::EmissionColor => self.emission = Some(path),
+            crate::material_graph::ShaderPin::Occlusion => self.occlusion = Some(path),
+            _ => {}
+        }
+    }
+
+    fn texture_nodes(&self) -> Vec<(PathBuf, crate::material_graph::ShaderPin)> {
+        let mut nodes = Vec::new();
+        if let Some(path) = &self.base_color {
+            nodes.push((path.clone(), crate::material_graph::ShaderPin::DiffuseColor));
+        }
+        if let Some(path) = &self.roughness {
+            nodes.push((path.clone(), crate::material_graph::ShaderPin::Roughness));
+        }
+        if let Some(path) = &self.metallic {
+            nodes.push((path.clone(), crate::material_graph::ShaderPin::Metallic));
+        }
+        if let Some(path) = &self.normal {
+            nodes.push((path.clone(), crate::material_graph::ShaderPin::Normal));
+        }
+        if let Some(path) = &self.emission {
+            nodes.push((
+                path.clone(),
+                crate::material_graph::ShaderPin::EmissionColor,
+            ));
+        }
+        if let Some(path) = &self.occlusion {
+            nodes.push((path.clone(), crate::material_graph::ShaderPin::Occlusion));
+        }
+        nodes
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedStageTexture {
+    path: PathBuf,
+    slot: Option<MaterialSlot>,
+    udim: Option<u32>,
 }
 
 /// One concurrent material binding. The library material at `source`
@@ -392,7 +474,10 @@ impl eframe::App for App {
                     &render_state.queue,
                     &cpu,
                 ));
-                log::info!("Viewport initialized with unit cube ({} verts)", cpu.positions.len());
+                log::info!(
+                    "Viewport initialized with unit cube ({} verts)",
+                    cpu.positions.len()
+                );
             }
         }
 
@@ -452,10 +537,7 @@ impl eframe::App for App {
                         ui.close_menu();
                     }
                     if ui
-                        .add_enabled(
-                            can_redo,
-                            egui::Button::new("Redo   ⇧⌘Z / Ctrl+Shift+Z"),
-                        )
+                        .add_enabled(can_redo, egui::Button::new("Redo   ⇧⌘Z / Ctrl+Shift+Z"))
                         .clicked()
                     {
                         self.do_redo(frame);
@@ -502,10 +584,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    if ui
-                        .checkbox(&mut self.show_uv_view, "UV view")
-                        .clicked()
-                    {
+                    if ui.checkbox(&mut self.show_uv_view, "UV view").clicked() {
                         ui.close_menu();
                     }
                     if ui
@@ -552,7 +631,10 @@ impl eframe::App for App {
                 .default_width(460.0)
                 .show(ctx, |ui| {
                     ui.label("USD URI or path (forge://… or a filesystem path):");
-                    ui.add(egui::TextEdit::singleline(&mut self.uri_buffer).desired_width(f32::INFINITY));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.uri_buffer)
+                            .desired_width(f32::INFINITY),
+                    );
                     ui.horizontal(|ui| {
                         let ok = ui.button("Load").clicked();
                         if ui.button("Cancel").clicked() {
@@ -607,23 +689,16 @@ impl eframe::App for App {
                                     .num_columns(columns)
                                     .spacing(egui::vec2(8.0, 8.0))
                                     .show(ui, |ui| {
-                                        for (i, asset) in
-                                            self.browser.textures.iter().enumerate()
-                                        {
+                                        for (i, asset) in self.browser.textures.iter().enumerate() {
                                             ui.vertical(|ui| {
-                                                let img = egui::Image::new((
-                                                    asset.thumb_id,
-                                                    thumb,
-                                                ))
-                                                .fit_to_exact_size(thumb)
-                                                .sense(egui::Sense::click());
+                                                let img = egui::Image::new((asset.thumb_id, thumb))
+                                                    .fit_to_exact_size(thumb)
+                                                    .sense(egui::Sense::click());
                                                 if ui.add(img).on_hover_text(&asset.name).clicked()
                                                 {
                                                     picked = Some(i);
                                                 }
-                                                ui.label(
-                                                    egui::RichText::new(&asset.name).small(),
-                                                );
+                                                ui.label(egui::RichText::new(&asset.name).small());
                                             });
                                             if (i + 1) % columns == 0 {
                                                 ui.end_row();
@@ -680,26 +755,16 @@ impl eframe::App for App {
                                     .num_columns(columns)
                                     .spacing(egui::vec2(8.0, 8.0))
                                     .show(ui, |ui| {
-                                        for (i, asset) in
-                                            self.browser.textures.iter().enumerate()
-                                        {
+                                        for (i, asset) in self.browser.textures.iter().enumerate() {
                                             ui.vertical(|ui| {
-                                                let img = egui::Image::new((
-                                                    asset.thumb_id,
-                                                    thumb,
-                                                ))
-                                                .fit_to_exact_size(thumb)
-                                                .sense(egui::Sense::click());
-                                                if ui
-                                                    .add(img)
-                                                    .on_hover_text(&asset.name)
-                                                    .clicked()
+                                                let img = egui::Image::new((asset.thumb_id, thumb))
+                                                    .fit_to_exact_size(thumb)
+                                                    .sense(egui::Sense::click());
+                                                if ui.add(img).on_hover_text(&asset.name).clicked()
                                                 {
                                                     picked = Some(i);
                                                 }
-                                                ui.label(
-                                                    egui::RichText::new(&asset.name).small(),
-                                                );
+                                                ui.label(egui::RichText::new(&asset.name).small());
                                             });
                                             if (i + 1) % columns == 0 {
                                                 ui.end_row();
@@ -940,6 +1005,7 @@ impl eframe::App for App {
                                     &mut self.uv_show_wireframe,
                                     &mut self.uv_view_undocked,
                                     &mut self.uv_last_paint_atlas_uv,
+                                    &mut self.uv_last_paint_pressure,
                                 );
                             });
                         if self.uv_channel != prev_uv_channel {
@@ -972,35 +1038,27 @@ impl eframe::App for App {
                     let mut swap_renderer = false;
                     let viewport_selection = match self.renderer_mode {
                         RendererMode::Wgpu => {
-                            vp.show(
-                                ui,
-                                frame,
-                                stencil_view,
-                                stencil_aspect,
-                                stencil_tex_id,
-                            )
+                            vp.show(ui, frame, stencil_view, stencil_aspect, stencil_tex_id)
                         }
-                        RendererMode::Hydra => {
-                            Self::draw_hydra_central(
-                                ui,
-                                frame,
-                                vp,
-                                &mut self.hydra,
-                                &mut self.hydra_egui_tex,
-                                &mut self.hydra_delegate,
-                                &mut self.hydra_paint_cache_dir,
-                                &mut self.hydra_paint_sync_seq,
-                                &mut self.hydra_paint_sync_status,
-                                &mut self.hydra_paint_sync_pending,
-                                &mut self.hydra_show_render,
-                                &mut self.hydra_show_proxy,
-                                &mut self.hydra_show_guides,
-                                &self.material_bindings,
-                                &mut self.last_pushed_bindings,
-                                self.current_usd_path.as_deref(),
-                                &mut swap_renderer,
-                            )
-                        }
+                        RendererMode::Hydra => Self::draw_hydra_central(
+                            ui,
+                            frame,
+                            vp,
+                            &mut self.hydra,
+                            &mut self.hydra_egui_tex,
+                            &mut self.hydra_delegate,
+                            &mut self.hydra_paint_cache_dir,
+                            &mut self.hydra_paint_sync_seq,
+                            &mut self.hydra_paint_sync_status,
+                            &mut self.hydra_paint_sync_pending,
+                            &mut self.hydra_show_render,
+                            &mut self.hydra_show_proxy,
+                            &mut self.hydra_show_guides,
+                            &self.material_bindings,
+                            &mut self.last_pushed_bindings,
+                            self.current_usd_path.as_deref(),
+                            &mut swap_renderer,
+                        ),
                     };
                     if let Some(selection) = viewport_selection {
                         pending_viewport_selection = Some(selection);
@@ -1022,8 +1080,7 @@ impl eframe::App for App {
                         &mut self.hydra_delegate,
                     );
                     let _ = swap_renderer;
-                    if prev_mode == RendererMode::Wgpu
-                        && self.renderer_mode == RendererMode::Hydra
+                    if prev_mode == RendererMode::Wgpu && self.renderer_mode == RendererMode::Hydra
                     {
                         // Just entered Hydra → schedule the one-
                         // shot paint sync so any strokes painted in
@@ -1118,6 +1175,7 @@ impl eframe::App for App {
                             &mut self.uv_show_wireframe,
                             &mut self.uv_view_undocked,
                             &mut self.uv_last_paint_atlas_uv,
+                            &mut self.uv_last_paint_pressure,
                         );
                     });
                 if self.uv_channel != prev_uv_channel {
@@ -1274,6 +1332,10 @@ fn layers_tab(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
     color_section(ui, vp);
     ui.add_space(10.0);
     ui.separator();
+    ui.label(egui::RichText::new("Brush").strong());
+    brush_section(ui, vp);
+    ui.add_space(10.0);
+    ui.separator();
     ui.label(egui::RichText::new("Layers").strong());
     layer_panel(ui, vp, frame);
 }
@@ -1311,9 +1373,15 @@ fn material_editor_body(
         ui.weak("Right-click a shader node to assign / remove.");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let (label, tip) = if *undocked {
-                ("⮌ Dock", "Dock the Material Editor back into the main layout")
+                (
+                    "⮌ Dock",
+                    "Dock the Material Editor back into the main layout",
+                )
             } else {
-                ("⮎ Undock", "Pop out the Material Editor into a floating window")
+                (
+                    "⮎ Undock",
+                    "Pop out the Material Editor into a floating window",
+                )
             };
             if ui.button(label).on_hover_text(tip).clicked() {
                 *undocked = !*undocked;
@@ -1351,8 +1419,7 @@ fn material_editor_body(
         match act {
             crate::material_graph::GraphAction::AssignToSelection(id) => {
                 if let Some(b) = bindings.iter_mut().find(|b| b.id == id) {
-                    b.target_prims =
-                        browser_selection.iter().cloned().collect();
+                    b.target_prims = browser_selection.iter().cloned().collect();
                     b.assigned = true;
                 }
             }
@@ -1387,7 +1454,12 @@ fn material_graph_style(ui: &egui::Ui) -> egui_snarl::ui::SnarlStyle {
         )),
         bg_pattern_stroke: Some(egui::Stroke::new(
             1.0,
-            visuals.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.55),
+            visuals
+                .widgets
+                .noninteractive
+                .bg_stroke
+                .color
+                .gamma_multiply(0.55),
         )),
         pin_size: Some(10.0),
         wire_width: Some(3.0),
@@ -1425,12 +1497,7 @@ fn material_tab(ui: &mut egui::Ui, vp: &mut Viewport) -> Option<MaterialSlot> {
     clicked
 }
 
-fn project_tab(
-    ui: &mut egui::Ui,
-    vp: &mut Viewport,
-    frame: &eframe::Frame,
-    status: &mut String,
-) {
+fn project_tab(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame, status: &mut String) {
     paint_target_section(ui, vp, frame, status);
 }
 
@@ -1484,7 +1551,11 @@ fn run_post_export_hook(dir: &std::path::Path) -> String {
     }
     let cmd_str = tmpl_str.replace("{dir}", &dir.to_string_lossy());
     log::info!("post-export hook: sh -c {cmd_str:?}");
-    match std::process::Command::new("sh").arg("-c").arg(&cmd_str).status() {
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd_str)
+        .status()
+    {
         Ok(s) if s.success() => " · post-export hook ok".to_string(),
         Ok(s) => format!(" · post-export hook failed ({s})"),
         Err(e) => format!(" · post-export hook error: {e}"),
@@ -1527,7 +1598,11 @@ fn color_section(ui: &mut egui::Ui, vp: &mut Viewport) {
             ));
         }
         PaintChannel::Mask => {
-            let tag = if lum >= 0.5 { "reveal (white)" } else { "hide (black)" };
+            let tag = if lum >= 0.5 {
+                "reveal (white)"
+            } else {
+                "hide (black)"
+            };
             ui.weak(format!("mask: {tag}  (threshold at 0.5)"));
         }
     }
@@ -1551,12 +1626,8 @@ fn color_section(ui: &mut egui::Ui, vp: &mut Viewport) {
                 (rgb[1] * 255.0) as u8,
                 (rgb[2] * 255.0) as u8,
             );
-            let (rect, resp) = ui.allocate_exact_size(
-                egui::vec2(22.0, 22.0),
-                egui::Sense::click(),
-            );
-            ui.painter()
-                .rect_filled(rect, 3.0, fill);
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+            ui.painter().rect_filled(rect, 3.0, fill);
             ui.painter().rect_stroke(
                 rect,
                 3.0,
@@ -1569,6 +1640,54 @@ fn color_section(ui: &mut egui::Ui, vp: &mut Viewport) {
             }
         }
     });
+}
+
+fn brush_section(ui: &mut egui::Ui, vp: &mut Viewport) {
+    ui.add(egui::Slider::new(&mut vp.brush.radius, 2.0..=500.0).text("radius px"));
+    ui.add(egui::Slider::new(&mut vp.brush.opacity, 0.0..=1.0).text("opacity"));
+    ui.add(egui::Slider::new(&mut vp.brush.hardness, 0.0..=1.0).text("hardness"));
+
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("Tablet pressure").strong());
+    let live = vp
+        .input_pressure()
+        .map(|p| format!("{p:.2}"))
+        .unwrap_or_else(|| "idle".to_string());
+    ui.horizontal(|ui| {
+        ui.label("input");
+        ui.weak(live);
+    });
+
+    let pressure = &mut vp.brush.pressure;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut pressure.size_enabled, "size")
+            .on_hover_text("Scale brush radius from tablet pressure");
+        ui.add_enabled(
+            pressure.size_enabled,
+            egui::Slider::new(&mut pressure.min_size, 0.0..=1.0).text("min"),
+        )
+        .on_hover_text("Radius multiplier at light pressure");
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut pressure.opacity_enabled, "opacity")
+            .on_hover_text("Scale per-dab opacity from tablet pressure");
+        ui.add_enabled(
+            pressure.opacity_enabled,
+            egui::Slider::new(&mut pressure.min_opacity, 0.0..=1.0).text("min"),
+        )
+        .on_hover_text("Opacity multiplier at light pressure");
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut pressure.hardness_enabled, "hardness")
+            .on_hover_text("Blend hardness from min to the brush hardness");
+        ui.add_enabled(
+            pressure.hardness_enabled,
+            egui::Slider::new(&mut pressure.min_hardness, 0.0..=1.0).text("min"),
+        )
+        .on_hover_text("Hardness at light pressure");
+    });
+    ui.add(egui::Slider::new(&mut pressure.curve, 0.25..=4.0).text("curve"))
+        .on_hover_text("1 is linear, lower is softer, higher is firmer");
 }
 
 fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
@@ -1618,120 +1737,123 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
                     vp.ensure_layer_thumb(&rs.device, &mut renderer, i)
                 });
                 let mut activate = false;
-                egui::Frame::NONE.fill(row_bg).inner_margin(4.0).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let layer = &mut vp.layer_stack.layers[i];
-
-                        if ui.checkbox(&mut layer.visible, "").changed() {
-                            needs_recomposite = true;
-                        }
-
-                        if let Some(id) = thumb {
-                            // Click the thumbnail → activate the layer.
-                            let img = egui::Image::new((id, egui::vec2(32.0, 32.0)))
-                                .fit_to_exact_size(egui::vec2(32.0, 32.0))
-                                .sense(egui::Sense::click());
-                            if ui.add(img).clicked() {
-                                activate = true;
-                            }
-                        }
-
-                        // Clickable name → sets active
-                        let label = egui::Label::new(egui::RichText::new(&layer.name).strong())
-                            .sense(egui::Sense::click())
-                            .truncate();
-                        if ui.add(label).clicked() {
-                            activate = true;
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        let layer = &mut vp.layer_stack.layers[i];
-                        use crate::paint::BlendMode;
-                        let before = layer.blend_mode;
-                        egui::ComboBox::from_id_salt(("blend_mode", i))
-                            .selected_text(layer.blend_mode.label())
-                            .show_ui(ui, |ui| {
-                                for &mode in BlendMode::ALL {
-                                    ui.selectable_value(
-                                        &mut layer.blend_mode,
-                                        mode,
-                                        mode.label(),
-                                    );
-                                }
-                            });
-                        if layer.blend_mode != before {
-                            needs_recomposite = true;
-                        }
-                        let resp = ui.add(
-                            egui::Slider::new(&mut layer.opacity, 0.0..=1.0)
-                                .show_value(true)
-                                .text("opacity"),
-                        );
-                        if resp.changed() {
-                            needs_recomposite = true;
-                        }
-                        if n > 1 && ui.small_button("delete").clicked() {
-                            delete_idx = Some(i);
-                        }
-                    });
-
-                    // Fill-layer controls replace the content/mask buttons —
-                    // Fill can't be painted directly; the sliders drive it.
-                    if let Some(mut params) = vp.layer_stack.layers[i].fill_params() {
-                        let before = params;
+                egui::Frame::NONE
+                    .fill(row_bg)
+                    .inner_margin(4.0)
+                    .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label("fill color");
-                            ui.color_edit_button_rgb(&mut params.base_color_srgb);
-                        });
-                        ui.add(
-                            egui::Slider::new(&mut params.roughness, 0.0..=1.0)
-                                .text("roughness"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut params.metallic, 0.0..=1.0).text("metallic"),
-                        );
-                        if params != before {
-                            if let Some(rs) = frame.wgpu_render_state() {
-                                vp.layer_stack.layers[i].set_fill_params(&rs.queue, params);
+                            let layer = &mut vp.layer_stack.layers[i];
+
+                            if ui.checkbox(&mut layer.visible, "").changed() {
                                 needs_recomposite = true;
                             }
+
+                            if let Some(id) = thumb {
+                                // Click the thumbnail → activate the layer.
+                                let img = egui::Image::new((id, egui::vec2(32.0, 32.0)))
+                                    .fit_to_exact_size(egui::vec2(32.0, 32.0))
+                                    .sense(egui::Sense::click());
+                                if ui.add(img).clicked() {
+                                    activate = true;
+                                }
+                            }
+
+                            // Clickable name → sets active
+                            let label = egui::Label::new(egui::RichText::new(&layer.name).strong())
+                                .sense(egui::Sense::click())
+                                .truncate();
+                            if ui.add(label).clicked() {
+                                activate = true;
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            let layer = &mut vp.layer_stack.layers[i];
+                            use crate::paint::BlendMode;
+                            let before = layer.blend_mode;
+                            egui::ComboBox::from_id_salt(("blend_mode", i))
+                                .selected_text(layer.blend_mode.label())
+                                .show_ui(ui, |ui| {
+                                    for &mode in BlendMode::ALL {
+                                        ui.selectable_value(
+                                            &mut layer.blend_mode,
+                                            mode,
+                                            mode.label(),
+                                        );
+                                    }
+                                });
+                            if layer.blend_mode != before {
+                                needs_recomposite = true;
+                            }
+                            let resp = ui.add(
+                                egui::Slider::new(&mut layer.opacity, 0.0..=1.0)
+                                    .show_value(true)
+                                    .text("opacity"),
+                            );
+                            if resp.changed() {
+                                needs_recomposite = true;
+                            }
+                            if n > 1 && ui.small_button("delete").clicked() {
+                                delete_idx = Some(i);
+                            }
+                        });
+
+                        // Fill-layer controls replace the content/mask buttons —
+                        // Fill can't be painted directly; the sliders drive it.
+                        if let Some(mut params) = vp.layer_stack.layers[i].fill_params() {
+                            let before = params;
+                            ui.horizontal(|ui| {
+                                ui.label("fill color");
+                                ui.color_edit_button_rgb(&mut params.base_color_srgb);
+                            });
+                            ui.add(
+                                egui::Slider::new(&mut params.roughness, 0.0..=1.0)
+                                    .text("roughness"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut params.metallic, 0.0..=1.0).text("metallic"),
+                            );
+                            if params != before {
+                                if let Some(rs) = frame.wgpu_render_state() {
+                                    vp.layer_stack.layers[i].set_fill_params(&rs.queue, params);
+                                    needs_recomposite = true;
+                                }
+                            }
                         }
-                    }
-                    ui.horizontal(|ui| {
-                        let has_mask = vp.layer_stack.layers[i].mask.is_some();
-                        if has_mask {
-                            let editing_this = is_active && vp.brush.mask_edit;
-                            let (content_label, mask_label) = if editing_this {
-                                ("edit content", "[editing mask]")
-                            } else if is_active {
-                                ("[editing content]", "edit mask")
-                            } else {
-                                ("content", "mask")
-                            };
-                            if ui.small_button(content_label).clicked() {
-                                vp.layer_stack.active = i;
-                                vp.brush.mask_edit = false;
+                        ui.horizontal(|ui| {
+                            let has_mask = vp.layer_stack.layers[i].mask.is_some();
+                            if has_mask {
+                                let editing_this = is_active && vp.brush.mask_edit;
+                                let (content_label, mask_label) = if editing_this {
+                                    ("edit content", "[editing mask]")
+                                } else if is_active {
+                                    ("[editing content]", "edit mask")
+                                } else {
+                                    ("content", "mask")
+                                };
+                                if ui.small_button(content_label).clicked() {
+                                    vp.layer_stack.active = i;
+                                    vp.brush.mask_edit = false;
+                                }
+                                if ui.small_button(mask_label).clicked() {
+                                    vp.layer_stack.active = i;
+                                    vp.brush.mask_edit = true;
+                                }
+                                if ui.small_button("×").clicked() {
+                                    mask_remove = Some(i);
+                                }
+                            } else if ui.small_button("+ mask").clicked() {
+                                mask_add = Some(i);
                             }
-                            if ui.small_button(mask_label).clicked() {
-                                vp.layer_stack.active = i;
-                                vp.brush.mask_edit = true;
-                            }
-                            if ui.small_button("×").clicked() {
-                                mask_remove = Some(i);
-                            }
-                        } else if ui.small_button("+ mask").clicked() {
-                            mask_add = Some(i);
+                        });
+                        // Smart-mask sub-block. Shown for any layer that
+                        // has a mask. The block renders inside an indented
+                        // group so the layer row stays compact when the
+                        // mask is purely manual.
+                        if vp.layer_stack.layers[i].mask.is_some() {
+                            smart_mask_subpanel(ui, vp, i, frame, &mut smart_regen_request);
                         }
                     });
-                    // Smart-mask sub-block. Shown for any layer that
-                    // has a mask. The block renders inside an indented
-                    // group so the layer row stays compact when the
-                    // mask is purely manual.
-                    if vp.layer_stack.layers[i].mask.is_some() {
-                        smart_mask_subpanel(ui, vp, i, frame, &mut smart_regen_request);
-                    }
-                });
                 if activate {
                     vp.layer_stack.active = i;
                 }
@@ -1825,11 +1947,8 @@ fn layer_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
 
         // Smart-material preset → new layer with mask + smart config.
         if let Some(preset) = preset_request {
-            match vp.apply_smart_material_preset(
-                &render_state.device,
-                &render_state.queue,
-                preset,
-            ) {
+            match vp.apply_smart_material_preset(&render_state.device, &render_state.queue, preset)
+            {
                 Ok(idx) => log::info!("applied {} preset as layer {idx}", preset.label()),
                 Err(e) => log::warn!("preset {} regen failed: {e}", preset.label()),
             }
@@ -1885,8 +2004,11 @@ fn env_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) {
 
     ui.add(egui::Slider::new(&mut vp.env_intensity, 0.0..=4.0).text("intensity"));
     ui.add(
-        egui::Slider::new(&mut vp.env_rotation_y, -std::f32::consts::PI..=std::f32::consts::PI)
-            .text("rotation"),
+        egui::Slider::new(
+            &mut vp.env_rotation_y,
+            -std::f32::consts::PI..=std::f32::consts::PI,
+        )
+        .text("rotation"),
     );
     ui.checkbox(&mut vp.env_skybox_visible, "show sky");
 
@@ -2056,10 +2178,7 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| "hp".into());
                         let tri = m.indices.len();
-                        log::info!(
-                            "loaded high-poly {} ({tri} triangles)",
-                            path.display()
-                        );
+                        log::info!("loaded high-poly {} ({tri} triangles)", path.display());
                         vp.bake_high_poly = Some(m);
                         vp.bake_high_poly_label = Some(format!("{stem} · {tri} tris"));
                         vp.bake_high_poly_path = Some(path);
@@ -2110,8 +2229,11 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
                                 m.positions.len(),
                                 lp_vert_count
                             );
-                            vp.bake_cage_label =
-                                Some(format!("⚠ {} verts ≠ {} (low-poly)", m.positions.len(), lp_vert_count));
+                            vp.bake_cage_label = Some(format!(
+                                "⚠ {} verts ≠ {} (low-poly)",
+                                m.positions.len(),
+                                lp_vert_count
+                            ));
                         } else {
                             log::info!(
                                 "loaded cage {} ({} verts)",
@@ -2185,7 +2307,11 @@ fn mesh_maps_panel(ui: &mut egui::Ui, vp: &mut Viewport, frame: &eframe::Frame) 
     let mut bake_all_request = false;
 
     ui.horizontal(|ui| {
-        if ui.button("Bake all").on_hover_text("Bake every map at the current resolution").clicked() {
+        if ui
+            .button("Bake all")
+            .on_hover_text("Bake every map at the current resolution")
+            .clicked()
+        {
             bake_all_request = true;
         }
     });
@@ -2352,11 +2478,8 @@ fn smart_mask_subpanel(
         };
         let toggle = ui.add(
             egui::Button::new(
-                egui::RichText::new(format!(
-                    "{}  Smart mask",
-                    egui_phosphor::regular::SPARKLE
-                ))
-                .size(14.0),
+                egui::RichText::new(format!("{}  Smart mask", egui_phosphor::regular::SPARKLE))
+                    .size(14.0),
             )
             .fill(fill)
             .min_size(egui::vec2(140.0, 22.0)),
@@ -2476,6 +2599,10 @@ fn paint_target_section(
         });
 }
 
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
+
 /// Render the 2D UV atlas painting view. Shows `paint_target.base_color`
 /// composited tiles at their UDIM positions, supports pan (drag) + zoom
 /// (scroll), paints via `Viewport::stamp_at_uv` on left-click drag.
@@ -2492,6 +2619,7 @@ fn uv_view_body(
     show_wireframe: &mut bool,
     undocked: &mut bool,
     last_paint_atlas_uv: &mut Option<egui::Vec2>,
+    last_paint_pressure: &mut Option<f32>,
 ) {
     use crate::render::ViewMode;
     // Allowed atlas channels — everything that has a per-tile, 2D image:
@@ -2543,8 +2671,8 @@ fn uv_view_body(
     // live on each Layer, so switching layers requires re-registering.
     let tiles = vp.paint_target().tiles.to_vec();
     let channel_changed = *thumb_channel != Some(*channel);
-    let mask_layer_changed = *channel == ViewMode::Mask
-        && *thumb_layer_idx != Some(active_layer_idx);
+    let mask_layer_changed =
+        *channel == ViewMode::Mask && *thumb_layer_idx != Some(active_layer_idx);
     if thumb_ids.len() != tiles.len() || channel_changed || mask_layer_changed {
         thumb_ids.clear();
         thumb_ids.resize(tiles.len(), None);
@@ -2594,10 +2722,8 @@ fn uv_view_body(
         }
     }
 
-    let (rect, response) = ui.allocate_exact_size(
-        ui.available_size(),
-        egui::Sense::click_and_drag(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
     // Pan (right-mouse drag or middle-mouse drag — leave LMB for paint).
     if response.dragged_by(egui::PointerButton::Secondary)
@@ -2610,9 +2736,7 @@ fn uv_view_body(
     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
     if response.hovered() && scroll.abs() > 0.0 {
         let factor = (1.0 + scroll * 0.0015).clamp(0.1, 10.0);
-        let cursor = response
-            .hover_pos()
-            .unwrap_or_else(|| rect.center());
+        let cursor = response.hover_pos().unwrap_or_else(|| rect.center());
         let before = cursor - rect.min - *pan;
         *zoom = (*zoom * factor).clamp(16.0, 8000.0);
         let after = before * factor;
@@ -2660,9 +2784,8 @@ fn uv_view_body(
         1.0,
         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
     );
-    let uv_min = (egui::vec2(rect.min.x, rect.min.y) - egui::vec2(rect.min.x, rect.min.y)
-        - *pan)
-        / *zoom;
+    let uv_min =
+        (egui::vec2(rect.min.x, rect.min.y) - egui::vec2(rect.min.x, rect.min.y) - *pan) / *zoom;
     let _ = uv_min;
     // Approximate visible UV range from rect.
     let uv_tl = (rect.min - rect.min - *pan) / *zoom;
@@ -2755,29 +2878,34 @@ fn uv_view_body(
     let primary_active = paintable
         && (response.dragged_by(egui::PointerButton::Primary)
             || response.clicked_by(egui::PointerButton::Primary));
+    let pressure_now = vp.refresh_input_pressure(ui.ctx(), primary_active);
     if primary_active {
         if let Some(pos) = response.interact_pointer_pos() {
             let atlas_uv_now = (pos - rect.min - *pan) / *zoom;
             // Step distance in UV: ~half the brush radius in UV units (so
             // stamps overlap by ~50%), floored to a small minimum.
-            let uv_radius = (vp.brush.radius / 400.0).max(1e-4);
+            let uv_radius = (vp.brush.effective_radius(pressure_now) / 400.0).max(1e-4);
             let step_uv = (uv_radius * 0.5).max(1e-3);
             const MAX_STEPS: u32 = 128;
 
-            let sequence: Vec<egui::Vec2> = match *last_paint_atlas_uv {
+            let sequence: Vec<(egui::Vec2, f32)> = match *last_paint_atlas_uv {
                 Some(prev) => {
                     let delta = atlas_uv_now - prev;
                     let dist = delta.length();
                     let steps = ((dist / step_uv).ceil() as u32).clamp(1, MAX_STEPS);
+                    let prev_pressure = last_paint_pressure.unwrap_or(pressure_now);
                     (1..=steps)
-                        .map(|i| prev + delta * (i as f32 / steps as f32))
+                        .map(|i| {
+                            let t = i as f32 / steps as f32;
+                            (prev + delta * t, lerp(prev_pressure, pressure_now, t))
+                        })
                         .collect()
                 }
-                None => vec![atlas_uv_now],
+                None => vec![(atlas_uv_now, pressure_now)],
             };
 
             if let Some(rs) = frame.wgpu_render_state() {
-                for uv in &sequence {
+                for (uv, pressure) in &sequence {
                     let tile_u = uv.x.floor() as i32;
                     let tile_v = uv.y.floor() as i32;
                     if tile_u < 0 || tile_v < 0 || tile_u >= 10 {
@@ -2788,17 +2916,19 @@ fn uv_view_body(
                         continue;
                     };
                     let local_uv = [uv.x.fract(), uv.y.fract()];
-                    vp.stamp_at_uv(&rs.device, &rs.queue, tile_idx, local_uv);
+                    vp.stamp_at_uv(&rs.device, &rs.queue, tile_idx, local_uv, *pressure);
                 }
                 ui.ctx().request_repaint();
             }
             *last_paint_atlas_uv = Some(atlas_uv_now);
+            *last_paint_pressure = Some(pressure_now);
         }
     } else {
         // Stroke ended — clear the anchor so the next stroke starts fresh
         // and doesn't interpolate a long line from wherever the previous
         // one ended.
         *last_paint_atlas_uv = None;
+        *last_paint_pressure = None;
     }
 
     // Brush cursor preview — an outline ring matching the stamped radius
@@ -2806,7 +2936,8 @@ fn uv_view_body(
     // panel and LMB isn't down on another widget.
     if response.hovered() {
         if let Some(hover) = response.hover_pos() {
-            let uv_radius = vp.brush.radius / 400.0;
+            let preview_pressure = if primary_active { pressure_now } else { 1.0 };
+            let uv_radius = vp.brush.effective_radius(preview_pressure) / 400.0;
             let screen_radius = uv_radius * *zoom;
             // Outer outline — dark, then bright, so it reads over both
             // light and dark atlas content.
@@ -2823,7 +2954,10 @@ fn uv_view_body(
             // Inner hardness ring — matches how the brush falls off in
             // the shader (radius * hardness stays at full opacity, beyond
             // that falls to zero).
-            let inner = screen_radius * vp.brush.hardness.clamp(0.0, 1.0);
+            let inner = screen_radius
+                * vp.brush
+                    .effective_hardness(preview_pressure)
+                    .clamp(0.0, 1.0);
             if inner > 1.5 {
                 painter.circle_stroke(
                     hover,
@@ -2841,7 +2975,10 @@ fn uv_view_body(
     painter.text(
         rect.left_bottom() + egui::vec2(6.0, -6.0),
         egui::Align2::LEFT_BOTTOM,
-        format!("UV atlas · {:.0} px/UV · RMB or MMB drag to pan · scroll to zoom", *zoom),
+        format!(
+            "UV atlas · {:.0} px/UV · RMB or MMB drag to pan · scroll to zoom",
+            *zoom
+        ),
         egui::FontId::monospace(11.0),
         egui::Color32::from_rgb(160, 170, 180),
     );
@@ -2964,11 +3101,7 @@ fn light_section(ui: &mut egui::Ui, vp: &mut Viewport) {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut light.enabled, "enabled");
-                    if ui
-                        .small_button("✕")
-                        .on_hover_text("Remove light")
-                        .clicked()
-                    {
+                    if ui.small_button("✕").on_hover_text("Remove light").clicked() {
                         remove_idx = Some(i);
                     }
                 });
@@ -3092,6 +3225,374 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
+fn is_usdz_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("usdz"))
+        .unwrap_or(false)
+}
+
+fn extracted_texture_lookup(
+    extracted: &[crate::usdz::ExtractedTexture],
+) -> std::collections::HashMap<String, PathBuf> {
+    let mut lookup = std::collections::HashMap::new();
+    for tex in extracted {
+        let normalized = crate::usdz::normalize_package_path(&tex.package_path);
+        lookup.insert(normalized.to_ascii_lowercase(), tex.path.clone());
+        if let Some(name) = Path::new(&normalized).file_name().and_then(|s| s.to_str()) {
+            lookup.insert(name.to_ascii_lowercase(), tex.path.clone());
+        }
+    }
+    lookup
+}
+
+fn package_inner_path(asset_ref: &str) -> Option<&str> {
+    let end = asset_ref.rfind(']')?;
+    let start = asset_ref[..end].rfind('[')?;
+    Some(&asset_ref[start + 1..end])
+}
+
+fn resolve_texture_reference(
+    stage_path: &Path,
+    texture_ref: &str,
+    extracted_lookup: &std::collections::HashMap<String, PathBuf>,
+) -> Option<PathBuf> {
+    let trimmed = texture_ref.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(inner) = package_inner_path(trimmed) {
+        let key = crate::usdz::normalize_package_path(inner).to_ascii_lowercase();
+        if let Some(path) = extracted_lookup.get(&key) {
+            return Some(path.clone());
+        }
+    }
+
+    let normalized = crate::usdz::normalize_package_path(trimmed);
+    if let Some(path) = extracted_lookup.get(&normalized.to_ascii_lowercase()) {
+        return Some(path.clone());
+    }
+    if let Some(name) = Path::new(&normalized).file_name().and_then(|s| s.to_str()) {
+        if let Some(path) = extracted_lookup.get(&name.to_ascii_lowercase()) {
+            return Some(path.clone());
+        }
+    }
+
+    let raw = PathBuf::from(trimmed);
+    if raw.is_absolute() && raw.exists() {
+        return Some(raw);
+    }
+    if let Some(parent) = stage_path.parent() {
+        let candidate = parent.join(trimmed);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn classify_texture_pin(path_or_ref: &str) -> Option<crate::material_graph::ShaderPin> {
+    let stem = Path::new(path_or_ref)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path_or_ref)
+        .to_ascii_lowercase();
+    let name = path_or_ref.to_ascii_lowercase();
+
+    if stem.contains("basecolor")
+        || stem.contains("base_color")
+        || stem.contains("albedo")
+        || stem.contains("diffuse")
+        || stem.ends_with("_base")
+    {
+        return Some(crate::material_graph::ShaderPin::DiffuseColor);
+    }
+    if stem.contains("normal") || stem.contains("_nrm") || stem.contains("-nrm") {
+        return Some(crate::material_graph::ShaderPin::Normal);
+    }
+    if stem.contains("emissive") || stem.contains("emission") || stem.contains("_emit") {
+        return Some(crate::material_graph::ShaderPin::EmissionColor);
+    }
+    if stem.contains("occlusion") || stem.contains("_occl") || stem.ends_with("_ao") {
+        return Some(crate::material_graph::ShaderPin::Occlusion);
+    }
+    if stem.contains("_rough")
+        || stem.ends_with("rough")
+        || stem.contains("roughness_rough")
+        || stem.contains("-rough")
+    {
+        return Some(crate::material_graph::ShaderPin::Roughness);
+    }
+    if stem.contains("_metal")
+        || stem.ends_with("metal")
+        || stem.contains("metallic")
+        || stem.contains("metalness")
+    {
+        return Some(crate::material_graph::ShaderPin::Metallic);
+    }
+    if name.contains("roughness") {
+        return Some(crate::material_graph::ShaderPin::Roughness);
+    }
+    if name.contains("metal") {
+        return Some(crate::material_graph::ShaderPin::Metallic);
+    }
+    None
+}
+
+fn material_slot_for_pin(pin: crate::material_graph::ShaderPin) -> Option<MaterialSlot> {
+    match pin {
+        crate::material_graph::ShaderPin::DiffuseColor => Some(MaterialSlot::BaseColor),
+        crate::material_graph::ShaderPin::Roughness => Some(MaterialSlot::Roughness),
+        crate::material_graph::ShaderPin::Metallic => Some(MaterialSlot::Metallic),
+        crate::material_graph::ShaderPin::Normal => Some(MaterialSlot::Normal),
+        _ => None,
+    }
+}
+
+fn texture_udim(path: &Path) -> Option<u32> {
+    let text = path.file_name()?.to_string_lossy();
+    let bytes = text.as_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
+    for i in 0..=bytes.len() - 4 {
+        let slice = &bytes[i..i + 4];
+        if slice.iter().all(u8::is_ascii_digit) {
+            let value = std::str::from_utf8(slice).ok()?.parse::<u32>().ok()?;
+            if (1001..=1999).contains(&value) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn collect_resolved_stage_textures(
+    stage_path: &Path,
+    materials: &[crate::usd::MeshMaterialInfo],
+    extracted: &[crate::usdz::ExtractedTexture],
+) -> Vec<ResolvedStageTexture> {
+    let lookup = extracted_texture_lookup(extracted);
+    let mut out = Vec::new();
+    for mat in materials {
+        for texture_ref in &mat.texture_paths {
+            let Some(pin) = classify_texture_pin(texture_ref) else {
+                continue;
+            };
+            let Some(path) = resolve_texture_reference(stage_path, texture_ref, &lookup) else {
+                continue;
+            };
+            out.push(ResolvedStageTexture {
+                udim: texture_udim(&path),
+                slot: material_slot_for_pin(pin),
+                path,
+            });
+        }
+    }
+
+    if out.is_empty() {
+        for texture in extracted {
+            let Some(pin) = classify_texture_pin(&texture.package_path) else {
+                continue;
+            };
+            out.push(ResolvedStageTexture {
+                udim: texture_udim(&texture.path),
+                slot: material_slot_for_pin(pin),
+                path: texture.path.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn stage_material_texture_groups(
+    stage_path: &Path,
+    materials: &[crate::usd::MeshMaterialInfo],
+    extracted: &[crate::usdz::ExtractedTexture],
+) -> std::collections::BTreeMap<DetectedMaterialTextures, Vec<String>> {
+    let lookup = extracted_texture_lookup(extracted);
+    let mut groups = std::collections::BTreeMap::new();
+    for mat in materials {
+        let mut detected = DetectedMaterialTextures::empty(
+            mat.uv_primvar_name
+                .clone()
+                .unwrap_or_else(|| "st".to_string()),
+        );
+        for texture_ref in &mat.texture_paths {
+            let Some(pin) = classify_texture_pin(texture_ref) else {
+                continue;
+            };
+            if let Some(path) = resolve_texture_reference(stage_path, texture_ref, &lookup) {
+                detected.set(pin, path);
+            }
+        }
+        if !detected.is_empty() {
+            groups
+                .entry(detected)
+                .or_insert_with(Vec::new)
+                .push(mat.prim_path.clone());
+        }
+    }
+    groups
+}
+
+fn usda_asset_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .replace('@', "%40")
+}
+
+fn write_texture_shader(
+    text: &mut String,
+    shader_name: &str,
+    path: &Path,
+    source_color_space: &str,
+    normal_map: bool,
+) {
+    use std::fmt::Write as _;
+    let asset = usda_asset_path(path);
+    let _ = writeln!(text, "\n    def Shader \"{shader_name}\"");
+    let _ = writeln!(text, "    {{");
+    let _ = writeln!(text, "        uniform token info:id = \"UsdUVTexture\"");
+    if normal_map {
+        let _ = writeln!(text, "        float4 inputs:bias = (-1, -1, -1, -1)");
+        let _ = writeln!(text, "        float4 inputs:scale = (2, 2, 2, 2)");
+    }
+    let _ = writeln!(text, "        asset inputs:file = @{asset}@");
+    let _ = writeln!(
+        text,
+        "        token inputs:sourceColorSpace = \"{source_color_space}\""
+    );
+    let _ = writeln!(
+        text,
+        "        float2 inputs:st.connect = </Material/stReader.outputs:result>"
+    );
+    let _ = writeln!(text, "        token inputs:wrapS = \"repeat\"");
+    let _ = writeln!(text, "        token inputs:wrapT = \"repeat\"");
+    let _ = writeln!(text, "        float outputs:r");
+    let _ = writeln!(text, "        float3 outputs:rgb");
+    let _ = writeln!(text, "    }}");
+}
+
+fn write_usd_preview_material(
+    path: &Path,
+    textures: &DetectedMaterialTextures,
+) -> anyhow::Result<()> {
+    use std::fmt::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+
+    let mut text = String::new();
+    let _ = writeln!(text, "#usda 1.0");
+    let _ = writeln!(text, "(");
+    let _ = writeln!(text, "    defaultPrim = \"Material\"");
+    let _ = writeln!(
+        text,
+        "    doc = \"Imported USDZ material network generated by forge-paint.\""
+    );
+    let _ = writeln!(text, ")");
+    let _ = writeln!(text);
+    let _ = writeln!(text, "def Material \"Material\"");
+    let _ = writeln!(text, "{{");
+    let _ = writeln!(
+        text,
+        "    token outputs:surface.connect = </Material/Surface.outputs:surface>"
+    );
+    let _ = writeln!(text);
+    let _ = writeln!(text, "    def Shader \"Surface\"");
+    let _ = writeln!(text, "    {{");
+    let _ = writeln!(
+        text,
+        "        uniform token info:id = \"UsdPreviewSurface\""
+    );
+    if textures.base_color.is_some() {
+        let _ = writeln!(
+            text,
+            "        color3f inputs:diffuseColor.connect = </Material/BaseColorTexture.outputs:rgb>"
+        );
+    } else {
+        let _ = writeln!(
+            text,
+            "        color3f inputs:diffuseColor = (0.8, 0.8, 0.8)"
+        );
+    }
+    if textures.metallic.is_some() {
+        let _ = writeln!(
+            text,
+            "        float inputs:metallic.connect = </Material/MetallicTexture.outputs:r>"
+        );
+    } else {
+        let _ = writeln!(text, "        float inputs:metallic = 0.0");
+    }
+    if textures.roughness.is_some() {
+        let _ = writeln!(
+            text,
+            "        float inputs:roughness.connect = </Material/RoughnessTexture.outputs:r>"
+        );
+    } else {
+        let _ = writeln!(text, "        float inputs:roughness = 0.5");
+    }
+    if textures.normal.is_some() {
+        let _ = writeln!(
+            text,
+            "        normal3f inputs:normal.connect = </Material/NormalTexture.outputs:rgb>"
+        );
+    }
+    if textures.emission.is_some() {
+        let _ = writeln!(
+            text,
+            "        color3f inputs:emissiveColor.connect = </Material/EmissionTexture.outputs:rgb>"
+        );
+    }
+    if textures.occlusion.is_some() {
+        let _ = writeln!(
+            text,
+            "        float inputs:occlusion.connect = </Material/OcclusionTexture.outputs:r>"
+        );
+    }
+    let _ = writeln!(text, "        token outputs:surface");
+    let _ = writeln!(text, "    }}");
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "    def Shader \"stReader\"");
+    let _ = writeln!(text, "    {{");
+    let _ = writeln!(
+        text,
+        "        uniform token info:id = \"UsdPrimvarReader_float2\""
+    );
+    let _ = writeln!(
+        text,
+        "        token inputs:varname = \"{}\"",
+        textures.uv_primvar
+    );
+    let _ = writeln!(text, "        float2 outputs:result");
+    let _ = writeln!(text, "    }}");
+
+    if let Some(path) = &textures.base_color {
+        write_texture_shader(&mut text, "BaseColorTexture", path, "sRGB", false);
+    }
+    if let Some(path) = &textures.metallic {
+        write_texture_shader(&mut text, "MetallicTexture", path, "raw", false);
+    }
+    if let Some(path) = &textures.roughness {
+        write_texture_shader(&mut text, "RoughnessTexture", path, "raw", false);
+    }
+    if let Some(path) = &textures.normal {
+        write_texture_shader(&mut text, "NormalTexture", path, "raw", true);
+    }
+    if let Some(path) = &textures.emission {
+        write_texture_shader(&mut text, "EmissionTexture", path, "sRGB", false);
+    }
+    if let Some(path) = &textures.occlusion {
+        write_texture_shader(&mut text, "OcclusionTexture", path, "raw", false);
+    }
+    let _ = writeln!(text, "}}");
+
+    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
+}
+
 impl App {
     fn export_textures_dialog(&mut self, frame: &eframe::Frame) {
         let Some(render_state) = frame.wgpu_render_state() else {
@@ -3146,156 +3647,419 @@ impl App {
         self.load_usd(frame, path);
     }
 
+    fn reset_stage_material_bindings(&mut self) {
+        self.material_bindings.clear();
+        self.active_binding_id = None;
+        self.material_graph = crate::material_graph::MaterialGraph::default();
+        self.last_pushed_bindings.clear();
+    }
+
+    fn restore_material_bindings_from_sidecar(
+        &mut self,
+        side: &crate::project::ProjectSidecar,
+        work_dir: &Path,
+    ) -> usize {
+        let to_restore: Vec<&crate::project::BoundMaterialBinding> =
+            if !side.bound_materials.is_empty() {
+                side.bound_materials.iter().collect()
+            } else if let Some(b) = side.bound_material.as_ref() {
+                vec![b]
+            } else {
+                Vec::new()
+            };
+        let mut restored = 0usize;
+        let generated_dir = work_dir.join("imported_materials");
+        for binding in to_restore {
+            let target =
+                std::fs::canonicalize(&binding.source).unwrap_or_else(|_| binding.source.clone());
+            let asset = self.browser.materials.iter().find(|m| {
+                std::fs::canonicalize(&m.source)
+                    .map(|p| p == target)
+                    .unwrap_or(false)
+                    || m.source == binding.source
+            });
+            match asset {
+                Some(mat) => {
+                    let new_id = self.next_binding_id;
+                    self.next_binding_id += 1;
+                    self.material_bindings.push(MaterialBindingInstance {
+                        id: new_id,
+                        source: mat.source.clone(),
+                        prim_path: mat.prim_path.clone(),
+                        kind: mat.kind,
+                        inputs: binding.inputs,
+                        target_prims: binding.target_prims.clone(),
+                        assigned: true,
+                    });
+                    self.material_graph.spawn_shader_node(new_id);
+                    self.active_binding_id = Some(new_id);
+                    restored += 1;
+                }
+                None if binding.source.exists() && !binding.source.starts_with(&generated_dir) => {
+                    let new_id = self.next_binding_id;
+                    self.next_binding_id += 1;
+                    self.material_bindings.push(MaterialBindingInstance {
+                        id: new_id,
+                        source: binding.source.clone(),
+                        prim_path: binding.prim_path.clone(),
+                        kind: crate::assets::MaterialKind::UsdPreviewSurface,
+                        inputs: binding.inputs,
+                        target_prims: binding.target_prims.clone(),
+                        assigned: true,
+                    });
+                    self.material_graph.spawn_shader_node(new_id);
+                    self.active_binding_id = Some(new_id);
+                    restored += 1;
+                }
+                None if binding.source.starts_with(&generated_dir) => {
+                    log::debug!(
+                        "sidecar generated material will be rebuilt from stage textures: {}",
+                        binding.source.display()
+                    );
+                }
+                None => {
+                    log::warn!(
+                        "sidecar bound material source not in library and missing on disk: {}",
+                        binding.source.display()
+                    );
+                }
+            }
+        }
+        if restored > 0 {
+            self.last_pushed_bindings.clear();
+        }
+        restored
+    }
+
+    fn import_resolved_stage_textures(
+        &mut self,
+        textures: &[ResolvedStageTexture],
+        render_state: &eframe::egui_wgpu::RenderState,
+    ) -> usize {
+        let mut imported = 0usize;
+        let mut renderer = render_state.renderer.write();
+        for texture in textures {
+            match self.browser.import_texture_once(
+                &texture.path,
+                &render_state.device,
+                &render_state.queue,
+                &mut renderer,
+            ) {
+                Ok(_) => imported += 1,
+                Err(e) => log::warn!("stage texture import {}: {e:#}", texture.path.display()),
+            }
+        }
+        imported
+    }
+
+    fn apply_resolved_stage_textures_to_active_layer(
+        &mut self,
+        textures: &[ResolvedStageTexture],
+        render_state: &eframe::egui_wgpu::RenderState,
+    ) -> usize {
+        let Some(vp) = &mut self.viewport else {
+            return 0;
+        };
+        let active_idx = vp.layer_stack.active;
+        let tile_count = vp.paint_target().tiles.len() as u32;
+        let res = vp.tile_resolution();
+        let mut applied = 0usize;
+        let mut seen = std::collections::HashSet::new();
+
+        for texture in textures {
+            let Some(slot) = texture.slot else {
+                continue;
+            };
+            let Some(asset_idx) = self.browser.texture_index_for_source(&texture.path) else {
+                continue;
+            };
+            let Some(asset) = self.browser.textures.get(asset_idx) else {
+                continue;
+            };
+
+            let layers: Vec<u32> = if let Some(udim) = texture.udim {
+                vp.paint_target()
+                    .layer_for_tile(udim)
+                    .map(|layer| vec![layer])
+                    .unwrap_or_default()
+            } else {
+                (0..tile_count).collect()
+            };
+            let layer = &vp.layer_stack.layers[active_idx];
+            for tile_layer in layers {
+                if !seen.insert((slot, tile_layer, texture.path.clone())) {
+                    continue;
+                }
+                let result = match slot {
+                    MaterialSlot::BaseColor => assets::apply_as_base_color_tile(
+                        &render_state.queue,
+                        asset,
+                        layer,
+                        tile_layer,
+                        res,
+                    ),
+                    MaterialSlot::Roughness => assets::apply_as_roughness_tile(
+                        &render_state.queue,
+                        asset,
+                        layer,
+                        tile_layer,
+                        res,
+                    ),
+                    MaterialSlot::Metallic => assets::apply_as_metallic_tile(
+                        &render_state.queue,
+                        asset,
+                        layer,
+                        tile_layer,
+                        res,
+                    ),
+                    MaterialSlot::Normal => assets::apply_as_normal_tile(
+                        &render_state.queue,
+                        asset,
+                        layer,
+                        tile_layer,
+                        res,
+                    ),
+                };
+                match result {
+                    Ok(()) => applied += 1,
+                    Err(e) => log::warn!(
+                        "stage texture apply {} to {:?}: {e:#}",
+                        texture.path.display(),
+                        slot
+                    ),
+                }
+            }
+        }
+
+        if applied > 0 {
+            vp.recomposite(&render_state.device, &render_state.queue);
+        }
+        applied
+    }
+
+    fn replicate_stage_materials_in_editor(
+        &mut self,
+        work_dir: &Path,
+        groups: std::collections::BTreeMap<DetectedMaterialTextures, Vec<String>>,
+    ) -> usize {
+        let material_dir = work_dir.join("imported_materials");
+        let mut created = 0usize;
+        for (textures, target_prims) in groups {
+            let source = material_dir.join(format!("stage_material_{created:02}.usda"));
+            if let Err(e) = write_usd_preview_material(&source, &textures) {
+                log::warn!("stage material replication failed: {e:#}");
+                continue;
+            }
+
+            let new_id = self.next_binding_id;
+            self.next_binding_id += 1;
+            self.material_bindings.push(MaterialBindingInstance {
+                id: new_id,
+                source,
+                prim_path: "/Material".to_string(),
+                kind: crate::assets::MaterialKind::UsdPreviewSurface,
+                inputs: crate::assets::MaterialInputs::default(),
+                target_prims,
+                assigned: true,
+            });
+            let shader_node = self.material_graph.spawn_shader_node(new_id);
+            for (idx, (path, pin)) in textures.texture_nodes().into_iter().enumerate() {
+                let texture_node = self.material_graph.spawn_texture_node_at(
+                    path,
+                    egui::pos2(40.0 + (created as f32 * 240.0), 330.0 + idx as f32 * 86.0),
+                );
+                self.material_graph
+                    .connect_texture_to_shader(texture_node, shader_node, pin);
+            }
+            self.active_binding_id = Some(new_id);
+            created += 1;
+        }
+        if created > 0 {
+            self.last_pushed_bindings.clear();
+        }
+        created
+    }
+
     fn load_usd(&mut self, frame: &eframe::Frame, path: PathBuf) {
         let Some(render_state) = frame.wgpu_render_state() else {
             self.status = "No GPU render state available.".to_string();
             return;
         };
-        let Some(vp) = &mut self.viewport else {
+        if self.viewport.is_none() {
             self.status = "Viewport not initialized yet.".to_string();
             return;
-        };
+        }
 
-        match crate::usd::load_stage_merged(&path) {
-            Ok(cpu) => {
+        match crate::usd::load_stage_merged_with_materials(&path) {
+            Ok(loaded_stage) => {
+                let crate::usd::LoadedStage {
+                    mesh: cpu,
+                    materials: stage_materials,
+                } = loaded_stage;
                 let tris = cpu.indices.len();
                 let verts = cpu.positions.len();
-                vp.set_mesh(&render_state.device, &render_state.queue, &cpu);
+                self.reset_stage_material_bindings();
+                if let Some(vp) = &mut self.viewport {
+                    vp.set_mesh(&render_state.device, &render_state.queue, &cpu);
+                }
 
                 let work_dir = crate::persist::default_work_dir(&path);
-                let loaded_n = crate::persist::load_sidecars(
-                    &render_state.queue,
-                    vp.active_layer(),
-                    vp.tiles(),
-                    vp.tile_resolution(),
-                    &work_dir,
-                );
-                if loaded_n > 0 {
-                    vp.recomposite(&render_state.device, &render_state.queue);
-                }
+                let extracted_textures = if is_usdz_path(&path) {
+                    let out_dir = work_dir.join("embedded_textures");
+                    match crate::usdz::extract_embedded_textures(&path, &out_dir) {
+                        Ok(textures) => {
+                            if !textures.is_empty() {
+                                log::info!(
+                                    "extracted {} embedded USDZ texture(s) to {}",
+                                    textures.len(),
+                                    out_dir.display()
+                                );
+                            }
+                            textures
+                        }
+                        Err(e) => {
+                            log::warn!("USDZ texture extraction failed: {e:#}");
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                let resolved_textures =
+                    collect_resolved_stage_textures(&path, &stage_materials, &extracted_textures);
+                let imported_texture_count =
+                    self.import_resolved_stage_textures(&resolved_textures, render_state);
+
+                let loaded_n = if let Some(vp) = &mut self.viewport {
+                    let loaded_n = crate::persist::load_sidecars(
+                        &render_state.queue,
+                        vp.active_layer(),
+                        vp.tiles(),
+                        vp.tile_resolution(),
+                        &work_dir,
+                    );
+                    if loaded_n > 0 {
+                        vp.recomposite(&render_state.device, &render_state.queue);
+                    }
+                    loaded_n
+                } else {
+                    0
+                };
 
                 // Project sidecar (JSON) — apply bake settings,
                 // material factors, smart-mask params. HP / cage are
                 // re-loaded from disk if their paths still exist.
+                let mut restored_binding_count = 0usize;
                 match crate::project::load_sidecar(&work_dir) {
                     Ok(Some(side)) => {
                         // Re-load HP / cage by replaying the same
                         // routine the panel buttons run, so the in-
                         // memory caches and labels stay coherent.
-                        if let Some(ref hp_path) = side.bake.high_poly_path {
-                            match crate::bake::integration::load_high_poly(hp_path) {
-                                Ok(m) => {
-                                    let stem = hp_path
-                                        .file_stem()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| "hp".into());
-                                    let tri = m.indices.len();
-                                    vp.bake_high_poly = Some(m);
-                                    vp.bake_high_poly_label = Some(format!("{stem} · {tri} tris"));
-                                    vp.bake_high_poly_path = Some(hp_path.clone());
-                                }
-                                Err(e) => {
-                                    log::warn!("sidecar HP load failed: {e}");
-                                }
-                            }
-                        }
-                        if let Some(ref cage_path) = side.bake.cage_path {
-                            match crate::bake::integration::load_cage(cage_path) {
-                                Ok(m) => {
-                                    let stem = cage_path
-                                        .file_stem()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| "cage".into());
-                                    let lp_vert_count = vp.cpu_mesh().positions.len();
-                                    if m.positions.len() == lp_vert_count {
-                                        vp.bake_cage = Some(m);
-                                        vp.bake_cage_label =
-                                            Some(format!("{stem} · {lp_vert_count} verts"));
-                                        vp.bake_cage_path = Some(cage_path.clone());
-                                    } else {
-                                        log::warn!(
-                                            "sidecar cage vertex mismatch: cage={} vs low-poly={}",
-                                            m.positions.len(),
-                                            lp_vert_count
-                                        );
+                        if let Some(vp) = &mut self.viewport {
+                            if let Some(ref hp_path) = side.bake.high_poly_path {
+                                match crate::bake::integration::load_high_poly(hp_path) {
+                                    Ok(m) => {
+                                        let stem = hp_path
+                                            .file_stem()
+                                            .map(|s| s.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| "hp".into());
+                                        let tri = m.indices.len();
+                                        vp.bake_high_poly = Some(m);
+                                        vp.bake_high_poly_label =
+                                            Some(format!("{stem} · {tri} tris"));
+                                        vp.bake_high_poly_path = Some(hp_path.clone());
+                                    }
+                                    Err(e) => {
+                                        log::warn!("sidecar HP load failed: {e}");
                                     }
                                 }
-                                Err(e) => log::warn!("sidecar cage load failed: {e}"),
                             }
-                        }
-                        vp.apply_sidecar(&render_state.device, &render_state.queue, &side);
-
-                        // Restore the library-material binding.
-                        // Match by absolute source path against the
-                        // freshly-scanned library. The per-frame
-                        // draw_hydra_central call will push the
-                        // reference + replay overrides on the next
-                        // tick once the hydra view is active.
-                        // Restore concurrent material bindings. Prefer
-                        // the new `bound_materials` Vec; fall back to
-                        // the legacy single `bound_material` so v1
-                        // sidecars keep working after the C2b migration.
-                        let to_restore: Vec<&crate::project::BoundMaterialBinding> =
-                            if !side.bound_materials.is_empty() {
-                                side.bound_materials.iter().collect()
-                            } else if let Some(b) = side.bound_material.as_ref() {
-                                vec![b]
-                            } else {
-                                Vec::new()
-                            };
-                        for binding in to_restore {
-                            let target = std::fs::canonicalize(&binding.source)
-                                .unwrap_or_else(|_| binding.source.clone());
-                            let asset = self.browser.materials.iter().find(|m| {
-                                std::fs::canonicalize(&m.source)
-                                    .map(|p| p == target)
-                                    .unwrap_or(false)
-                                    || m.source == binding.source
-                            });
-                            match asset {
-                                Some(mat) => {
-                                    let new_id = self.next_binding_id;
-                                    self.next_binding_id += 1;
-                                    self.material_bindings.push(MaterialBindingInstance {
-                                        id: new_id,
-                                        source: mat.source.clone(),
-                                        prim_path: mat.prim_path.clone(),
-                                        kind: mat.kind,
-                                        inputs: binding.inputs,
-                                        target_prims: binding.target_prims.clone(),
-                                        // Sidecar entries were assigned at save
-                                        // time — restore them as such so the
-                                        // user doesn't have to re-assign.
-                                        assigned: true,
-                                    });
-                                    self.material_graph
-                                        .spawn_shader_node(new_id);
-                                    self.active_binding_id = Some(new_id);
+                            if let Some(ref cage_path) = side.bake.cage_path {
+                                match crate::bake::integration::load_cage(cage_path) {
+                                    Ok(m) => {
+                                        let stem = cage_path
+                                            .file_stem()
+                                            .map(|s| s.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| "cage".into());
+                                        let lp_vert_count = vp.cpu_mesh().positions.len();
+                                        if m.positions.len() == lp_vert_count {
+                                            vp.bake_cage = Some(m);
+                                            vp.bake_cage_label =
+                                                Some(format!("{stem} · {lp_vert_count} verts"));
+                                            vp.bake_cage_path = Some(cage_path.clone());
+                                        } else {
+                                            log::warn!(
+                                                "sidecar cage vertex mismatch: cage={} vs low-poly={}",
+                                                m.positions.len(),
+                                                lp_vert_count
+                                            );
+                                        }
+                                    }
+                                    Err(e) => log::warn!("sidecar cage load failed: {e}"),
                                 }
-                                None => log::warn!(
-                                    "sidecar bound material source not in library: {}",
-                                    binding.source.display()
-                                ),
                             }
+                            vp.apply_sidecar(&render_state.device, &render_state.queue, &side);
                         }
-                        // Force a Hydra push next frame.
-                        self.last_pushed_bindings.clear();
+                        restored_binding_count =
+                            self.restore_material_bindings_from_sidecar(&side, &work_dir);
                     }
                     Ok(None) => {}
                     Err(e) => log::warn!("project sidecar parse failed: {e:#}"),
                 }
 
+                let applied_texture_count = if loaded_n == 0 {
+                    self.apply_resolved_stage_textures_to_active_layer(
+                        &resolved_textures,
+                        render_state,
+                    )
+                } else {
+                    0
+                };
+
+                let replicated_material_count = if restored_binding_count == 0 {
+                    let groups =
+                        stage_material_texture_groups(&path, &stage_materials, &extracted_textures);
+                    self.replicate_stage_materials_in_editor(&work_dir, groups)
+                } else {
+                    0
+                };
+
                 self.current_usd_path = Some(path.clone());
                 self.stage_browser.ensure_loaded(&path);
-                let sidecar_msg = if loaded_n > 0 {
-                    format!(" — loaded {loaded_n} sidecar(s) from {}", work_dir.display())
-                } else {
+                let mut extras = Vec::new();
+                if loaded_n > 0 {
+                    extras.push(format!("loaded {loaded_n} sidecar(s)"));
+                }
+                if !extracted_textures.is_empty() {
+                    extras.push(format!(
+                        "extracted {} embedded texture(s)",
+                        extracted_textures.len()
+                    ));
+                }
+                if imported_texture_count > 0 {
+                    extras.push(format!("imported {imported_texture_count} texture(s)"));
+                }
+                if applied_texture_count > 0 {
+                    extras.push(format!("seeded {applied_texture_count} paint tile(s)"));
+                }
+                if replicated_material_count > 0 {
+                    extras.push(format!(
+                        "replicated {replicated_material_count} material(s)"
+                    ));
+                }
+                let extra_msg = if extras.is_empty() {
                     String::new()
+                } else {
+                    format!(" — {}", extras.join(", "))
                 };
+                let tile_count = self
+                    .viewport
+                    .as_ref()
+                    .map(|vp| vp.tiles().len())
+                    .unwrap_or(0);
                 self.status = format!(
-                    "Loaded {} — {verts} verts, {tris} tris, {} UDIM tiles{sidecar_msg}",
+                    "Loaded {} — {verts} verts, {tris} tris, {tile_count} UDIM tiles{extra_msg}",
                     path.display(),
-                    vp.tiles().len()
                 );
                 log::info!("{}", self.status);
             }
@@ -3424,11 +4188,8 @@ impl App {
 
         // Background fill so the not-yet-rendered area reads as part
         // of the panel rather than the dark canvas behind everything.
-        ui.painter().rect_filled(
-            rect,
-            0.0,
-            egui::Color32::from_rgb(5, 5, 6),
-        );
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_rgb(5, 5, 6));
 
         // Camera nav — same plumbing as the wgpu side, same scroll
         // wheel for zoom. Updates `vp.camera`, which is what we
@@ -3524,14 +4285,16 @@ impl App {
             vp.camera.z_near,
             vp.camera.z_far,
         );
-        let env = vp.env.source_path.as_ref().map(|p| {
-            crate::hydra_view::DomeEnv {
+        let env = vp
+            .env
+            .source_path
+            .as_ref()
+            .map(|p| crate::hydra_view::DomeEnv {
                 path: p.clone(),
                 intensity: vp.env_intensity,
                 exposure_stops: vp.exposure_stops,
                 rotation_y_radians: vp.env_rotation_y,
-            }
-        });
+            });
 
         // Adopt the user's delegate pick, if any.
         let current_delegate = hydra.current_delegate();
@@ -3562,8 +4325,7 @@ impl App {
         // per change (apply_material_binding for new/scope-changed,
         // set_binding_input_* for slider edits, remove_material_
         // binding for vanished ids).
-        let mut current_ids: std::collections::HashSet<u64> =
-            std::collections::HashSet::new();
+        let mut current_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for b in material_bindings {
             // Skip shader nodes the user has staged but not yet
             // assigned — those exist in the graph only and shouldn't
@@ -3575,18 +4337,17 @@ impl App {
             let new_snap = MaterialBindingSnapshot::of(b);
             let prev = last_pushed_bindings.get(&b.id).cloned();
             let scope_or_source_changed = match prev.as_ref() {
-                Some(p) => p.source != new_snap.source
-                    || p.prim_path != new_snap.prim_path
-                    || p.target_prims != new_snap.target_prims,
+                Some(p) => {
+                    p.source != new_snap.source
+                        || p.prim_path != new_snap.prim_path
+                        || p.target_prims != new_snap.target_prims
+                }
                 None => true,
             };
             if scope_or_source_changed {
-                if let Err(e) = hydra.apply_material_binding(
-                    b.id,
-                    &b.source,
-                    &b.prim_path,
-                    &b.target_prims,
-                ) {
+                if let Err(e) =
+                    hydra.apply_material_binding(b.id, &b.source, &b.prim_path, &b.target_prims)
+                {
                     log::warn!("Hydra: apply_material_binding failed: {e:#}");
                 }
             }
@@ -3665,30 +4426,21 @@ impl App {
                 log::info!("Hydra paint mode-entry sync: {status}");
                 *hydra_paint_sync_status = Some(status);
             } else {
-                log::info!(
-                    "Hydra: skipping paint mode-entry sync — library material bound",
-                );
+                log::info!("Hydra: skipping paint mode-entry sync — library material bound",);
             }
         }
 
         match hydra.render(&view_row, &proj_row) {
             Ok(pixels) => {
-                let img = egui::ColorImage::from_rgba_unmultiplied(
-                    [w as usize, h as usize],
-                    &pixels,
-                );
-                let handle = ui.ctx().load_texture(
-                    "hydra_frame",
-                    img,
-                    egui::TextureOptions::default(),
-                );
+                let img =
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+                let handle =
+                    ui.ctx()
+                        .load_texture("hydra_frame", img, egui::TextureOptions::default());
                 ui.painter().image(
                     handle.id(),
                     rect,
-                    egui::Rect::from_min_max(
-                        egui::pos2(0.0, 0.0),
-                        egui::pos2(1.0, 1.0),
-                    ),
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
                 *hydra_egui_tex = Some(handle);
@@ -3703,7 +4455,6 @@ impl App {
                 );
             }
         }
-
 
         // Renderer / delegate picker now lives in a single overlay
         // drawn by `App::draw_renderer_picker` (after this function
@@ -3746,7 +4497,11 @@ impl App {
             log::info!("Hydra paint sync: {status}");
             *hydra_paint_sync_status = Some(status);
         }
-        let (sync_fill_alpha, sync_stroke_w) = if sync_resp.hovered() { (240u8, 2.0) } else { (220u8, 1.5) };
+        let (sync_fill_alpha, sync_stroke_w) = if sync_resp.hovered() {
+            (240u8, 2.0)
+        } else {
+            (220u8, 1.5)
+        };
         ui.painter().rect_filled(
             sync_btn_rect,
             6.0,
@@ -3999,11 +4754,7 @@ impl App {
         egui::ComboBox::from_id_salt("renderer_picker")
             .selected_text(format!("▶ {current_label}"))
             .show_ui(&mut combo_ui, |ui| {
-                ui.selectable_value(
-                    &mut chosen_id,
-                    WGPU_ID.to_string(),
-                    "wgpu painter",
-                );
+                ui.selectable_value(&mut chosen_id, WGPU_ID.to_string(), "wgpu painter");
                 for id in &delegates {
                     ui.selectable_value(
                         &mut chosen_id,
@@ -4027,8 +4778,8 @@ impl App {
         // top of the canvas, just below the combo's y. Reads as a
         // nudge ("Storm is preview, paint in wgpu") rather than an
         // error.
-        let storm_active = *renderer_mode == RendererMode::Hydra
-            && chosen_id == "HdStormRendererPlugin";
+        let storm_active =
+            *renderer_mode == RendererMode::Hydra && chosen_id == "HdStormRendererPlugin";
         if storm_active {
             let banner_size = egui::vec2(260.0, 22.0);
             let banner_rect = egui::Rect::from_center_size(
@@ -4079,7 +4830,11 @@ impl App {
         if resp.clicked() {
             *request_swap = true;
         }
-        let (fill_alpha, stroke_w) = if resp.hovered() { (240u8, 2.0) } else { (220u8, 1.5) };
+        let (fill_alpha, stroke_w) = if resp.hovered() {
+            (240u8, 2.0)
+        } else {
+            (220u8, 1.5)
+        };
         ui.painter().rect_filled(
             badge_rect,
             6.0,
@@ -4102,7 +4857,6 @@ impl App {
             resp.on_hover_text("Click to switch back to wgpu painter");
         }
     }
-
 
     fn do_undo(&mut self, frame: &eframe::Frame) {
         let Some(render_state) = frame.wgpu_render_state() else {
@@ -4174,8 +4928,7 @@ impl App {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
             };
-            let mut paths: Vec<std::path::PathBuf> =
-                entries.flatten().map(|e| e.path()).collect();
+            let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
             paths.sort();
             for path in paths {
                 let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
@@ -4186,7 +4939,10 @@ impl App {
                     continue;
                 }
                 let mut renderer = rs.renderer.write();
-                match self.browser.import_texture(&path, &rs.device, &rs.queue, &mut renderer) {
+                match self
+                    .browser
+                    .import_texture(&path, &rs.device, &rs.queue, &mut renderer)
+                {
                     Ok(()) => count += 1,
                     Err(e) => log::warn!("bundled asset {}: {e:#}", path.display()),
                 }
@@ -4202,8 +4958,7 @@ impl App {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
             };
-            let mut paths: Vec<std::path::PathBuf> =
-                entries.flatten().map(|e| e.path()).collect();
+            let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
             paths.sort();
             for path in paths {
                 let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
@@ -4226,8 +4981,8 @@ impl App {
 
         // Materials library — scan once at startup. Same exe-relative
         // fallback as the HDRI discovery.
-        let materials_root = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let materials_root =
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         self.browser.materials = crate::assets::discover_materials(&materials_root);
         if !self.browser.materials.is_empty() {
             log::info!(
@@ -4270,9 +5025,11 @@ impl App {
                     if ui.button("Clear stencil").clicked() {
                         want_clear_stencil = true;
                     }
-                    ui.label(egui::RichText::new(format!("Stencil: {}", name)).strong().color(
-                        egui::Color32::from_rgb(255, 220, 100),
-                    ));
+                    ui.label(
+                        egui::RichText::new(format!("Stencil: {}", name))
+                            .strong()
+                            .color(egui::Color32::from_rgb(255, 220, 100)),
+                    );
                 }
             });
         });
@@ -4326,8 +5083,7 @@ impl App {
                             // at import time.
                             let glyph =
                                 egui::RichText::new(egui_phosphor::regular::CUBE).size(48.0);
-                            let btn = egui::Button::new(glyph)
-                                .min_size(egui::vec2(80.0, 80.0));
+                            let btn = egui::Button::new(glyph).min_size(egui::vec2(80.0, 80.0));
                             if ui
                                 .add(btn)
                                 .on_hover_text(format!(
@@ -4340,9 +5096,9 @@ impl App {
                                 load_requested = Some(mesh.path.clone());
                             }
                             ui.label(
-                                egui::RichText::new(&mesh.name).small().color(
-                                    ui.style().visuals.weak_text_color(),
-                                ),
+                                egui::RichText::new(&mesh.name)
+                                    .small()
+                                    .color(ui.style().visuals.weak_text_color()),
                             );
                         });
                     }
@@ -4411,8 +5167,8 @@ impl App {
                             continue;
                         }
                         ui.vertical(|ui| {
-                            let (rect, resp) =
-                                ui.allocate_exact_size(egui::vec2(84.0, 84.0), egui::Sense::click());
+                            let (rect, resp) = ui
+                                .allocate_exact_size(egui::vec2(84.0, 84.0), egui::Sense::click());
                             let visuals = ui.style().interact(&resp);
                             ui.painter().rect(
                                 rect,
@@ -4449,10 +5205,8 @@ impl App {
                             // Name under the chip, slightly larger,
                             // truncated to keep the card narrow.
                             ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&mat.name).size(11.0),
-                                )
-                                .truncate(),
+                                egui::Label::new(egui::RichText::new(&mat.name).size(11.0))
+                                    .truncate(),
                             );
                         });
                     }
@@ -4494,12 +5248,9 @@ impl App {
                 ui.horizontal(|ui| {
                     for (i, asset) in self.browser.textures.iter().enumerate() {
                         ui.vertical(|ui| {
-                            let img = egui::Image::new((
-                                asset.thumb_id,
-                                egui::vec2(80.0, 80.0),
-                            ))
-                            .fit_to_exact_size(egui::vec2(80.0, 80.0))
-                            .sense(egui::Sense::click());
+                            let img = egui::Image::new((asset.thumb_id, egui::vec2(80.0, 80.0)))
+                                .fit_to_exact_size(egui::vec2(80.0, 80.0))
+                                .sense(egui::Sense::click());
                             let response = ui.add(img);
                             response.context_menu(|ui| {
                                 if ui.button("Project with stencil").clicked() {
@@ -4521,9 +5272,9 @@ impl App {
                                 }
                             });
                             ui.label(
-                                egui::RichText::new(&asset.name).small().color(
-                                    ui.style().visuals.weak_text_color(),
-                                ),
+                                egui::RichText::new(&asset.name)
+                                    .small()
+                                    .color(ui.style().visuals.weak_text_color()),
                             );
                         });
                     }
@@ -4565,12 +5316,7 @@ impl App {
         }
     }
 
-    fn apply_asset_action(
-        &mut self,
-        idx: usize,
-        action: AssetAction,
-        frame: &eframe::Frame,
-    ) {
+    fn apply_asset_action(&mut self, idx: usize, action: AssetAction, frame: &eframe::Frame) {
         let Some(vp) = &mut self.viewport else {
             return;
         };
@@ -4616,8 +5362,7 @@ impl App {
             AssetAction::ApplyMask => {
                 let active = vp.layer_stack.active;
                 if vp.layer_stack.layers[active].mask.is_none() {
-                    vp.layer_stack
-                        .add_mask_to(active, &rs.device, &rs.queue);
+                    vp.layer_stack.add_mask_to(active, &rs.device, &rs.queue);
                 }
                 let tile_count = vp.paint_target().tiles.len() as u32;
                 let res = vp.tile_resolution();
@@ -4732,10 +5477,7 @@ impl App {
             vp.active_stencil = Some(idx);
             vp.stencil_transform = crate::viewport::StencilTransform::default();
         }
-        self.status = format!(
-            "Stencil: '{}' · M/R/T + LMB to move/rotate/scale",
-            name
-        );
+        self.status = format!("Stencil: '{}' · M/R/T + LMB to move/rotate/scale", name);
     }
 
     fn open_stencil_dialog(&mut self, frame: &eframe::Frame) {
@@ -4765,12 +5507,9 @@ impl App {
             }
         }
         let mut renderer = rs.renderer.write();
-        let result = self.browser.import_texture(
-            &path,
-            &rs.device,
-            &rs.queue,
-            &mut renderer,
-        );
+        let result = self
+            .browser
+            .import_texture(&path, &rs.device, &rs.queue, &mut renderer);
         drop(renderer);
         match result {
             Ok(()) => {

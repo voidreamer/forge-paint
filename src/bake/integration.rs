@@ -458,9 +458,7 @@ pub fn bake_map(
     for (layer, &tile_id) in tiles.iter().enumerate() {
         let Some((tile_mesh, tile_cage)) = extract_tile_mesh("forge", cpu_mesh, cage, tile_id)
         else {
-            log::info!(
-                "bake: tile {tile_id} (layer {layer}) has no triangles, skipping"
-            );
+            log::info!("bake: tile {tile_id} (layer {layer}) has no triangles, skipping");
             continue;
         };
         let cage_slice = tile_cage.as_ref().map(std::slice::from_ref);

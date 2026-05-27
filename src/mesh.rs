@@ -17,10 +17,26 @@ impl Vertex {
         array_stride: std::mem::size_of::<Self>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &[
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0,  shader_location: 0 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 24, shader_location: 2 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 40, shader_location: 3 },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 12,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 24,
+                shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: 40,
+                shader_location: 3,
+            },
         ],
     };
 }
@@ -143,11 +159,7 @@ impl GpuMesh {
     /// all the Mesh leaves it contains, matching Solaris/Houdini
     /// outliner behaviour). No-op if the mesh has no `prim_ranges`
     /// populated (i.e. came from a non-merging load path).
-    pub fn set_selection(
-        &self,
-        queue: &wgpu::Queue,
-        selected: &std::collections::HashSet<String>,
-    ) {
+    pub fn set_selection(&self, queue: &wgpu::Queue, selected: &std::collections::HashSet<String>) {
         if self.prim_ranges.is_empty() {
             return;
         }
@@ -199,8 +211,7 @@ fn is_selected_or_descendant(
         if sel == "/" {
             return true;
         }
-        prim_path.starts_with(sel.as_str())
-            && prim_path.as_bytes().get(sel.len()) == Some(&b'/')
+        prim_path.starts_with(sel.as_str()) && prim_path.as_bytes().get(sel.len()) == Some(&b'/')
     })
 }
 
@@ -268,8 +279,7 @@ fn subdivide_once(mesh: &CpuMesh) -> CpuMesh {
         let base = out.positions.len() as u32;
         out.positions
             .extend_from_slice(&[p0, p1, p2, p01, p12, p20]);
-        out.normals
-            .extend_from_slice(&[n0, n1, n2, n01, n12, n20]);
+        out.normals.extend_from_slice(&[n0, n1, n2, n01, n12, n20]);
         out.uvs.extend_from_slice(&[u0, u1, u2, u01, u12, u20]);
         // 4 new triangles per original (corners use original verts, the
         // central triangle uses the three new midpoints).
@@ -300,12 +310,60 @@ impl Vec3NormalizeOr for Vec3 {
 pub fn cube() -> CpuMesh {
     // (four corners CCW when viewed from outside, face normal)
     let faces: [([Vec3; 4], Vec3); 6] = [
-        ([Vec3::new( 0.5,-0.5,-0.5), Vec3::new( 0.5,-0.5, 0.5), Vec3::new( 0.5, 0.5, 0.5), Vec3::new( 0.5, 0.5,-0.5)], Vec3::X),
-        ([Vec3::new(-0.5,-0.5, 0.5), Vec3::new(-0.5,-0.5,-0.5), Vec3::new(-0.5, 0.5,-0.5), Vec3::new(-0.5, 0.5, 0.5)], Vec3::NEG_X),
-        ([Vec3::new(-0.5, 0.5,-0.5), Vec3::new( 0.5, 0.5,-0.5), Vec3::new( 0.5, 0.5, 0.5), Vec3::new(-0.5, 0.5, 0.5)], Vec3::Y),
-        ([Vec3::new(-0.5,-0.5, 0.5), Vec3::new( 0.5,-0.5, 0.5), Vec3::new( 0.5,-0.5,-0.5), Vec3::new(-0.5,-0.5,-0.5)], Vec3::NEG_Y),
-        ([Vec3::new(-0.5,-0.5, 0.5), Vec3::new(-0.5, 0.5, 0.5), Vec3::new( 0.5, 0.5, 0.5), Vec3::new( 0.5,-0.5, 0.5)], Vec3::Z),
-        ([Vec3::new( 0.5,-0.5,-0.5), Vec3::new( 0.5, 0.5,-0.5), Vec3::new(-0.5, 0.5,-0.5), Vec3::new(-0.5,-0.5,-0.5)], Vec3::NEG_Z),
+        (
+            [
+                Vec3::new(0.5, -0.5, -0.5),
+                Vec3::new(0.5, -0.5, 0.5),
+                Vec3::new(0.5, 0.5, 0.5),
+                Vec3::new(0.5, 0.5, -0.5),
+            ],
+            Vec3::X,
+        ),
+        (
+            [
+                Vec3::new(-0.5, -0.5, 0.5),
+                Vec3::new(-0.5, -0.5, -0.5),
+                Vec3::new(-0.5, 0.5, -0.5),
+                Vec3::new(-0.5, 0.5, 0.5),
+            ],
+            Vec3::NEG_X,
+        ),
+        (
+            [
+                Vec3::new(-0.5, 0.5, -0.5),
+                Vec3::new(0.5, 0.5, -0.5),
+                Vec3::new(0.5, 0.5, 0.5),
+                Vec3::new(-0.5, 0.5, 0.5),
+            ],
+            Vec3::Y,
+        ),
+        (
+            [
+                Vec3::new(-0.5, -0.5, 0.5),
+                Vec3::new(0.5, -0.5, 0.5),
+                Vec3::new(0.5, -0.5, -0.5),
+                Vec3::new(-0.5, -0.5, -0.5),
+            ],
+            Vec3::NEG_Y,
+        ),
+        (
+            [
+                Vec3::new(-0.5, -0.5, 0.5),
+                Vec3::new(-0.5, 0.5, 0.5),
+                Vec3::new(0.5, 0.5, 0.5),
+                Vec3::new(0.5, -0.5, 0.5),
+            ],
+            Vec3::Z,
+        ),
+        (
+            [
+                Vec3::new(0.5, -0.5, -0.5),
+                Vec3::new(0.5, 0.5, -0.5),
+                Vec3::new(-0.5, 0.5, -0.5),
+                Vec3::new(-0.5, -0.5, -0.5),
+            ],
+            Vec3::NEG_Z,
+        ),
     ];
 
     let uv_corners = [

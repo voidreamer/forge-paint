@@ -129,8 +129,7 @@ impl Environment {
         prefilter_baker: &PrefilterBaker,
         path: &Path,
     ) -> Result<Self> {
-        let img = image::open(path)
-            .with_context(|| format!("open HDRI {}", path.display()))?;
+        let img = image::open(path).with_context(|| format!("open HDRI {}", path.display()))?;
         // `image::open` on a .hdr returns an Rgb32F image via the HdrDecoder path.
         let rgb32 = img.to_rgb32f();
         let (w, h) = (rgb32.width(), rgb32.height());
@@ -287,7 +286,7 @@ impl Environment {
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("env.sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,    // longitude wraps
+            address_mode_u: wgpu::AddressMode::Repeat, // longitude wraps
             address_mode_v: wgpu::AddressMode::ClampToEdge, // latitude clamps
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,

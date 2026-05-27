@@ -174,8 +174,7 @@ impl ProjectionBrushPipeline {
         let pipeline = make_pipe(wgpu::TextureFormat::Rgba8UnormSrgb, "projection.pipe");
         let displacement_pipeline =
             make_pipe(wgpu::TextureFormat::Rg16Float, "projection.pipe.disp");
-        let single_channel_pipeline =
-            make_pipe(wgpu::TextureFormat::R8Unorm, "projection.pipe.r8");
+        let single_channel_pipeline = make_pipe(wgpu::TextureFormat::R8Unorm, "projection.pipe.r8");
 
         Self {
             pipeline,

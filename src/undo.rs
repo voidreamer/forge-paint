@@ -154,7 +154,11 @@ impl UndoStack {
     }
 }
 
-fn source_texture(stack: &LayerStack, layer_index: usize, kind: SnapshotKind) -> Option<&wgpu::Texture> {
+fn source_texture(
+    stack: &LayerStack,
+    layer_index: usize,
+    kind: SnapshotKind,
+) -> Option<&wgpu::Texture> {
     let layer = stack.layers.get(layer_index)?;
     match kind {
         SnapshotKind::BaseColor => Some(&layer.base_color),

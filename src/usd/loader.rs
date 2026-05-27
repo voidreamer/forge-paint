@@ -13,7 +13,22 @@ use crate::mesh::CpuMesh;
 #[derive(Debug, Clone)]
 pub struct LoadedMesh {
     pub path: String,
+    pub texture_paths: Vec<String>,
+    pub uv_primvar_name: Option<String>,
     pub mesh: CpuMesh,
+}
+
+#[derive(Debug, Clone)]
+pub struct MeshMaterialInfo {
+    pub prim_path: String,
+    pub texture_paths: Vec<String>,
+    pub uv_primvar_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedStage {
+    pub mesh: CpuMesh,
+    pub materials: Vec<MeshMaterialInfo>,
 }
 
 /// Load a USD stage by path or `forge://` URI. Returns one `LoadedMesh`
@@ -60,10 +75,13 @@ pub fn load_stage(path: &Path) -> Result<Vec<LoadedMesh>> {
 
     let mut loaded = Vec::with_capacity(pxr_meshes.len());
     for m in pxr_meshes {
+        let texture_paths = m.bound_texture_paths();
         let intermediate = build_intermediate(&m)?;
         let mesh = triangulate(&intermediate)?;
         loaded.push(LoadedMesh {
             path: intermediate.path,
+            texture_paths,
+            uv_primvar_name: intermediate.uv_primvar_name,
             mesh,
         });
     }
@@ -108,6 +126,8 @@ pub fn load_stage_merged(path: &Path) -> Result<CpuMesh> {
     let mut iter = loaded.into_iter();
     let LoadedMesh {
         path: first_path,
+        texture_paths: _,
+        uv_primvar_name: _,
         mesh: first,
     } = iter.next().unwrap();
     let mut out = first;
@@ -121,7 +141,13 @@ pub fn load_stage_merged(path: &Path) -> Result<CpuMesh> {
         return Ok(out);
     }
 
-    for LoadedMesh { path: ppath, mesh } in iter {
+    for LoadedMesh {
+        path: ppath,
+        texture_paths: _,
+        uv_primvar_name: _,
+        mesh,
+    } in iter
+    {
         let offset = out.positions.len() as u32;
         let added = mesh.positions.len() as u32;
         out.positions.extend(mesh.positions);
@@ -139,6 +165,66 @@ pub fn load_stage_merged(path: &Path) -> Result<CpuMesh> {
     }
     log::info!("merged {count} mesh prims into a single CpuMesh");
     Ok(out)
+}
+
+/// Load and merge a stage while preserving the bound texture references
+/// discovered on each mesh prim. The merged CpuMesh remains the WGPU paint
+/// surface; `materials` lets the app reconstruct assigned material graph nodes
+/// and resolve embedded USDZ texture assets.
+pub fn load_stage_merged_with_materials(path: &Path) -> Result<LoadedStage> {
+    let loaded = load_stage(path)?;
+    let materials = loaded
+        .iter()
+        .filter(|m| !m.texture_paths.is_empty())
+        .map(|m| MeshMaterialInfo {
+            prim_path: m.path.clone(),
+            texture_paths: m.texture_paths.clone(),
+            uv_primvar_name: m.uv_primvar_name.clone(),
+        })
+        .collect();
+    let count = loaded.len();
+    let mut iter = loaded.into_iter();
+    let LoadedMesh {
+        path: first_path,
+        texture_paths: _,
+        uv_primvar_name: _,
+        mesh: first,
+    } = iter.next().unwrap();
+    let mut out = first;
+    let first_count = out.positions.len() as u32;
+    out.prim_ranges.push(crate::mesh::PrimRange {
+        prim_path: first_path,
+        vert_start: 0,
+        vert_count: first_count,
+    });
+
+    for LoadedMesh {
+        path: ppath,
+        texture_paths: _,
+        uv_primvar_name: _,
+        mesh,
+    } in iter
+    {
+        let offset = out.positions.len() as u32;
+        let added = mesh.positions.len() as u32;
+        out.positions.extend(mesh.positions);
+        out.normals.extend(mesh.normals);
+        out.uvs.extend(mesh.uvs);
+        for tri in mesh.indices {
+            out.indices
+                .push([tri[0] + offset, tri[1] + offset, tri[2] + offset]);
+        }
+        out.prim_ranges.push(crate::mesh::PrimRange {
+            prim_path: ppath,
+            vert_start: offset,
+            vert_count: added,
+        });
+    }
+    log::info!("merged {count} mesh prims into a single CpuMesh");
+    Ok(LoadedStage {
+        mesh: out,
+        materials,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +261,7 @@ impl Interpolation {
 
 #[derive(Debug, Clone)]
 struct StPrimvar {
+    name: String,
     data: Vec<[f32; 2]>,
     indices: Option<Vec<u32>>,
     interpolation: Interpolation,
@@ -194,6 +281,7 @@ struct UsdMesh {
     face_vertex_counts: Vec<u32>,
     face_vertex_indices: Vec<u32>,
     st: Option<StPrimvar>,
+    uv_primvar_name: Option<String>,
     normals: Option<NormalPrimvar>,
     world_xform: Mat4,
     // UsdGeomMesh::orientation == "leftHanded" ⇒ face vertices wind CW.
@@ -250,28 +338,8 @@ fn build_intermediate(m: &rust_usd::Mesh) -> Result<UsdMesh> {
         })
     };
 
-    let st_data = m.st_uv();
-    let st = if st_data.is_empty() {
-        None
-    } else {
-        let st_idx = m.st_indices_u32();
-        let indices = if st_idx.is_empty() { None } else { Some(st_idx) };
-        // Query the Primvar handle for the actual interpolation token.
-        // FaceVarying is the typical authored value but rust-usd surfaces
-        // whatever was set via UsdGeomPrimvarsAPI — vertex-interpolated
-        // UVs (common on subdivision-friendly meshes) get routed through
-        // the Vertex branch in `expand_to_corners` correctly when we
-        // pull the live string instead of hardcoding it.
-        let interp = m
-            .primvar("st")
-            .map(|pv| Interpolation::parse(&pv.interpolation()))
-            .unwrap_or(Interpolation::FaceVarying);
-        Some(StPrimvar {
-            data: st_data,
-            indices,
-            interpolation: interp,
-        })
-    };
+    let st = choose_uv_primvar(m);
+    let uv_primvar_name = st.as_ref().map(|pv| pv.name.clone());
 
     let left_handed = m.orientation() == "leftHanded";
 
@@ -281,10 +349,73 @@ fn build_intermediate(m: &rust_usd::Mesh) -> Result<UsdMesh> {
         face_vertex_counts: m.face_vertex_counts_u32(),
         face_vertex_indices: m.face_vertex_indices_u32(),
         st,
+        uv_primvar_name,
         normals,
         world_xform,
         left_handed,
     })
+}
+
+fn choose_uv_primvar(m: &rust_usd::Mesh) -> Option<StPrimvar> {
+    let names = m.primvar_names();
+    let mut candidates = Vec::new();
+    for preferred in ["st", "st0"] {
+        if names.iter().any(|name| name == preferred) {
+            candidates.push(preferred.to_string());
+        }
+    }
+    for name in names.iter().filter(|name| name.starts_with("st")) {
+        if !candidates.iter().any(|candidate| candidate == name) {
+            candidates.push(name.clone());
+        }
+    }
+    for name in names.iter().filter(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower.contains("uv") || lower.contains("texcoord")
+    }) {
+        if !candidates.iter().any(|candidate| candidate == name) {
+            candidates.push(name.clone());
+        }
+    }
+    for name in names {
+        if !candidates.iter().any(|candidate| candidate == &name) {
+            candidates.push(name);
+        }
+    }
+
+    for name in candidates {
+        let Some(pv) = m.primvar(&name) else {
+            continue;
+        };
+        let raw = pv.as_vec2f_array();
+        if raw.is_empty() {
+            continue;
+        }
+        let data: Vec<[f32; 2]> = raw.chunks_exact(2).map(|uv| [uv[0], uv[1]]).collect();
+        if data.is_empty() {
+            continue;
+        }
+        let indices: Vec<u32> = pv
+            .indices()
+            .into_iter()
+            .filter_map(|idx| (idx >= 0).then_some(idx as u32))
+            .collect();
+        let indices = if indices.is_empty() {
+            None
+        } else {
+            Some(indices)
+        };
+        let interpolation = Interpolation::parse(&pv.interpolation());
+        log::debug!("mesh {} using UV primvar `{name}`", m.prim_path());
+        return Some(StPrimvar {
+            name,
+            data,
+            indices,
+            interpolation,
+        });
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -397,7 +528,11 @@ fn normal_matrix_from_xform(m: &Mat4) -> Mat3 {
     // correction when reading the stage, which is why mirrored
     // sub-meshes look right in the Hydra view but were wrong on the
     // wgpu side.
-    if m3.determinant() < 0.0 { -it } else { it }
+    if m3.determinant() < 0.0 {
+        -it
+    } else {
+        it
+    }
 }
 
 fn compute_face_normal(m: &UsdMesh, off: usize, count: usize) -> Vec3 {
@@ -414,7 +549,11 @@ fn compute_face_normal(m: &UsdMesh, off: usize, count: usize) -> Vec3 {
     // leftHanded winds CW from the outside, so the cross product
     // yields the inward normal. Flip so the per-face fallback (used
     // when no authored normals primvar exists) still points outward.
-    if m.left_handed { -n } else { n }
+    if m.left_handed {
+        -n
+    } else {
+        n
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

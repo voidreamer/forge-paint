@@ -131,8 +131,7 @@ impl HydraView {
         // but the user's stage doesn't, the issue is asset-side, not
         // renderer-side. Drop the env var to go back to the live
         // forge-paint stage path.
-        let actual = std::env::var_os("HYDRA_TEST_STAGE")
-            .map(std::path::PathBuf::from);
+        let actual = std::env::var_os("HYDRA_TEST_STAGE").map(std::path::PathBuf::from);
         let path: &Path = actual.as_deref().unwrap_or(stage_path);
         log::info!("HydraView::new opening: {}", path.display());
         let mut renderer = Renderer::new(path)?;
@@ -238,11 +237,7 @@ impl HydraView {
     /// Idempotent: re-pointing at a different material is one bridge
     /// call. Dirty-tracking lives in the caller (`draw_hydra_central`
     /// only invokes this when the selected index changes).
-    pub fn set_external_material(
-        &mut self,
-        source: &Path,
-        prim_path: &str,
-    ) -> Result<()> {
+    pub fn set_external_material(&mut self, source: &Path, prim_path: &str) -> Result<()> {
         let next = (source.to_path_buf(), prim_path.to_string());
         if self.last_external_material.as_ref() == Some(&next) {
             return Ok(());
@@ -275,9 +270,7 @@ impl HydraView {
         }
         self.renderer
             .set_external_material_on_prims(source, prim_path, target_prims)
-            .map_err(|e| {
-                anyhow::anyhow!("set_external_material_on_prims failed: {}", e.what())
-            })?;
+            .map_err(|e| anyhow::anyhow!("set_external_material_on_prims failed: {}", e.what()))?;
         self.last_external_material = Some(src_next);
         self.last_target_prims = target_prims.to_vec();
         Ok(())
@@ -298,17 +291,14 @@ impl HydraView {
     /// input_f` which authors a session-layer override on top of
     /// the referenced source value.
     pub fn set_external_material_input_f(&mut self, input_name: &str, value: f32) {
-        self.renderer.set_external_material_input_f(input_name, value);
+        self.renderer
+            .set_external_material_input_f(input_name, value);
     }
 
     /// Live-edit a colour input on the currently-bound external
     /// material's surface shader (e.g. `diffuseColor`, `base_color`,
     /// `emissiveColor`).
-    pub fn set_external_material_input_color3(
-        &mut self,
-        input_name: &str,
-        color: [f32; 3],
-    ) {
+    pub fn set_external_material_input_color3(&mut self, input_name: &str, color: [f32; 3]) {
         self.renderer
             .set_external_material_input_color3(input_name, color);
     }
@@ -358,21 +348,18 @@ impl HydraView {
     }
 
     pub fn set_binding_input_f(&mut self, binding_id: u64, input_name: &str, value: f32) {
-        self.renderer.set_binding_input_f(binding_id, input_name, value);
+        self.renderer
+            .set_binding_input_f(binding_id, input_name, value);
     }
 
-    pub fn set_binding_input_color3(
-        &mut self,
-        binding_id: u64,
-        input_name: &str,
-        color: [f32; 3],
-    ) {
+    pub fn set_binding_input_color3(&mut self, binding_id: u64, input_name: &str, color: [f32; 3]) {
         self.renderer
             .set_binding_input_color3(binding_id, input_name, color);
     }
 
     pub fn set_binding_input_i(&mut self, binding_id: u64, input_name: &str, value: i32) {
-        self.renderer.set_binding_input_i(binding_id, input_name, value);
+        self.renderer
+            .set_binding_input_i(binding_id, input_name, value);
     }
 
     /// Push the consumer's analytic-light list into the Hydra

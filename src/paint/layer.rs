@@ -67,8 +67,8 @@ pub struct Layer {
     pub kind: LayerKind,
 
     pub base_color: wgpu::Texture,
-    pub base_color_view: wgpu::TextureView,               // full array view
-    pub base_color_layer_views: Vec<wgpu::TextureView>,    // per tile — stamp / sample
+    pub base_color_view: wgpu::TextureView, // full array view
+    pub base_color_layer_views: Vec<wgpu::TextureView>, // per tile — stamp / sample
 
     pub roughness: wgpu::Texture,
     pub roughness_view: wgpu::TextureView,

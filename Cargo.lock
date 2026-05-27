@@ -1727,7 +1727,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hydra-rs"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "cxx",
  "cxx-build",

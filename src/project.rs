@@ -149,22 +149,19 @@ pub fn load_sidecar(work_dir: &Path) -> Result<Option<ProjectSidecar>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let parsed: ProjectSidecar = serde_json::from_str(&text)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let parsed: ProjectSidecar =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(parsed))
 }
 
 /// Write `forge-project.json`, creating the directory if needed.
 pub fn save_sidecar(work_dir: &Path, sidecar: &ProjectSidecar) -> Result<()> {
-    std::fs::create_dir_all(work_dir)
-        .with_context(|| format!("create {}", work_dir.display()))?;
+    std::fs::create_dir_all(work_dir).with_context(|| format!("create {}", work_dir.display()))?;
     let path = sidecar_path(work_dir);
-    let text = serde_json::to_string_pretty(sidecar)
-        .context("serialize sidecar")?;
-    std::fs::write(&path, text)
-        .with_context(|| format!("write {}", path.display()))?;
+    let text = serde_json::to_string_pretty(sidecar).context("serialize sidecar")?;
+    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
     log::info!("project sidecar saved: {}", path.display());
     Ok(())
 }
