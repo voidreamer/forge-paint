@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       include_hdnsi:
-        description: 'Build and package the optional 3Delight hdNSI delegate. Requires DELIGHT on the runner or DELIGHT_WINDOWS_ARCHIVE_URL secret.'
+        description: 'Build and package the optional hdNSI delegate. 3Delight is used at build time only; users install the runtime separately.'
         type: boolean
         default: false
   push:
@@ -238,11 +238,13 @@ jobs:
 
           Hydra/Storm is bundled through OpenUSD.
 
-          3Delight: if this zip contains plugins\usd\hdNSI, install
-          3Delight on this machine and restart forge-paint. The app
-          self-locates the hdNSI plugInfo and common 3Delight runtime
-          folders at startup. Without plugins\usd\hdNSI, the delegate
-          picker will show Storm only.
+          3Delight: install 3Delight on this machine, then restart
+          forge-paint. If this zip contains plugins\usd\hdNSI, the app
+          self-locates that delegate plus common 3Delight runtime
+          folders at startup. It also checks DELIGHT,
+          FORGE_PAINT_3DELIGHT_DIR, and common Program Files installs.
+          Without an hdNSI plugInfo compatible with the bundled USD,
+          the delegate picker will show Storm only.
           '@ | Out-File "$stage\README.txt" -Encoding utf8
 
           Compress-Archive -Path "$stage\*" `

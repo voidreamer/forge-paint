@@ -29,7 +29,7 @@ mod viewport;
 mod wireframe;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// forge-paint — USD-centric Rust painter (standalone / anvil-aware).
 ///
@@ -126,7 +126,7 @@ fn main() -> eframe::Result<()> {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn push_usd_plugin_path_dirs(plugin_paths: &mut Vec<PathBuf>, root: &std::path::Path) {
+fn push_usd_plugin_path_dirs(plugin_paths: &mut Vec<PathBuf>, root: &Path) {
     if !root.is_dir() {
         return;
     }
@@ -156,20 +156,111 @@ fn dedup_paths(paths: &mut Vec<PathBuf>) {
 }
 
 #[cfg(windows)]
-fn delight_runtime_dirs(bundle_dir: &std::path::Path) -> Vec<PathBuf> {
+fn delight_install_roots(bundle_dir: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(delight) = std::env::var_os("DELIGHT") {
-        roots.push(PathBuf::from(delight));
+    for var in ["FORGE_PAINT_3DELIGHT_DIR", "DELIGHT", "Delight"] {
+        if let Some(value) = std::env::var_os(var) {
+            roots.push(PathBuf::from(value));
+        }
     }
     roots.push(bundle_dir.join("3Delight"));
-    roots.push(PathBuf::from(r"C:\Program Files\3Delight"));
-    roots.push(PathBuf::from(r"C:\Program Files (x86)\3Delight"));
 
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        let Some(base) = std::env::var_os(var).map(PathBuf::from) else {
+            continue;
+        };
+        roots.push(base.join("3Delight"));
+        roots.push(base.join("3DelightNSI"));
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                if name.contains("3delight") {
+                    roots.push(path);
+                }
+            }
+        }
+    }
+
+    roots.retain(|root| root.join("bin").join("renderdl.exe").is_file());
+    dedup_paths(&mut roots);
+    roots
+}
+
+#[cfg(windows)]
+fn delight_runtime_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    for root in roots {
+    for root in roots.iter().filter(|root| root.is_dir()) {
+        dirs.push(root.to_path_buf());
         if root.is_dir() {
             dirs.push(root.join("bin"));
             dirs.push(root.join("lib"));
+        }
+    }
+    dirs.retain(|p| p.is_dir());
+    dedup_paths(&mut dirs);
+    dirs
+}
+
+#[cfg(windows)]
+fn path_has_component_case_insensitive(path: &Path, needle: &str) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(needle)
+    })
+}
+
+#[cfg(windows)]
+fn push_hdnsi_plugin_dirs_from_delight(plugin_paths: &mut Vec<PathBuf>, root: &Path) {
+    let known_roots = [
+        root.join("hdNSI"),
+        root.join("usd").join("hdNSI"),
+        root.join("plugin").join("usd").join("hdNSI"),
+        root.join("plugins").join("usd").join("hdNSI"),
+        root.join("hydra").join("hdNSI"),
+    ];
+    for known_root in known_roots {
+        push_usd_plugin_path_dirs(plugin_paths, &known_root);
+    }
+
+    // Some 3Delight installers put DCC integrations in product-specific
+    // subtrees. Keep this bounded so startup does not crawl arbitrary
+    // Program Files contents, but still find e.g. .../hdNSI/resources.
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if dir.join("plugInfo.json").is_file() && path_has_component_case_insensitive(&dir, "hdNSI")
+        {
+            plugin_paths.push(dir.clone());
+        }
+        if depth >= 7 {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn usd_plugin_dll_search_dirs(plugin_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for plugin_path in plugin_paths {
+        dirs.push(plugin_path.clone());
+        let mut current = plugin_path.as_path();
+        for _ in 0..3 {
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            dirs.push(parent.to_path_buf());
+            current = parent;
         }
     }
     dirs.retain(|p| p.is_dir());
@@ -209,9 +300,24 @@ fn setup_bundled_usd_env() {
         let sep = ";";
         #[cfg(not(windows))]
         let sep = ":";
+        #[cfg(windows)]
+        let delight_roots = delight_install_roots(dir);
+        #[cfg(windows)]
+        if std::env::var_os("DELIGHT").is_none() {
+            if let Some(delight_root) = delight_roots.first() {
+                // SAFETY: still before any eframe threads spawn.
+                unsafe {
+                    std::env::set_var("DELIGHT", delight_root);
+                }
+            }
+        }
         let mut plugin_paths = vec![usd.join("plugin").join("usd"), usd.join("lib").join("usd")];
         let optional_plugins = dir.join("plugins").join("usd");
         push_usd_plugin_path_dirs(&mut plugin_paths, &optional_plugins);
+        #[cfg(windows)]
+        for delight_root in &delight_roots {
+            push_hdnsi_plugin_dirs_from_delight(&mut plugin_paths, delight_root);
+        }
         dedup_paths(&mut plugin_paths);
         let mut plugin_path = plugin_paths
             .iter()
@@ -234,7 +340,8 @@ fn setup_bundled_usd_env() {
         #[cfg(windows)]
         {
             let mut path_dirs = vec![usd.join("lib"), usd.join("bin")];
-            path_dirs.extend(delight_runtime_dirs(dir));
+            path_dirs.extend(usd_plugin_dll_search_dirs(&plugin_paths));
+            path_dirs.extend(delight_runtime_dirs(&delight_roots));
             dedup_paths(&mut path_dirs);
             let prefix = path_dirs
                 .iter()

@@ -115,6 +115,23 @@ $dest = Join-Path $OutputDir "hdNSI"
 New-Item -ItemType Directory -Path $dest -Force | Out-Null
 Copy-Item -Recurse (Join-Path $pluginRoot "*") $dest
 
+# The release bundle ships the Hydra delegate only. 3Delight itself is
+# installed by the user and discovered by forge-paint at startup, so
+# keep renderer runtime files out of the artifact if CMake copied any.
+$runtimeNames = @(
+  "renderdl.exe",
+  "i-display.exe",
+  "oslc.exe",
+  "tdlmake.exe",
+  "3Delight*.dll",
+  "lib3delight*.dll",
+  "libnsi*.dll"
+)
+foreach ($name in $runtimeNames) {
+  Get-ChildItem -Path $dest -Recurse -Filter $name -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
 $plugInfo = Get-ChildItem -Path $dest -Recurse -Filter plugInfo.json |
   Select-Object -First 1
 if (-not $plugInfo) {
