@@ -65,7 +65,9 @@ runtime files from the staged delegate folder; the release zip must not
 redistribute 3Delight itself.
 
 That optional step still needs 3Delight at build time because HydraNSI compiles
-against the 3Delight NSI SDK. Use either:
+against the 3Delight NSI SDK. If `include_hdnsi` is enabled without one of the
+inputs below, the workflow logs a warning and skips hdNSI packaging instead of
+failing the whole Windows artifact. Use either:
 
 - a self-hosted runner with `DELIGHT` pointing at the 3Delight install, or
 - a repository secret named `DELIGHT_WINDOWS_ARCHIVE_URL` pointing at a private

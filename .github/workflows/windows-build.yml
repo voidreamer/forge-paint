@@ -155,7 +155,8 @@ jobs:
         run: |
           .github\scripts\package-hdnsi-windows.ps1 `
             -UsdInstallDir "$env:USD_INSTALL_DIR" `
-            -OutputDir "$env:GITHUB_WORKSPACE\hdnsi-package"
+            -OutputDir "$env:GITHUB_WORKSPACE\hdnsi-package" `
+            -SkipIfMissing
 
       - name: Stage Windows zip
         shell: pwsh

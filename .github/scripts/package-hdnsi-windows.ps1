@@ -3,7 +3,9 @@ param(
   [string]$UsdInstallDir,
 
   [Parameter(Mandatory = $true)]
-  [string]$OutputDir
+  [string]$OutputDir,
+
+  [switch]$SkipIfMissing
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,11 +39,16 @@ function Find-DelightRoot {
     }
   }
 
-  throw @"
+  $message = @"
 hdNSI packaging requires 3Delight.
 Set DELIGHT on a self-hosted runner, or add a DELIGHT_WINDOWS_ARCHIVE_URL
 repository secret that points at a zip containing a 3Delight install tree.
 "@
+  if ($SkipIfMissing) {
+    Write-Warning $message
+    return $null
+  }
+  throw $message
 }
 
 function Find-PxrConfig {
@@ -86,6 +93,10 @@ function Find-HdNsiPluginRoot {
 }
 
 $delightRoot = Find-DelightRoot
+if (-not $delightRoot) {
+  Write-Host "Skipping optional hdNSI packaging; no 3Delight install or archive was found."
+  exit 0
+}
 $pxrDir = Find-PxrConfig -Root $UsdInstallDir
 
 $env:DELIGHT = $delightRoot
