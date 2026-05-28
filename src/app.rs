@@ -4417,7 +4417,7 @@ impl App {
         // rect comes from.
         if hydra_slot.is_none() {
             log::info!("Hydra: opening stage {}", path.display());
-            match crate::hydra_view::HydraView::new(path) {
+            match crate::hydra_view::HydraView::new_with_delegate(path, hydra_delegate.as_deref()) {
                 Ok(mut v) => {
                     log::info!("Hydra: stage opened OK, size {}x{}", w, h);
                     // Match the wgpu side's warm-orange selection tint.
@@ -4889,6 +4889,15 @@ impl App {
     ) {
         const WGPU_ID: &str = "__wgpu";
         let delegates = crate::hydra_view::HydraView::list_delegates();
+        if hydra_delegate
+            .as_ref()
+            .is_some_and(|id| !delegates.iter().any(|delegate| delegate == id))
+        {
+            *hydra_delegate = delegates.first().cloned();
+        }
+        if *renderer_mode == RendererMode::Hydra && delegates.is_empty() {
+            *renderer_mode = RendererMode::Wgpu;
+        }
 
         // Current selection in the combo:
         //  - Wgpu mode      → WGPU_ID

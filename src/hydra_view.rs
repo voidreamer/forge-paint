@@ -24,6 +24,8 @@ use anyhow::Result;
 use hydra_rs::Renderer;
 use std::path::Path;
 
+const STORM_DELEGATE: &str = "HdStormRendererPlugin";
+
 /// Snapshot of the wgpu side's three-point studio rig. Each frame the
 /// caller copies these from `Viewport` and hands them to
 /// `HydraView::set_rig` so Hydra mirrors the same key/fill/rim that
@@ -124,6 +126,16 @@ impl HydraView {
     /// `set_rig` before the first `render()` so the wgpu studio rig
     /// drives Hydra too.
     pub fn new(stage_path: &Path) -> Result<Self> {
+        Self::new_with_delegate(stage_path, None)
+    }
+
+    /// Open a stage path through Hydra using a specific render
+    /// delegate when requested. On Windows, Storm is hidden unless
+    /// `FORGE_PAINT_ENABLE_STORM=1` is set: this headless bridge uses
+    /// `UsdImagingGLEngine` offscreen, and Storm can terminate in
+    /// native graphics code before Rust gets a recoverable error.
+    /// CPU/path-tracing delegates such as hdNSI are still allowed.
+    pub fn new_with_delegate(stage_path: &Path, delegate_id: Option<&str>) -> Result<Self> {
         // Diagnostic override: setting HYDRA_TEST_STAGE points the
         // renderer at any USDA you supply (e.g. the bundled
         // hydra-rs/examples/hydra_test.usda — a red sphere with a
@@ -133,8 +145,21 @@ impl HydraView {
         // forge-paint stage path.
         let actual = std::env::var_os("HYDRA_TEST_STAGE").map(std::path::PathBuf::from);
         let path: &Path = actual.as_deref().unwrap_or(stage_path);
-        log::info!("HydraView::new opening: {}", path.display());
-        let mut renderer = Renderer::new(path)?;
+        let delegate = Self::choose_startup_delegate(delegate_id)?;
+        log::info!(
+            "HydraView::new opening: {} via {}",
+            path.display(),
+            if delegate.is_empty() {
+                "default delegate"
+            } else {
+                delegate.as_str()
+            },
+        );
+        let mut renderer = if delegate.is_empty() {
+            Renderer::new(path)?
+        } else {
+            Renderer::with_delegate(path, &delegate)?
+        };
         renderer.set_size(1280, 720);
 
         // Neutral dark backdrop for when no dome is bound — matches
@@ -168,13 +193,84 @@ impl HydraView {
         })
     }
 
+    fn choose_startup_delegate(delegate_id: Option<&str>) -> Result<String> {
+        let raw = Self::list_delegates_raw();
+        if let Some(id) = delegate_id.filter(|id| !id.is_empty()) {
+            if !raw.iter().any(|registered| registered == id) {
+                anyhow::bail!(
+                    "Hydra render delegate not registered: {id}. Available: {:?}",
+                    raw
+                );
+            }
+            if !Self::delegate_enabled(id) {
+                anyhow::bail!("{}", Self::disabled_delegate_message(id));
+            }
+            return Ok(id.to_string());
+        }
+
+        #[cfg(windows)]
+        {
+            if let Some(id) = raw.iter().find(|id| Self::delegate_enabled(id)) {
+                return Ok(id.clone());
+            }
+            anyhow::bail!(
+                "No safe Hydra render delegate is available. Storm is registered but disabled \
+                 in Windows hand-off builds because it can crash in native offscreen graphics \
+                 code. To use 3Delight, package or point PXR_PLUGINPATH_NAME at a compatible \
+                 hdNSI/resources plug-in. To test Storm anyway, set FORGE_PAINT_ENABLE_STORM=1."
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            Ok(String::new())
+        }
+    }
+
     /// Plugin IDs of every Hydra render delegate the USD plug
     /// registry found at startup. Storm is always there
     /// (`HdStormRendererPlugin`); production delegates show up only
     /// when their anvil packages compose into the run — `3delight`
     /// adds `HdNSiRendererPlugin`, etc.
     pub fn list_delegates() -> Vec<String> {
+        Self::list_delegates_raw()
+            .into_iter()
+            .filter(|id| Self::delegate_enabled(id))
+            .collect()
+    }
+
+    fn list_delegates_raw() -> Vec<String> {
         hydra_rs::list_render_delegates()
+    }
+
+    pub fn delegate_enabled(plugin_id: &str) -> bool {
+        plugin_id != STORM_DELEGATE || Self::storm_enabled()
+    }
+
+    fn storm_enabled() -> bool {
+        #[cfg(windows)]
+        {
+            std::env::var_os("FORGE_PAINT_ENABLE_STORM")
+                .map(|value| {
+                    let value = value.to_string_lossy();
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+
+    pub fn disabled_delegate_message(plugin_id: &str) -> String {
+        match plugin_id {
+            STORM_DELEGATE => "Storm is disabled by default on Windows because this offscreen Hydra bridge can crash inside native graphics code before Rust can recover. Set FORGE_PAINT_ENABLE_STORM=1 to test it anyway.".to_string(),
+            other => format!("Hydra render delegate is disabled: {other}"),
+        }
     }
 
     /// Plugin ID currently driving `render()`. Empty string if the
@@ -188,6 +284,9 @@ impl HydraView {
     /// swap — only the rasteriser / path-tracer behind them changes.
     /// Returns `Err` when `plugin_id` isn't a registered delegate.
     pub fn set_delegate(&mut self, plugin_id: &str) -> Result<()> {
+        if !Self::delegate_enabled(plugin_id) {
+            anyhow::bail!("{}", Self::disabled_delegate_message(plugin_id));
+        }
         if !self.renderer.set_renderer_plugin(plugin_id) {
             anyhow::bail!(
                 "Hydra render delegate not registered: {plugin_id}. \
@@ -559,7 +658,7 @@ impl HydraView {
 /// row.
 pub fn delegate_label(plugin_id: &str) -> &str {
     match plugin_id {
-        "HdStormRendererPlugin" => "Storm",
+        STORM_DELEGATE => "Storm",
         // hdNSI registers as `HdNSIRendererPlugin` with three caps —
         // NSI is the acronym (Nodal Scene Interface). Easy typo.
         "HdNSIRendererPlugin" => "3Delight",

@@ -36,6 +36,11 @@ because plugInfo discovery and plug-in-relative library paths depend on that
 layout. The generated `forge-paint.bat` launcher also prepends USD and 3Delight
 runtime paths for testers who prefer the old explicit shell setup.
 
+Storm is bundled with OpenUSD, but forge-paint hides it by default on Windows
+because the current offscreen Hydra bridge can terminate inside native graphics
+code before Rust can surface an error. Set `FORGE_PAINT_ENABLE_STORM=1` before
+launch when intentionally testing Storm on Windows.
+
 ## OBJ Import
 
 forge-paint is still USD-first. When the user opens or drops an `.obj`, the app
@@ -62,12 +67,14 @@ The intended shipping model is:
 2. The tester installs 3Delight normally.
 3. forge-paint discovers both pieces at startup.
 
-The app should work without 3Delight. In that case the delegate picker shows
-Storm only.
+The app should work without 3Delight. On Windows, the delegate picker then
+stays on `wgpu painter` unless `FORGE_PAINT_ENABLE_STORM=1` is set; on other
+platforms it can still show Storm.
 
-The Windows workflow has an optional `include_hdnsi` dispatch input. When it is
-enabled, CI runs `.github/scripts/package-hdnsi-windows.ps1` after OpenUSD and
-forge-paint are built. The script clones HydraNSI, configures it with
+The Windows workflow has an optional `include_hdnsi` dispatch input. Manual
+builds use that input, and `v*` tag builds attempt the same optional packaging
+automatically. CI runs `.github/scripts/package-hdnsi-windows.ps1` after
+OpenUSD and forge-paint are built. The script clones HydraNSI, configures it with
 `pxr_DIR` pointing at the just-built OpenUSD package, builds the delegate, and
 stages the delegate under `plugins/usd/hdNSI`. It strips common 3Delight
 runtime files from the staged delegate folder; the release zip must not

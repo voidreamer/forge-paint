@@ -13,7 +13,7 @@ on:
       include_hdnsi:
         description: 'Build and package the optional hdNSI delegate. 3Delight is used at build time only; users install the runtime separately.'
         type: boolean
-        default: false
+        default: true
   push:
     tags: ['v*']
 
@@ -144,11 +144,11 @@ jobs:
         run: cargo build --release
 
       - name: Setup MSVC shell for hdNSI
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.include_hdnsi }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.include_hdnsi) }}
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build optional hdNSI delegate
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.include_hdnsi }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.include_hdnsi) }}
         shell: pwsh
         env:
           DELIGHT_WINDOWS_ARCHIVE_URL: ${{ secrets.DELIGHT_WINDOWS_ARCHIVE_URL }}
@@ -266,6 +266,11 @@ jobs:
           filesystem-only.
 
           Hydra/Storm is bundled through OpenUSD.
+          On Windows, Storm is hidden by default in forge-paint because
+          the current offscreen Hydra bridge can crash inside native
+          graphics code before the app can show an error. Set
+          FORGE_PAINT_ENABLE_STORM=1 before launch only if you want to
+          test that path explicitly.
 
           3Delight: install 3Delight on this machine, then restart
           forge-paint. If this zip contains plugins\usd\hdNSI, the app

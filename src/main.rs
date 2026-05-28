@@ -312,7 +312,9 @@ fn setup_bundled_usd_env() {
                 }
             }
         }
-        let mut plugin_paths = vec![usd.join("plugin").join("usd"), usd.join("lib").join("usd")];
+        let mut plugin_paths = Vec::new();
+        push_usd_plugin_path_dirs(&mut plugin_paths, &usd.join("plugin").join("usd"));
+        push_usd_plugin_path_dirs(&mut plugin_paths, &usd.join("lib").join("usd"));
         let optional_plugins = dir.join("plugins").join("usd");
         push_usd_plugin_path_dirs(&mut plugin_paths, &optional_plugins);
         #[cfg(windows)]

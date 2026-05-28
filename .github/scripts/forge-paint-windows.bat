@@ -1,11 +1,13 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 
 set "FORGE_PAINT_DIR=%~dp0"
 
 rem DLLs imported by forge-paint.exe must be visible before the app can
 rem run its own startup environment setup.
 set "PATH=%FORGE_PAINT_DIR%usd\bin;%FORGE_PAINT_DIR%usd\lib;%PATH%"
+for /d %%D in ("%FORGE_PAINT_DIR%usd\plugin\usd\*") do set "PATH=%%~fD;!PATH!"
+for /d %%D in ("%FORGE_PAINT_DIR%usd\lib\usd\*") do set "PATH=%%~fD;!PATH!"
 
 set "FORGE_USD_PLUGINS=%FORGE_PAINT_DIR%usd\plugin\usd;%FORGE_PAINT_DIR%usd\lib\usd"
 if exist "%FORGE_PAINT_DIR%plugins\usd" (
