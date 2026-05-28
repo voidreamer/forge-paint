@@ -3,6 +3,8 @@
 The release zips are self-contained for the default renderer set:
 
 - `forge-paint(.exe)`
+- Windows only: root-level OpenUSD DLL copies for direct EXE launch, plus
+  `forge-paint.bat` for explicit USD / 3Delight environment setup
 - `usd/` with OpenUSD runtime libraries, plugInfo files, file-format plugins, and Hydra/Storm
 - `assets/` with starter meshes, materials, HDRI, stencils, and displacement textures
 - `tools/` with small utility scripts such as `obj_to_usd.py`
@@ -26,6 +28,13 @@ CI uses the published `rust-usd` and `hydra-rs` crates. The repository keeps a
 local `[patch.crates-io]` block for day-to-day development against
 `../rust-usd`; the workflows strip that block before building so they do not
 need access to a private sibling checkout.
+
+On Windows, DLLs imported by `forge-paint.exe` must be discoverable before
+`main()` runs, so the workflow copies the top-level OpenUSD runtime DLLs from
+`usd/bin` and `usd/lib` beside the EXE. The full `usd/` tree is still bundled
+because plugInfo discovery and plug-in-relative library paths depend on that
+layout. The generated `forge-paint.bat` launcher also prepends USD and 3Delight
+runtime paths for testers who prefer the old explicit shell setup.
 
 ## OBJ Import
 

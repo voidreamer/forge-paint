@@ -174,8 +174,8 @@ jobs:
           # LibraryPath references relative to themselves, so the tree
           # has to be copied wholesale to keep them resolvable.
           # forge-paint's main() detects this layout at startup and
-          # sets PXR_PLUGINPATH_NAME + PATH itself, so no launcher
-          # batch file is needed.
+          # sets PXR_PLUGINPATH_NAME + plugin/runtime PATH entries
+          # before USD is used.
           Copy-Item -Recurse "$env:USD_INSTALL_DIR" "$stage\usd"
 
           # Strip non-runtime artifacts. build_usd.py builds
@@ -200,6 +200,25 @@ jobs:
             Get-ChildItem -Path "$stage\usd\bin" -Filter *.exe -ErrorAction SilentlyContinue `
               | Remove-Item -Force -ErrorAction SilentlyContinue
           }
+
+          # Windows resolves DLLs imported by forge-paint.exe before
+          # main() runs, so the app's self-locating PATH setup is too
+          # late for direct EXE launches. Keep the USD runtime DLLs
+          # beside the EXE as well as inside usd/ so double-clicking
+          # forge-paint.exe works without a preconfigured shell.
+          $directLaunchDllDirs = @("$stage\usd\bin", "$stage\usd\lib") |
+            Where-Object { Test-Path $_ }
+          foreach ($dllDir in $directLaunchDllDirs) {
+            Get-ChildItem -Path $dllDir -Filter *.dll -File -ErrorAction SilentlyContinue |
+              Copy-Item -Destination $stage -Force
+          }
+          $usdShadeDll = Get-ChildItem -Path $stage -Filter usd_usdShade.dll -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $usdShadeDll) {
+            throw "Windows package is missing root-level usd_usdShade.dll; direct EXE launch would fail before main()."
+          }
+
+          Copy-Item .github\scripts\forge-paint-windows.bat "$stage\forge-paint.bat"
 
           # Report final bundle size so future runs can sanity-check
           # whether new bloat has crept in.
@@ -227,9 +246,13 @@ jobs:
           @'
           forge-paint Windows test build.
 
-          Run forge-paint.exe directly — at startup it self-locates
-          the bundled `usd/` directory next to itself and configures
-          USD's plugin discovery, so no wrapper script is needed.
+          Run forge-paint.exe directly. The zip keeps the USD DLLs
+          that Windows needs beside the EXE, and the app self-locates
+          the bundled `usd/` directory at startup for USD plug-ins.
+
+          A forge-paint.bat launcher is also included. Use it when you
+          want an explicit shell setup for USD and 3Delight before the
+          EXE starts, or when debugging custom installed runtimes.
 
           If the app fails to start with "VCRUNTIME140.dll" or
           "MSVCP140.dll" missing, install the Microsoft Visual C++
