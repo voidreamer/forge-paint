@@ -40,3 +40,7 @@
 .idea/
 *.swp
 *.swo
+
+# Local Houdini HDA tooling — mock lookdev-publish workflow, built/run
+# from Houdini's hython, not part of the forge-paint app build.
+/tools/houdini/

@@ -132,9 +132,24 @@ if (Test-Path $OutputDir) {
 
 git clone --depth 1 https://gitlab.com/3Delight/HydraNSI.git $src
 
+# pxrConfig.cmake's find_package(OpenSubdiv) walks CMake's standard
+# search paths — `-Dpxr_DIR` alone isn't enough because OpenSubdiv
+# isn't a sub-dep of the pxr package, just a sibling installed by
+# build_usd.py into the same prefix. CMAKE_PREFIX_PATH wires the
+# whole USD install in so find_package picks up OpenSubdivConfig +
+# headers + libs. OpenSubdiv_ROOT covers older FindOpenSubdiv
+# modules that don't honour CMAKE_PREFIX_PATH.
 cmake -S $src -B $build -G "Visual Studio 17 2022" -A x64 `
-  -Dpxr_DIR="$pxrDir"
+  -Dpxr_DIR="$pxrDir" `
+  -DCMAKE_PREFIX_PATH="$UsdInstallDir" `
+  -DOpenSubdiv_ROOT="$UsdInstallDir"
+if ($LASTEXITCODE -ne 0) {
+  throw "hdNSI CMake configure failed (exit $LASTEXITCODE). Check the log above for missing dependencies (typically OpenSubdiv / TBB)."
+}
 cmake --build $build --config Release --parallel
+if ($LASTEXITCODE -ne 0) {
+  throw "hdNSI build failed (exit $LASTEXITCODE)."
+}
 
 $pluginRoot = Find-HdNsiPluginRoot -BuildDir $build
 $dest = Join-Path $OutputDir "hdNSI"
