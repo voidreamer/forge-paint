@@ -147,11 +147,23 @@ jobs:
         if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.include_hdnsi) }}
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Build optional hdNSI delegate
-        if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.include_hdnsi) }}
+      - name: Build requested hdNSI delegate
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.include_hdnsi }}
         shell: pwsh
         env:
           DELIGHT_WINDOWS_ARCHIVE_URL: ${{ secrets.DELIGHT_WINDOWS_ARCHIVE_URL }}
+          DELIGHT_WINDOWS_ARCHIVE_PATH: ${{ github.workspace }}\.github\3delight-windows.zip
+        run: |
+          .github\scripts\package-hdnsi-windows.ps1 `
+            -UsdInstallDir "$env:USD_INSTALL_DIR" `
+            -OutputDir "$env:GITHUB_WORKSPACE\hdnsi-package"
+
+      - name: Build optional hdNSI delegate for release tags
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        env:
+          DELIGHT_WINDOWS_ARCHIVE_URL: ${{ secrets.DELIGHT_WINDOWS_ARCHIVE_URL }}
+          DELIGHT_WINDOWS_ARCHIVE_PATH: ${{ github.workspace }}\.github\3delight-windows.zip
         run: |
           .github\scripts\package-hdnsi-windows.ps1 `
             -UsdInstallDir "$env:USD_INSTALL_DIR" `
@@ -239,6 +251,12 @@ jobs:
             Copy-Item docs\release.md "$stage\RELEASE.md"
           }
           if (Test-Path hdnsi-package) {
+            $hdnsiPlugInfo = Get-ChildItem -Path hdnsi-package -Recurse -Filter plugInfo.json -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match 'hdNSI' } |
+              Select-Object -First 1
+            if (-not $hdnsiPlugInfo) {
+              throw "hdnsi-package exists but does not contain an hdNSI plugInfo.json"
+            }
             New-Item -ItemType Directory -Path "$stage\plugins\usd" -Force | Out-Null
             Copy-Item -Recurse hdnsi-package\* "$stage\plugins\usd"
           }

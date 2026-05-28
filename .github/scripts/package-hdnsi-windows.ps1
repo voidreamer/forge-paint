@@ -15,6 +15,20 @@ function Find-DelightRoot {
     return (Resolve-Path $env:DELIGHT).Path
   }
 
+  if ($env:DELIGHT_WINDOWS_ARCHIVE_PATH -and (Test-Path $env:DELIGHT_WINDOWS_ARCHIVE_PATH)) {
+    $extract = Join-Path $env:RUNNER_TEMP "3delight-repo"
+    New-Item -ItemType Directory -Path $extract -Force | Out-Null
+    Expand-Archive -Path $env:DELIGHT_WINDOWS_ARCHIVE_PATH -DestinationPath $extract -Force
+
+    $renderdl = Get-ChildItem -Path $extract -Recurse -Filter renderdl.exe |
+      Select-Object -First 1
+    if ($renderdl) {
+      return (Split-Path (Split-Path $renderdl.FullName -Parent) -Parent)
+    }
+
+    throw "DELIGHT_WINDOWS_ARCHIVE_PATH exists but does not contain bin\renderdl.exe: $env:DELIGHT_WINDOWS_ARCHIVE_PATH"
+  }
+
   if ($env:DELIGHT_WINDOWS_ARCHIVE_URL) {
     $archive = Join-Path $env:RUNNER_TEMP "3delight.zip"
     $extract = Join-Path $env:RUNNER_TEMP "3delight"
@@ -41,8 +55,9 @@ function Find-DelightRoot {
 
   $message = @"
 hdNSI packaging requires 3Delight.
-Set DELIGHT on a self-hosted runner, or add a DELIGHT_WINDOWS_ARCHIVE_URL
-repository secret that points at a zip containing a 3Delight install tree.
+Set DELIGHT on a self-hosted runner, commit .github/3delight-windows.zip,
+or add a DELIGHT_WINDOWS_ARCHIVE_URL repository secret that points at a zip
+containing a 3Delight install tree.
 "@
   if ($SkipIfMissing) {
     Write-Warning $message
