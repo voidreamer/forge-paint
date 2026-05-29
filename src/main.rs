@@ -91,6 +91,14 @@ fn main() -> eframe::Result<()> {
 
     if let Some(ref path) = log_path {
         log::info!("forge-paint starting — log file: {}", path.display());
+        // Hand the log path to the C++ Hydra bridge so it can append
+        // its own breadcrumbs — the bridge's stderr is dead on the
+        // console-less Windows build. The bridge reads this env var and
+        // no-ops if it's unset.
+        // SAFETY: single-threaded startup, before eframe spawns threads.
+        unsafe {
+            std::env::set_var("FORGE_PAINT_HYDRA_LOG", path);
+        }
     }
 
     let args = Args::parse();
