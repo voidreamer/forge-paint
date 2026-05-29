@@ -4473,8 +4473,17 @@ impl App {
             .clone()
             .unwrap_or_else(|| current_delegate.clone());
         if !desired_delegate.is_empty() && desired_delegate != current_delegate {
-            if let Err(e) = hydra.set_delegate(&desired_delegate) {
-                log::warn!("Hydra: delegate switch failed: {e:#}");
+            // Breadcrumb the switch — on Windows the delegate change
+            // can trigger a native HgiGL crash on the next render, and
+            // the console-less release build otherwise vanishes with no
+            // trace. The matching "switch OK" line tells us whether the
+            // crash is in SetRendererPlugin itself or the render after.
+            log::info!(
+                "Hydra: switching delegate '{current_delegate}' -> '{desired_delegate}'"
+            );
+            match hydra.set_delegate(&desired_delegate) {
+                Ok(()) => log::info!("Hydra: delegate switch to '{desired_delegate}' returned OK"),
+                Err(e) => log::warn!("Hydra: delegate switch failed: {e:#}"),
             }
         }
         if hydra_delegate.is_none() && !current_delegate.is_empty() {
@@ -4601,8 +4610,39 @@ impl App {
             }
         }
 
+        // Breadcrumb the first render on a freshly-switched delegate.
+        // Throttled to one begin/end pair per delegate change (not per
+        // frame) so the log stays readable. If the log shows "render
+        // begin" on a delegate but never the matching "render end", the
+        // crash is inside that delegate's first Render/AOV-readback —
+        // the exact Windows halt we're chasing.
+        thread_local! {
+            static LAST_BREADCRUMBED: std::cell::RefCell<String> =
+                const { std::cell::RefCell::new(String::new()) };
+        }
+        let active_delegate = hydra.current_delegate();
+        let first_on_delegate = LAST_BREADCRUMBED.with(|c| {
+            let mut last = c.borrow_mut();
+            if *last != active_delegate {
+                *last = active_delegate.clone();
+                true
+            } else {
+                false
+            }
+        });
+        if first_on_delegate {
+            log::info!(
+                "Hydra: first render begin on delegate '{active_delegate}' ({w}x{h})"
+            );
+        }
         match hydra.render(&view_row, &proj_row) {
             Ok(pixels) => {
+                if first_on_delegate {
+                    log::info!(
+                        "Hydra: first render end on delegate '{active_delegate}' — {} bytes",
+                        pixels.len()
+                    );
+                }
                 let img =
                     egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
                 let handle =

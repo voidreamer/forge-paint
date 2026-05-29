@@ -63,10 +63,35 @@ enum Cmd {
 fn main() -> eframe::Result<()> {
     setup_bundled_usd_env();
 
-    env_logger::Builder::from_env(
+    // On Windows release builds `windows_subsystem = "windows"` detaches
+    // the console, so env_logger's stderr output and panic messages go
+    // nowhere — a crash looks like the app silently vanishing. Tee the
+    // log to a file beside the exe (falling back to the temp dir) so we
+    // always have a post-mortem trail. The path is logged to stderr too
+    // for dev runs that DO have a console.
+    let log_path = init_file_log();
+
+    let mut builder = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn"),
-    )
-    .init();
+    );
+    if let Some(ref path) = log_path {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            builder.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+    }
+    builder.init();
+
+    install_panic_logger(log_path.clone());
+    #[cfg(windows)]
+    install_native_crash_logger(log_path.clone());
+
+    if let Some(ref path) = log_path {
+        log::info!("forge-paint starting — log file: {}", path.display());
+    }
 
     let args = Args::parse();
 
@@ -124,6 +149,143 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app::App::new(args.path)))
         }),
     )
+}
+
+/// Choose a writable log path: `forge-paint.log` next to the exe if
+/// that directory is writable, else `<temp>/forge-paint.log`. Returns
+/// None only if neither is usable (logging then stays stderr-only).
+fn init_file_log() -> Option<std::path::PathBuf> {
+    let candidates = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.join("forge-paint.log")))
+        .into_iter()
+        .chain(std::iter::once(std::env::temp_dir().join("forge-paint.log")));
+    for path in candidates {
+        // Probe writability by opening in append/create mode.
+        if std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .is_ok()
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Route Rust panics to both the default handler and the log file, so
+/// a panic on the console-less Windows build still leaves a trace.
+fn install_panic_logger(log_path: Option<std::path::PathBuf>) {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!("PANIC: {info}");
+        log::error!("{msg}");
+        if let Some(ref path) = log_path {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(f, "{msg}");
+                let bt = std::backtrace::Backtrace::force_capture();
+                let _ = writeln!(f, "{bt}");
+            }
+        }
+        default(info);
+    }));
+}
+
+/// Windows-only: install a vectored exception handler that appends the
+/// exception code + faulting address to the log right before a native
+/// (C++ / Hydra) access violation tears the process down. A Rust panic
+/// hook can't see these — they bypass unwinding entirely — so without
+/// this an HgiGL / delegate-switch crash just vanishes with no trace.
+#[cfg(windows)]
+fn install_native_crash_logger(log_path: Option<std::path::PathBuf>) {
+    use std::sync::Mutex;
+    // Stash the path in a static so the bare `extern "system"` handler
+    // (which can't capture) can reach it.
+    static LOG_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+    if let Ok(mut g) = LOG_PATH.lock() {
+        *g = log_path;
+    }
+
+    // Minimal manual FFI — avoids pulling the whole `windows` crate in
+    // just for one handler. AddVectoredExceptionHandler fires for every
+    // structured exception in-process; we log the fatal ones and let
+    // the OS continue its normal (terminating) search so behaviour is
+    // otherwise unchanged.
+    #[repr(C)]
+    struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        record: *mut std::ffi::c_void,
+        address: *mut std::ffi::c_void,
+        // remaining fields unused
+    }
+    #[repr(C)]
+    struct ExceptionPointers {
+        exception_record: *mut ExceptionRecord,
+        context_record: *mut std::ffi::c_void,
+    }
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    // Codes we treat as fatal-worth-logging.
+    const ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+    const STACK_OVERFLOW: u32 = 0xC000_00FD;
+
+    // One-shot guard: an access violation may have corrupted the heap,
+    // and the file-open below allocates — if that re-faults we must not
+    // recurse into ourselves forever. Log at most once.
+    static LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    unsafe extern "system" fn handler(info: *mut ExceptionPointers) -> i32 {
+        unsafe {
+            if !info.is_null() {
+                let rec = (*info).exception_record;
+                if !rec.is_null() {
+                    let code = (*rec).code;
+                    if (code == ACCESS_VIOLATION
+                        || code == ILLEGAL_INSTRUCTION
+                        || code == STACK_OVERFLOW)
+                        && !LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        if let Ok(g) = LOG_PATH.lock() {
+                            if let Some(ref path) = *g {
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(path)
+                                {
+                                    let _ = writeln!(
+                                        f,
+                                        "NATIVE EXCEPTION 0x{:08X} at {:p} — likely inside the Hydra/Hgi bridge. See the last log line above for the call that was in flight.",
+                                        code,
+                                        (*rec).address
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    unsafe extern "system" {
+        fn AddVectoredExceptionHandler(
+            first: u32,
+            handler: unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
+        ) -> *mut std::ffi::c_void;
+    }
+    unsafe {
+        AddVectoredExceptionHandler(1, handler);
+    }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
