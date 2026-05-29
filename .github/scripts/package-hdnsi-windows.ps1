@@ -114,6 +114,30 @@ if (-not $delightRoot) {
 }
 $pxrDir = Find-PxrConfig -Root $UsdInstallDir
 
+# Fail fast with a clear message if the 3Delight archive is a renderer-
+# only runtime (no compiler). hdNSI's osl/CMakeLists.txt compiles its
+# bundled .osl shaders with `3Delight::oslc`, and Find3Delight.cmake
+# points that target at <root>/bin/oslc.exe WITHOUT checking it exists
+# — so a missing oslc otherwise surfaces as an opaque MSBuild "exit
+# code 9009" (command not found) deep in the per-shader build rules.
+$oslc = Join-Path $delightRoot "bin\oslc.exe"
+if (-not (Test-Path $oslc)) {
+  throw @"
+3Delight archive at $delightRoot has no bin\oslc.exe.
+hdNSI needs the OSL compiler to build its shader resources. The archive
+must be a 3Delight install that includes bin\oslc.exe plus the osl\ header
+dir (stdosl.h is auto-found at ..\osl relative to oslc). A renderer-only
+runtime (renderdl.exe + DLLs) is not sufficient.
+"@
+}
+# stdosl.h is auto-resolved by oslc relative to its own exe (<root>\osl),
+# so the osl header dir must be a sibling of bin. Warn early if it's
+# absent — the shader compiles would otherwise fail with "stdosl.h not
+# found" once MSBuild reaches them.
+if (-not (Test-Path (Join-Path $delightRoot "osl\stdosl.h"))) {
+  Write-Warning "3Delight archive has no osl\stdosl.h next to bin\oslc.exe; OSL shader compilation may fail to find the standard library."
+}
+
 $env:DELIGHT = $delightRoot
 $env:PATH = "$delightRoot\bin;$delightRoot\lib;$env:PATH"
 
