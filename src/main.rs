@@ -29,6 +29,7 @@ mod usdz;
 mod viewport;
 mod wireframe;
 
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
@@ -101,6 +102,10 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    if let Some(code) = run_hydra_probe_from_env() {
+        std::process::exit(code);
+    }
+
     let args = Args::parse();
 
     if let Some(Cmd::Bake(b)) = args.cmd {
@@ -157,6 +162,64 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app::App::new(args.path)))
         }),
     )
+}
+
+fn run_hydra_probe_from_env() -> Option<i32> {
+    std::env::var_os("FORGE_PAINT_HYDRA_PROBE")?;
+    let Some(stage) = std::env::var_os("FORGE_PAINT_HYDRA_PROBE_STAGE").map(PathBuf::from) else {
+        log::error!("Hydra startup probe requested without FORGE_PAINT_HYDRA_PROBE_STAGE");
+        return Some(2);
+    };
+    let delegate = std::env::var("FORGE_PAINT_HYDRA_PROBE_DELEGATE")
+        .ok()
+        .filter(|id| !id.is_empty());
+    let delegate_label = delegate.as_deref().unwrap_or("default delegate");
+    log::info!(
+        "Hydra startup probe opening {} via {}",
+        stage.display(),
+        delegate_label
+    );
+    let started = std::time::Instant::now();
+    let result = (|| -> anyhow::Result<()> {
+        let mut view = hydra_view::HydraView::new_with_delegate(&stage, delegate.as_deref())
+            .with_context(|| format!("constructing Hydra renderer via {delegate_label}"))?;
+        view.resize(64, 64);
+        let view_matrix = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let proj = hydra_view::perspective_for_hydra(45.0_f32.to_radians(), 1.0, 0.01, 1000.0);
+        let pixels = view
+            .render(&view_matrix, &proj)
+            .context("rendering one Hydra startup probe frame")?;
+        anyhow::ensure!(
+            pixels.len() == 64 * 64 * 4,
+            "Hydra probe returned {} bytes, expected {}",
+            pixels.len(),
+            64 * 64 * 4
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            log::info!(
+                "Hydra startup probe OK for {} in {:.2}s",
+                delegate_label,
+                started.elapsed().as_secs_f32()
+            );
+            Some(0)
+        }
+        Err(e) => {
+            log::error!(
+                "Hydra startup probe failed for {} after {:.2}s: {e:#}",
+                delegate_label,
+                started.elapsed().as_secs_f32()
+            );
+            Some(3)
+        }
+    }
 }
 
 /// Choose a writable log path: `forge-paint.log` next to the exe if

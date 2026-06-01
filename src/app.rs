@@ -8,6 +8,93 @@ use crate::{
     viewport::{Tool, Viewport, ViewportSelection},
 };
 
+#[cfg(windows)]
+const HDNSI_DELEGATE: &str = "HdNSIRendererPlugin";
+const HYDRA_STARTUP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+struct HydraStartupProbe {
+    stage_path: PathBuf,
+    delegate: Option<String>,
+    child: std::process::Child,
+    started_at: std::time::Instant,
+}
+
+impl HydraStartupProbe {
+    fn start(stage_path: &Path, delegate: Option<&str>) -> anyhow::Result<Self> {
+        let exe = std::env::current_exe().context("locating forge-paint executable")?;
+        let normalized_delegate = delegate
+            .filter(|id| !id.is_empty())
+            .map(std::string::ToString::to_string);
+        let mut cmd = std::process::Command::new(exe);
+        cmd.env("FORGE_PAINT_HYDRA_PROBE", "1")
+            .env("FORGE_PAINT_HYDRA_PROBE_STAGE", stage_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(delegate) = normalized_delegate.as_deref() {
+            cmd.env("FORGE_PAINT_HYDRA_PROBE_DELEGATE", delegate);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let child = cmd.spawn().with_context(|| {
+            format!(
+                "starting Hydra startup probe for {}",
+                normalized_delegate
+                    .as_deref()
+                    .unwrap_or("the default Hydra delegate")
+            )
+        })?;
+        Ok(Self {
+            stage_path: stage_path.to_path_buf(),
+            delegate: normalized_delegate,
+            child,
+            started_at: std::time::Instant::now(),
+        })
+    }
+
+    fn matches(&self, stage_path: &Path, delegate: Option<&str>) -> bool {
+        self.stage_path == stage_path
+            && self.delegate.as_deref() == delegate.filter(|id| !id.is_empty())
+    }
+}
+
+impl Drop for HydraStartupProbe {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+struct HydraStartupFailure {
+    stage_path: PathBuf,
+    delegate: Option<String>,
+    message: String,
+}
+
+enum HydraStartupState {
+    Running(HydraStartupProbe),
+    Failed(HydraStartupFailure),
+}
+
+impl HydraStartupState {
+    fn matches(&self, stage_path: &Path, delegate: Option<&str>) -> bool {
+        let normalized_delegate = delegate.filter(|id| !id.is_empty());
+        match self {
+            Self::Running(probe) => probe.matches(stage_path, normalized_delegate),
+            Self::Failed(failure) => {
+                failure.stage_path == stage_path
+                    && failure.delegate.as_deref() == normalized_delegate
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct App {
     viewport: Option<Viewport>,
@@ -74,6 +161,11 @@ pub struct App {
     /// then sticks across stage opens so the user's pick (Storm /
     /// 3Delight / Arnold / ...) survives a close-reopen.
     hydra_delegate: Option<String>,
+    /// Windows hdNSI startup guard. HydraNSI can block forever while
+    /// loading 3Delight or its shader compiler; probing in a child
+    /// process keeps the main egui frame responsive and gives us a
+    /// timeout path before constructing the real renderer.
+    hydra_startup: Option<HydraStartupState>,
     /// Root cache dir for painted-material syncs. Each sync writes
     /// into a versioned subdir (`v<seq>`) of this so the material's
     /// asset paths change every time — without that, Hydra's texture
@@ -1137,6 +1229,7 @@ impl eframe::App for App {
                             &mut self.hydra,
                             &mut self.hydra_egui_tex,
                             &mut self.hydra_delegate,
+                            &mut self.hydra_startup,
                             &mut self.hydra_paint_cache_dir,
                             &mut self.hydra_paint_sync_seq,
                             &mut self.hydra_paint_sync_status,
@@ -4316,6 +4409,192 @@ impl App {
         }
     }
 
+    fn hydra_delegate_needs_startup_probe(delegate: Option<&str>) -> bool {
+        #[cfg(windows)]
+        {
+            matches!(delegate, Some(HDNSI_DELEGATE))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = delegate;
+            false
+        }
+    }
+
+    fn draw_hydra_startup_overlay(
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        title: &str,
+        detail: &str,
+        retry: bool,
+    ) -> bool {
+        let panel_w = rect.width().clamp(280.0, 460.0);
+        let panel_h = if retry { 118.0 } else { 86.0 };
+        let panel_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(panel_w, panel_h));
+        let mut retry_clicked = false;
+        egui::Area::new(egui::Id::new("hydra_startup_overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(panel_rect.min)
+            .show(ui.ctx(), |ui| {
+                ui.set_width(panel_w);
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_rgba_unmultiplied(8, 8, 10, 235))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(180, 200, 255),
+                    ))
+                    .inner_margin(12.0)
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(title)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(235, 240, 255)),
+                            );
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(detail)
+                                        .size(12.0)
+                                        .color(egui::Color32::from_gray(205)),
+                                )
+                                .wrap(),
+                            );
+                            if retry {
+                                ui.add_space(8.0);
+                                retry_clicked = ui.button("Retry").clicked();
+                            }
+                        });
+                    });
+            });
+        retry_clicked
+    }
+
+    fn ensure_hydra_startup_ready(
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        stage_path: &Path,
+        delegate: Option<&str>,
+        hydra_startup: &mut Option<HydraStartupState>,
+    ) -> bool {
+        let delegate = delegate.filter(|id| !id.is_empty());
+        if !Self::hydra_delegate_needs_startup_probe(delegate) {
+            if hydra_startup
+                .as_ref()
+                .is_some_and(|state| !state.matches(stage_path, delegate))
+            {
+                *hydra_startup = None;
+            }
+            return true;
+        }
+
+        if hydra_startup
+            .as_ref()
+            .is_some_and(|state| !state.matches(stage_path, delegate))
+        {
+            *hydra_startup = None;
+        }
+
+        if hydra_startup.is_none() {
+            match HydraStartupProbe::start(stage_path, delegate) {
+                Ok(probe) => {
+                    log::info!(
+                        "Hydra startup probe started for {} on {}",
+                        delegate.unwrap_or("default delegate"),
+                        stage_path.display()
+                    );
+                    *hydra_startup = Some(HydraStartupState::Running(probe));
+                }
+                Err(e) => {
+                    let message = format!("Could not start the 3Delight startup check: {e:#}");
+                    log::warn!("Hydra startup probe launch failed: {message}");
+                    *hydra_startup = Some(HydraStartupState::Failed(HydraStartupFailure {
+                        stage_path: stage_path.to_path_buf(),
+                        delegate: delegate.map(std::string::ToString::to_string),
+                        message,
+                    }));
+                }
+            }
+        }
+
+        let mut ready = false;
+        let mut failure = None;
+        if let Some(HydraStartupState::Running(probe)) = hydra_startup.as_mut() {
+            match probe.child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    log::info!(
+                        "Hydra startup probe completed OK for {}",
+                        delegate.unwrap_or("default delegate")
+                    );
+                    ready = true;
+                }
+                Ok(Some(status)) => {
+                    let status_text = status.code().map_or_else(
+                        || "terminated before reporting an exit code".to_string(),
+                        |code| format!("exit code {code}"),
+                    );
+                    failure = Some(format!(
+                        "3Delight startup check failed ({status_text}). See forge-paint.log beside forge-paint.exe for the HydraNSI breadcrumb."
+                    ));
+                }
+                Ok(None) => {
+                    let elapsed = probe.started_at.elapsed();
+                    if elapsed >= HYDRA_STARTUP_PROBE_TIMEOUT {
+                        failure = Some(format!(
+                            "3Delight startup check timed out after {}s. The UI stayed alive; see forge-paint.log for the last HydraNSI breadcrumb.",
+                            HYDRA_STARTUP_PROBE_TIMEOUT.as_secs()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    failure = Some(format!(
+                        "3Delight startup check failed to report status: {e}"
+                    ));
+                }
+            }
+        }
+
+        if ready {
+            *hydra_startup = None;
+            return true;
+        }
+        if let Some(message) = failure {
+            log::warn!(
+                "Hydra startup probe failed for {} on {}: {}",
+                delegate.unwrap_or("default delegate"),
+                stage_path.display(),
+                message
+            );
+            *hydra_startup = Some(HydraStartupState::Failed(HydraStartupFailure {
+                stage_path: stage_path.to_path_buf(),
+                delegate: delegate.map(std::string::ToString::to_string),
+                message,
+            }));
+        }
+
+        match hydra_startup.as_ref() {
+            Some(HydraStartupState::Running(probe)) => {
+                let elapsed = probe.started_at.elapsed().as_secs_f32();
+                let detail = format!("Checking HydraNSI outside the UI process ({elapsed:.1}s).");
+                Self::draw_hydra_startup_overlay(ui, rect, "Starting 3Delight", &detail, false);
+            }
+            Some(HydraStartupState::Failed(failure)) => {
+                let retry = Self::draw_hydra_startup_overlay(
+                    ui,
+                    rect,
+                    "3Delight did not start",
+                    &failure.message,
+                    true,
+                );
+                if retry {
+                    *hydra_startup = None;
+                }
+            }
+            None => {}
+        }
+        false
+    }
+
     /// Render the Hydra preview into the central viewport, full-size,
     /// in place of the wgpu painter. Solaris-style mode swap: orbit /
     /// zoom input still drives `vp.camera` (so flipping back to wgpu
@@ -4335,6 +4614,7 @@ impl App {
         hydra_slot: &mut Option<crate::hydra_view::HydraView>,
         hydra_egui_tex: &mut Option<egui::TextureHandle>,
         hydra_delegate: &mut Option<String>,
+        hydra_startup: &mut Option<HydraStartupState>,
         hydra_paint_cache_dir: &mut Option<std::path::PathBuf>,
         hydra_paint_sync_seq: &mut u64,
         hydra_paint_sync_status: &mut Option<String>,
@@ -4408,6 +4688,7 @@ impl App {
                 );
                 *hydra_slot = None;
                 *hydra_egui_tex = None;
+                *hydra_startup = None;
             }
         }
 
@@ -4416,12 +4697,28 @@ impl App {
         // implementation — the only thing that changed is where the
         // rect comes from.
         if hydra_slot.is_none() {
+            let explicit_delegate = hydra_delegate.as_deref().filter(|id| !id.is_empty());
+            let inferred_delegate = explicit_delegate
+                .is_none()
+                .then(|| {
+                    crate::hydra_view::HydraView::list_delegates()
+                        .into_iter()
+                        .next()
+                })
+                .flatten();
+            let startup_delegate = explicit_delegate.or(inferred_delegate.as_deref());
+            if !Self::ensure_hydra_startup_ready(ui, rect, path, startup_delegate, hydra_startup) {
+                let _ = request_swap_renderer;
+                let _ = frame;
+                return None;
+            }
             log::info!("Hydra: opening stage {}", path.display());
             match crate::hydra_view::HydraView::new_with_delegate(path, hydra_delegate.as_deref()) {
                 Ok(mut v) => {
                     log::info!("Hydra: stage opened OK, size {}x{}", w, h);
                     // Match the wgpu side's warm-orange selection tint.
                     v.set_selection_color([1.0, 0.55, 0.15, 1.0]);
+                    *hydra_startup = None;
                     *hydra_slot = Some(v);
                 }
                 Err(e) => {
@@ -4473,6 +4770,17 @@ impl App {
             .clone()
             .unwrap_or_else(|| current_delegate.clone());
         if !desired_delegate.is_empty() && desired_delegate != current_delegate {
+            if !Self::ensure_hydra_startup_ready(
+                ui,
+                rect,
+                path,
+                Some(&desired_delegate),
+                hydra_startup,
+            ) {
+                let _ = request_swap_renderer;
+                let _ = frame;
+                return None;
+            }
             // Breadcrumb the switch — on Windows the delegate change
             // can trigger a native HgiGL crash on the next render, and
             // the console-less release build otherwise vanishes with no
