@@ -1,0 +1,192 @@
+forge-paint — 3Delight (hdNSI) works on macOS, fails on Windows
+================================================================
+Status: 2026-06-09 — FIXED in hydra-rs 0.0.11 (local working tree), verified
+end-to-end on the Windows box. Remaining: commit/push, publish hydra-rs
+0.0.11 to crates.io, re-run the windows-build workflow (include_hdnsi=true).
+
+SUMMARY
+-------
+The 3Delight Hydra render delegate (HdNSIRendererPlugin) rendered fine in
+forge-paint on macOS but failed on Windows: the out-of-process startup probe
+exited with code 3 and the viewport fell back to Storm-only.
+
+Root cause was a platform graphics-API difference. hdNSI requires a GPU
+graphics device (an Hgi) to load; macOS provides one headlessly (Metal) for
+free, Windows (OpenGL) does not. FIX: the bridge now creates a hidden
+window + WGL context on Windows so it can take the exact same
+gpuEnabled=true HGI path macOS uses. Verified on this box: the probe now
+exits 0 for both HdNSIRendererPlugin and HdStormRendererPlugin.
+
+
+SYMPTOM (Windows, pre-fix)
+--------------------------
+forge-paint.log, with the 0.0.10 diagnostics:
+
+  [hydra-bridge] create_renderer: new UsdImagingGLEngine(delegate=HdNSIRendererPlugin, gpuEnabled=false, no HGI)
+  [hydra-bridge] create_renderer: current renderer =                 <-- EMPTY
+  [hydra-bridge] create_renderer: SetRendererAov(color)
+  [hydra-bridge] create_renderer: WARNING SetRendererAov(color) returned false
+  ERROR forge_paint  ... SetRendererAov(color) failed for renderer ''
+  WARN  forge_paint::app ... 3Delight startup check failed (exit code 3).
+
+"current renderer" empty  =>  the hdNSI delegate never loaded.
+
+POST-FIX trail from the same probe (captured on this box, 2026-06-09):
+
+  [hydra-bridge] create_renderer: ensure hidden WGL context
+  [hydra-bridge] wgl: hidden GL context ready (4.6.0 Compatibility Profile Context 25.8.1.250617)
+  [hydra-bridge] create_renderer: Hgi::CreatePlatformDefaultHgi
+  [hydra-bridge] create_renderer: Hgi OK (OpenGL)
+  [hydra-bridge] create_renderer: new UsdImagingGLEngine
+  [hydra-bridge] create_renderer: current renderer = HdStormRendererPlugin
+  [hydra-bridge] create_renderer: SetRendererAov(color)
+  [hydra-bridge] create_renderer: SetRendererPlugin(HdNSIRendererPlugin)
+  [hydra-bridge] create_renderer: SetRendererPlugin returned OK
+  [hydra-bridge] create_renderer: done
+  ... Hydra startup probe OK for HdNSIRendererPlugin in 2.66s  (exit 0)
+
+
+ROOT CAUSE (unchanged analysis, now confirmed)
+----------------------------------------------
+1. forge-paint's Hydra bridge (rust-usd/hydra-rs/cpp/hydra_bridge.cpp,
+   create_renderer) builds a pxr::UsdImagingGLEngine to drive Hydra.
+
+2. On Windows it used to take a "no-HGI" path:
+       UsdImagingGLEngine(HdDriver(), "HdNSIRendererPlugin", gpuEnabled=false)
+   (added to dodge a Windows hang during Hgi creation).
+
+3. UsdImagingGLEngine::SetRendererPlugin gates loading an explicit delegate
+   on plugin->IsSupported(_gpuEnabled). With gpuEnabled=false, hdNSI's
+   IsSupported(false) returns FALSE. The gate fails, no delegate loads, no
+   color AOV buffer exists, the probe throws and exits 3.
+
+4. The Hgi-creation hang the old dodge avoided: on Windows the platform-
+   default Hgi is HgiGL, and HgiGL does not create a GL device — it adopts
+   whatever GL context is current on the calling thread and touches driver
+   entry points immediately. Headless processes (the probe; forge-paint
+   itself renders via wgpu) never have one, so creation died in driver
+   code. macOS never hits this: HgiMetal creates its own headless device.
+
+
+THE FIX (implemented in hydra-rs 0.0.11)
+----------------------------------------
+Give Windows what macOS gets for free: a real but invisible GPU context.
+
+hydra_bridge.cpp now creates, once per process, a never-shown window and a
+WGL context (wglCreateContextAttribsARB, 4.5 COMPATIBILITY profile, legacy
+wglCreateContext fallback), makes it current on the calling thread, and
+then takes the same gpuEnabled=true / CreatePlatformDefaultHgi path macOS
+uses. hdNSI passes the IsSupported(true) gate, loads, and renders on the
+CPU; the GL context only exists so HgiGL can be constructed (presentation
+stays disabled). The context's currency is re-asserted in render_color(),
+set_renderer_plugin(), and ~Renderer() (HgiGL teardown also makes GL
+calls). If no usable >= 4.5 GL context can be created (remote desktop,
+no driver), the bridge falls back to the old no-HGI route and leaves a
+breadcrumb naming why.
+
+Two details that cost a debugging round each, recorded for posterity:
+
+* COMPATIBILITY profile is load-bearing. A 4.5 CORE context lets the
+  delegate load but every draw errors out (empty image): HgiGL's
+  ScopedStateHolder saves/restores GL_POINT_SMOOTH / GL_POINT_SPRITE,
+  which are removed from core (GL_INVALID_ENUM), and Storm's indirect
+  draws fail on strict core. Everything USD normally runs on (usdview's
+  Qt contexts, GarchGLDebugWindow) is compatibility profile.
+
+* C getenv vs Rust set_var: the bridge's breadcrumbs gate on
+  getenv("FORGE_PAINT_HYDRA_LOG"). The Windows CRT snapshots the
+  environment at process start, so std::env::set_var from Rust inside the
+  same process is invisible to the C++ side. Breadcrumbs appear when the
+  env var is set in the PARENT (the app sets it on the probe child via
+  Command::env; for manual runs, set it in the shell first).
+
+Build-side changes: hydra-rs/build.rs links user32 + gdi32 + opengl32 on
+Windows targets. hydra-rs version 0.0.10 -> 0.0.11; forge-paint pins
+hydra-rs = "0.0.11".
+
+
+VERIFIED (this box, AMD Radeon RX Vega, driver 25.8.1, 2026-06-09)
+------------------------------------------------------------------
+1. MSVC compile check of hydra_bridge.cpp against USD headers: clean.
+2. Standalone WGL probe (same code): 4.6 compat context comes up headless.
+3. hydra-rs hydra_render example, headless Storm, local USD 25.11:
+   exit 0, test sphere renders, zero GL errors. (Impossible pre-fix —
+   CreatePlatformDefaultHgi could not come up headless on Windows.)
+4. Real forge-paint.exe probe, HdStormRendererPlugin: exit 0 in 0.80s.
+5. Real forge-paint.exe probe, HdNSIRendererPlugin (hdNSI built from
+   HydraNSI source against local USD 25.11 + installed 3Delight 2.9.199):
+   exit 0 in 2.66s. The pre-fix failure is reproduced as fixed.
+
+CI remains the authoritative test for the SHIPPED artifact (USD 25.05,
+--no-python), but local end-to-end hdNSI testing now WORKS — see below.
+
+
+LOCAL END-TO-END TEST RECIPE (Windows box)
+------------------------------------------
+The old "local hdNSI testing is unreliable" caveat is gone: build hdNSI
+from source against the local USD and the whole stack runs locally.
+
+Build forge-paint against local USD 25.11 (python-enabled):
+  $env:USD_INSTALL_DIR = "C:\Users\voidr\usd"
+  $env:USD_LIB_PREFIX = "usd_"
+  $env:USD_LINK_PYTHON = "lib"
+  $env:USD_PYTHON_INCLUDE_DIR = "$env:LOCALAPPDATA\Programs\Python\Python313\include"
+  $env:USD_PYTHON_LIB_DIR = "$env:LOCALAPPDATA\Programs\Python\Python313\libs"
+  $env:USD_PYTHON_LIB_NAME = "python313"
+  $env:CXXFLAGS = "/std:c++17 /Zc:__cplusplus /EHsc /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_USE_MATH_DEFINES"
+  cargo build --release        # [patch.crates-io] uses ../rust-usd sources
+
+Build hdNSI against the same USD (one-time, reusable):
+  git clone --depth 1 https://gitlab.com/3Delight/HydraNSI.git <src>
+  cmake -S <src> -B <build> -G "Visual Studio 17 2022" -A x64 `
+    -Dpxr_DIR="C:\Users\voidr\usd" -DCMAKE_PREFIX_PATH="C:\Users\voidr\usd" `
+    -DOpenSubdiv_ROOT="C:\Users\voidr\usd"
+  cmake --build <build> --config Release --parallel
+  cmake --install <build> --config Release --prefix <install>
+  # PXR_PLUGINPATH_NAME entry: <install>\hdNSI\resources
+
+Run the probe:
+  $env:PATH = "C:\Users\voidr\usd\lib;C:\Users\voidr\usd\bin;" +
+              "$env:LOCALAPPDATA\Programs\Python\Python313;" +
+              "C:\Program Files\3Delight\bin;$env:PATH"
+  $env:DELIGHT = "C:\Program Files\3Delight"
+  $env:PXR_PLUGINPATH_NAME = "<install>\hdNSI\resources"
+  $env:FORGE_PAINT_HYDRA_LOG = "$env:TEMP\hydra_bridge_probe.log"  # breadcrumbs
+  $env:FORGE_PAINT_HYDRA_PROBE = "1"
+  $env:FORGE_PAINT_HYDRA_PROBE_STAGE = "<repo>\assets\default_mesh\default.usda"
+  $env:FORGE_PAINT_HYDRA_PROBE_DELEGATE = "HdNSIRendererPlugin"
+  target\release\forge-paint.exe        # exit 0 = pass, 3 = fail
+
+(The locally-built exe links USD 25.11, so the 25.05-built hdNSI bundled in
+release zips still won't load into it — build hdNSI against the matching
+USD as above. The artifact zip pairing stays 25.05 + 25.05 via CI.)
+
+
+SHIP CHECKLIST
+--------------
+1. Commit rust-usd (hydra_bridge.cpp/.h, build.rs, Cargo.toml 0.0.11) and
+   forge-paint (Cargo.toml + Cargo.lock pin 0.0.11, this doc).
+2. cargo publish hydra-rs 0.0.11 (CI builds from crates.io — publish FIRST).
+3. Actions -> windows-build -> Run workflow, include_hdnsi=true.
+4. Re-run the repro probe against the new artifact; expect exit 0.
+5. Optional follow-up: with the bridge fixed, FORGE_PAINT_ENABLE_STORM's
+   default-off gating on Windows (src/hydra_view.rs) may no longer be
+   needed — Storm passed the probe here. Flip after the CI artifact
+   confirms on a second machine.
+
+
+KEY FACTS / REFERENCES
+----------------------
+* Fixed code: rust-usd/hydra-rs/cpp/hydra_bridge.cpp — hidden-WGL helpers
+  (create_hidden_gl_context / ensure_hidden_gl_context_current) +
+  create_renderer / render_color / set_renderer_plugin / ~Renderer.
+* USD gate: UsdImagingGLEngine::SetRendererPlugin -> plugin->IsSupported(
+  _gpuEnabled)  (OpenUSD 25.05, pxr/usdImaging/usdImagingGL/engine.cpp).
+* HgiGL floor: GL 4.5, compatibility profile required in practice
+  (GL_POINT_SMOOTH/GL_POINT_SPRITE state save in HgiGL_ScopedStateHolder).
+* Versions: bindings + CI target OpenUSD 25.05 (--no-python). Local dev USD
+  C:\Users\voidr\usd is 25.11 (python313-enabled); USD source at
+  C:\Users\voidr\usd-src\v25.11.
+* Crates: rust-usd 0.0.4 (unchanged); hydra-rs 0.0.11 (this fix).
+* Repos: github.com/voidreamer/forge-paint (public);
+  github.com/voidreamer/rust-usd (private).
