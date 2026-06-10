@@ -708,7 +708,8 @@ fn relaunch_from_bundled_usd_lib() -> Option<i32> {
         Err(err) => {
             // The logger isn't up yet (it initializes after this), so
             // stderr is the best signal available; falling through to
-            // the in-process setup keeps .bat launches working.
+            // the in-process setup keeps launches with a preconfigured
+            // shell environment working.
             eprintln!(
                 "forge-paint: bundle relaunch via {} failed: {err}",
                 child_exe.display()

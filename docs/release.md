@@ -3,9 +3,9 @@
 The release zips are self-contained for the default renderer set:
 
 - `forge-paint(.exe)`
-- Windows only: root-level OpenUSD DLL copies for direct EXE launch, a second
-  `usd/lib/forge-paint.exe` copy the root EXE relaunches at startup (see
-  below), plus `forge-paint.bat` for explicit USD / 3Delight environment setup
+- Windows only: root-level OpenUSD DLL copies for direct EXE launch, and a
+  second `usd/lib/forge-paint.exe` copy the root EXE relaunches at startup
+  (see below)
 - `usd/` with OpenUSD runtime libraries, plugInfo files, file-format plugins, and Hydra/Storm
 - `assets/` with starter meshes, materials, HDRI, stencils, and displacement textures
 - `tools/` with small utility scripts such as `obj_to_usd.py`
@@ -34,8 +34,11 @@ On Windows, DLLs imported by `forge-paint.exe` must be discoverable before
 `main()` runs, so the workflow copies the top-level OpenUSD runtime DLLs from
 `usd/bin` and `usd/lib` beside the EXE. The full `usd/` tree is still bundled
 because plugInfo discovery and plug-in-relative library paths depend on that
-layout. The generated `forge-paint.bat` launcher also prepends USD and 3Delight
-runtime paths for testers who prefer the old explicit shell setup.
+layout. There is no launcher script: environment variables set in the shell
+before starting the EXE (`DELIGHT`, `FORGE_PAINT_3DELIGHT_DIR`,
+`PXR_PLUGINPATH_NAME`, `PATH`) are merged into the bundle environment, which
+covers the explicit-setup / debugging use case the old `forge-paint.bat`
+served (now retired to `attic/`).
 
 The app must not actually *run* from the bundle root, though: USD's plug
 registry later `LoadLibrary()`s `usd/lib/usd_*.dll` by absolute path, which
@@ -48,8 +51,8 @@ The workflow therefore stages a second EXE copy at `usd/lib/forge-paint.exe`;
 the root EXE detects the bundle layout, computes the environment, relaunches
 that copy with the environment applied, and forwards its exit code. Imports
 and plug loads then resolve to the same `usd/lib` files, and the environment
-exists before USD initializes — for double-clicks, `forge-paint.bat`, and
-manual probe runs alike.
+exists before USD initializes — for double-clicks and manual probe runs
+alike.
 
 Storm is bundled with OpenUSD and shows in the delegate picker by default.
 On Windows, every Hydra delegate switch is guarded by a short out-of-process

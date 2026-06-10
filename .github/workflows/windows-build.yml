@@ -244,8 +244,6 @@ jobs:
             throw "Windows package is missing root-level usd_usdShade.dll; direct EXE launch would fail before main()."
           }
 
-          Copy-Item .github\scripts\forge-paint-windows.bat "$stage\forge-paint.bat"
-
           # Report final bundle size so future runs can sanity-check
           # whether new bloat has crept in.
           $usdSize = (Get-ChildItem -Path "$stage\usd" -Recurse -File `
@@ -291,9 +289,10 @@ jobs:
           that Windows needs beside the EXE, and the app self-locates
           the bundled `usd/` directory at startup for USD plug-ins.
 
-          A forge-paint.bat launcher is also included. Use it when you
-          want an explicit shell setup for USD and 3Delight before the
-          EXE starts, or when debugging custom installed runtimes.
+          Custom setups don't need a launcher script: environment
+          variables set in your shell before starting the EXE (DELIGHT,
+          FORGE_PAINT_3DELIGHT_DIR, PXR_PLUGINPATH_NAME, PATH) are
+          merged into the bundle environment, not replaced.
 
           If the app fails to start with "VCRUNTIME140.dll" or
           "MSVCP140.dll" missing, install the Microsoft Visual C++

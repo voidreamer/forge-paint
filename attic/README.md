@@ -8,6 +8,13 @@ attempt without spelunking `git log`.
 
 ## Current contents
 
-(empty — the Hydra preview wrapper was lifted back into `src/` once
-the orientation flip and lighting parity were fixed in hydra-rs 0.0.3
-and the wgpu studio rig was wired through to `set_rig`.)
+- `forge-paint-windows.bat` — shell launcher the Windows zips shipped
+  as `forge-paint.bat`. It existed to set PATH / PXR_PLUGINPATH_NAME /
+  DELIGHT *before* the EXE started, back when direct launches couldn't
+  self-configure (USD captures its plugin paths pre-`main()`, and the
+  bundle root double-loaded the USD DLLs). Retired once the root EXE
+  began relaunching `usd\lib\forge-paint.exe` with the bundle
+  environment applied at process start — see
+  `relaunch_from_bundled_usd_lib` in `src/main.rs`. Shell-set env vars
+  are still honored (merged, not replaced), so the bat's debugging use
+  case needs no script.
