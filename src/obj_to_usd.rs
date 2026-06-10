@@ -1,3 +1,4 @@
+use crate::usd_out::{fmt_f32, sanitize_identifier, write_usda_document};
 use anyhow::{anyhow, bail, Context, Result};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -212,10 +213,6 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
 }
 
 fn write_usda(source: &Path, dest: &Path, vertices: &[FaceVertex]) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-
     let mesh_name = source
         .file_stem()
         .and_then(|s| s.to_str())
@@ -244,7 +241,7 @@ fn write_usda(source: &Path, dest: &Path, vertices: &[FaceVertex]) -> Result<()>
     writeln!(text, "    }}")?;
     writeln!(text, "}}")?;
 
-    std::fs::write(dest, text).with_context(|| format!("write {}", dest.display()))
+    write_usda_document(&text, dest)
 }
 
 fn write_face_vertex_counts(text: &mut String, triangles: usize) -> Result<()> {
@@ -320,29 +317,6 @@ fn write_uvs(text: &mut String, vertices: &[FaceVertex]) -> Result<()> {
     writeln!(text, "            interpolation = \"faceVarying\"")?;
     writeln!(text, "        )")?;
     Ok(())
-}
-
-fn fmt_f32(value: f32) -> String {
-    if value == 0.0 {
-        "0".to_string()
-    } else {
-        format!("{value:.9}")
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_string()
-    }
-}
-
-fn sanitize_identifier(input: &str) -> String {
-    let mut out = String::new();
-    for (i, c) in input.chars().enumerate() {
-        let valid = c == '_' || c.is_ascii_alphanumeric();
-        if i == 0 && c.is_ascii_digit() {
-            out.push('_');
-        }
-        out.push(if valid { c } else { '_' });
-    }
-    out
 }
 
 #[cfg(test)]

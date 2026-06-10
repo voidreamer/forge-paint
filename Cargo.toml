@@ -18,7 +18,7 @@ texture-baker = { path = "crates/texture-baker" }
 # to the C++ ForgeResolver loaded via PXR_PLUGINPATH_NAME (set by
 # anvil). See anvil/forge-paint.yaml for the build env vars rust-usd's
 # own build.rs reads.
-rust-usd = "0.0.4"
+rust-usd = "0.0.5"
 # hydra-rs is the sibling Hydra (Storm) binding from the same repo.
 # Public dep is a version range; `[patch.crates-io]` at the bottom of
 # this file redirects to the local ../rust-usd/hydra-rs checkout, so
@@ -51,6 +51,9 @@ anyhow = "1"
 thiserror = "2"
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }
+# glTF / GLB parsing for the static model -> USD converter (same crate
+# texture-baker already uses for its bake-mesh loader).
+gltf = "1"
 # exr is pulled in directly so we can bypass the `image` crate's strict
 # channel/memory assumptions (needed for Poly Haven single-channel and 8K
 # normal-map EXRs).

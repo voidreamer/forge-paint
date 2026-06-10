@@ -61,19 +61,34 @@ desktop, missing driver) gets a viewport overlay naming the failure instead
 of a hang or crash. Set `FORGE_PAINT_ENABLE_STORM=0` to hide Storm
 explicitly.
 
-## OBJ Import
+## Model Import (OBJ / glTF / Alembic)
 
-forge-paint is still USD-first. When the user opens or drops an `.obj`, the app
-asks where to save a converted `.usda`, runs the built-in static OBJ converter,
-and opens the result. FBX and other interchange formats are intentionally not
+forge-paint is still USD-first. When the user opens or drops an `.obj`,
+`.gltf`/`.glb`, or `.abc`, the app asks where to save a converted USD file and
+opens the result. The save dialog defaults to binary `.usdc` — ASCII `.usda`
+balloons with vertex count and parses slower, so text output is the opt-in
+now, not the default. FBX and other interchange formats are intentionally not
 handled yet; convert those externally to USD.
 
-The built-in converter supports positions, normals, UVs, polygon faces, negative
-OBJ indices, and fan triangulation. It ignores `.mtl` material libraries for
-now. The same minimal converter is available as:
+- **OBJ** goes through the built-in static converter: positions, normals, UVs,
+  polygon faces, negative OBJ indices, fan triangulation. `.mtl` material
+  libraries are ignored for now.
+- **glTF/GLB** goes through a second built-in converter with the same
+  geometry-only scope: the default scene's node transforms are baked into the
+  points, each triangle primitive becomes a `Mesh` prim, UVs are flipped from
+  glTF's top-left origin to USD's bottom-left `st`, and materials, skins, and
+  animations are ignored.
+- **Alembic** is re-encoded through the USD runtime itself (`SdfLayer`
+  export), so whatever the bundled `usdAbc` plugin reads — including time
+  samples — lands in the output. CI builds OpenUSD with `--alembic`
+  (Ogawa-only, no HDF5); a local USD install without the plugin reports a
+  clear error instead.
+
+The same conversions are scriptable without the GUI:
 
 ```bash
-python3 tools/obj_to_usd.py model.obj model.usda
+forge-paint convert model.glb model.usdc
+python3 tools/obj_to_usd.py model.obj model.usda   # text-only OBJ fallback
 ```
 
 ## 3Delight

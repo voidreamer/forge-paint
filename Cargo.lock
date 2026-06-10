@@ -1412,6 +1412,7 @@ dependencies = [
  "env_logger",
  "exr",
  "glam",
+ "gltf",
  "half",
  "hydra-rs",
  "image",
@@ -3293,7 +3294,7 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
 name = "rust-usd"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "cxx",
  "cxx-build",

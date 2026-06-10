@@ -61,7 +61,7 @@ jobs:
         with:
           path: ${{ env.USD_INSTALL_DIR }}
           # Bump the trailing -vN any time the build flags below change.
-          key: openusd-${{ env.USD_VERSION }}-macos-arm64-no-python-imaging-v1
+          key: openusd-${{ env.USD_VERSION }}-macos-arm64-no-python-imaging-alembic-v1
 
       - name: Checkout OpenUSD source
         if: steps.cache-usd.outputs.cache-hit != 'true'
@@ -77,10 +77,13 @@ jobs:
         # hydra-rs links Hydra / UsdImagingGL and the release bundle must
         # include hdStorm. We still skip Python, tests, examples, docs and
         # usdview to keep the CI runtime and artifact size under control.
+        # --alembic builds the usdAbc file-format plugin (Ogawa-only, no
+        # HDF5) so .abc files can be opened/converted as USD layers.
         run: |
           python openusd-src/build_scripts/build_usd.py \
             --no-python --no-tests \
             --no-examples --no-tutorials --no-docs --no-usdview \
+            --alembic \
             "$USD_INSTALL_DIR"
 
       - name: Save OpenUSD install
@@ -88,7 +91,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.USD_INSTALL_DIR }}
-          key: openusd-${{ env.USD_VERSION }}-macos-arm64-no-python-imaging-v1
+          key: openusd-${{ env.USD_VERSION }}-macos-arm64-no-python-imaging-alembic-v1
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -176,11 +179,13 @@ jobs:
 
             xattr -dr com.apple.quarantine forge-paint usd/
 
-          Opening files: drag-and-drop a .usd/.usda/.usdc/.usdz or .obj
-          onto the window, or use File > Open. OBJ files
-          are converted to a .usda file before loading. forge:// URIs
-          only resolve when launched through anvil; standalone runs are
-          filesystem-only.
+          Opening files: drag-and-drop a .usd/.usda/.usdc/.usdz, .obj,
+          .gltf/.glb, or .abc onto the window, or use File > Open.
+          OBJ and glTF convert through built-in static converters;
+          Alembic re-encodes through the bundled usdAbc plugin. All
+          three ask where to save the converted USD (binary .usdc by
+          default) and then open it. forge:// URIs only resolve when
+          launched through anvil; standalone runs are filesystem-only.
 
           Hydra/Storm is bundled through OpenUSD. 3Delight is optional:
           install 3Delight separately and add a compatible hdNSI plugin

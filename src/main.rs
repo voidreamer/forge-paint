@@ -10,6 +10,7 @@ mod camera;
 mod env;
 mod export;
 mod fxaa;
+mod gltf_to_usd;
 mod hydra_view;
 mod lights;
 mod material_graph;
@@ -25,6 +26,7 @@ mod stage_browser;
 mod tangents;
 mod undo;
 mod usd;
+mod usd_out;
 mod usdz;
 mod viewport;
 mod wireframe;
@@ -59,6 +61,74 @@ enum Cmd {
     /// Bake mesh maps (AO, normal, curvature, position, …) headlessly.
     /// Drop-in compatible with the standalone `texture-baker` CLI.
     Bake(bake_cli::BakeArgs),
+
+    /// Convert a model file to USD headlessly. OBJ and glTF/GLB go
+    /// through the built-in static converters; Alembic (and USD
+    /// itself) are re-encoded through the USD runtime, which needs
+    /// the usdAbc plugin for .abc input. The output format follows
+    /// the destination extension: .usd/.usdc = crate binary
+    /// (recommended), .usda = text.
+    Convert(ConvertArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ConvertArgs {
+    /// Source model: .obj, .gltf, .glb, .abc, or any USD file.
+    source: PathBuf,
+    /// Destination USD file: .usdc / .usd (binary) or .usda (text).
+    dest: PathBuf,
+}
+
+fn run_convert(args: &ConvertArgs) -> i32 {
+    let ext = args
+        .source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let result = match ext.as_str() {
+        "obj" => obj_to_usd::convert_obj_to_usd(&args.source, &args.dest).map(|summary| {
+            format!("{} verts, {} tris", summary.vertices, summary.triangles)
+        }),
+        "gltf" | "glb" => {
+            gltf_to_usd::convert_gltf_to_usd(&args.source, &args.dest).map(|summary| {
+                format!(
+                    "{} meshes, {} verts, {} tris",
+                    summary.meshes, summary.vertices, summary.triangles
+                )
+            })
+        }
+        // Anything USD itself can read — .abc through the usdAbc
+        // plugin, or a USD file being re-encoded text<->binary.
+        "abc" | "usd" | "usda" | "usdc" => {
+            if rust_usd::convert_usd_file(&args.source, &args.dest) {
+                Ok("re-encoded through USD".to_string())
+            } else {
+                Err(anyhow::anyhow!(
+                    "USD could not open {} as a layer (for .abc this needs the usdAbc plugin) or could not write {}",
+                    args.source.display(),
+                    args.dest.display()
+                ))
+            }
+        }
+        other => Err(anyhow::anyhow!(
+            "unsupported source format `.{other}` (supported: .obj, .gltf, .glb, .abc, .usd*)"
+        )),
+    };
+    match result {
+        Ok(detail) => {
+            println!(
+                "converted {} -> {} ({detail})",
+                args.source.display(),
+                args.dest.display()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("conversion failed: {e:#}");
+            1
+        }
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -116,8 +186,10 @@ fn main() -> eframe::Result<()> {
 
     let args = Args::parse();
 
-    if let Some(Cmd::Bake(b)) = args.cmd {
-        std::process::exit(bake_cli::run(b));
+    match args.cmd {
+        Some(Cmd::Bake(b)) => std::process::exit(bake_cli::run(b)),
+        Some(Cmd::Convert(c)) => std::process::exit(run_convert(&c)),
+        None => {}
     }
 
     // Bump the wgpu device's per-buffer cap so dense meshes

@@ -269,6 +269,11 @@ pub struct App {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConvertibleModelKind {
     Obj,
+    Gltf,
+    /// Converted by re-encoding through the USD runtime, which needs
+    /// the usdAbc file-format plugin (bundled in CI builds via
+    /// `build_usd.py --alembic`).
+    Alembic,
 }
 
 impl ConvertibleModelKind {
@@ -280,6 +285,8 @@ impl ConvertibleModelKind {
             .as_deref()
         {
             Some("obj") => Some(Self::Obj),
+            Some("gltf") | Some("glb") => Some(Self::Gltf),
+            Some("abc") => Some(Self::Alembic),
             _ => None,
         }
     }
@@ -287,6 +294,8 @@ impl ConvertibleModelKind {
     fn label(self) -> &'static str {
         match self {
             Self::Obj => "OBJ",
+            Self::Gltf => "glTF",
+            Self::Alembic => "Alembic",
         }
     }
 }
@@ -3429,7 +3438,11 @@ fn is_usd_stage_path(path: &Path) -> bool {
 
 fn default_converted_usd_path(source: &Path) -> PathBuf {
     let mut out = source.to_path_buf();
-    out.set_extension("usda");
+    // Crate binary by default: ASCII .usda balloons with vertex count
+    // (every float spelled out in text) and parses slower; .usdc is
+    // the production encoding. The save dialog still offers .usda for
+    // anyone who wants a diffable file.
+    out.set_extension("usdc");
     out
 }
 
@@ -3839,9 +3852,14 @@ impl App {
 
     fn open_stage_dialog(&mut self, frame: &eframe::Frame) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("USD / OBJ", &["usd", "usda", "usdc", "usdz", "obj"])
+            .add_filter(
+                "3D files",
+                &["usd", "usda", "usdc", "usdz", "obj", "gltf", "glb", "abc"],
+            )
             .add_filter("USD", &["usd", "usda", "usdc", "usdz"])
             .add_filter("OBJ", &["obj"])
+            .add_filter("glTF", &["gltf", "glb"])
+            .add_filter("Alembic", &["abc"])
             .set_title("Open")
             .pick_file()
         else {
@@ -3861,7 +3879,7 @@ impl App {
             return;
         }
         self.status = format!(
-            "Unsupported file type: {}. Choose a USD file directly, or choose OBJ to convert.",
+            "Unsupported file type: {}. Choose a USD file directly, or OBJ / glTF / GLB / Alembic to convert.",
             path.display()
         );
     }
@@ -3869,8 +3887,8 @@ impl App {
     fn convert_model_dialog(&mut self, frame: &eframe::Frame, request: PendingModelConversion) {
         let suggested = default_converted_usd_path(&request.source);
         let mut dialog = rfd::FileDialog::new()
-            .add_filter("USDA", &["usda"])
-            .add_filter("USD", &["usd", "usda", "usdc"])
+            .add_filter("USD binary", &["usdc", "usd"])
+            .add_filter("USDA text", &["usda"])
             .set_title("Save converted USD");
         if let Some(parent) = suggested.parent() {
             dialog = dialog.set_directory(parent);
@@ -3906,6 +3924,45 @@ impl App {
                         self.status = format!("OBJ conversion failed: {e:#}");
                         log::error!("{}", self.status);
                     }
+                }
+            }
+            ConvertibleModelKind::Gltf => {
+                match crate::gltf_to_usd::convert_gltf_to_usd(&request.source, &dest) {
+                    Ok(summary) => {
+                        self.status = format!(
+                            "Converted {} to {} — {} meshes, {} verts, {} tris",
+                            request.source.display(),
+                            dest.display(),
+                            summary.meshes,
+                            summary.vertices,
+                            summary.triangles
+                        );
+                        log::info!("{}", self.status);
+                        self.load_usd(frame, dest);
+                    }
+                    Err(e) => {
+                        self.status = format!("glTF conversion failed: {e:#}");
+                        log::error!("{}", self.status);
+                    }
+                }
+            }
+            ConvertibleModelKind::Alembic => {
+                if rust_usd::convert_usd_file(&request.source, &dest) {
+                    self.status = format!(
+                        "Converted {} to {}",
+                        request.source.display(),
+                        dest.display()
+                    );
+                    log::info!("{}", self.status);
+                    self.load_usd(frame, dest);
+                } else {
+                    self.status = format!(
+                        "Alembic conversion failed: USD could not open {} as a layer. \
+                         This needs the usdAbc plugin in the USD runtime (bundled in \
+                         release builds; local USD installs may lack it).",
+                        request.source.display()
+                    );
+                    log::error!("{}", self.status);
                 }
             }
         }
