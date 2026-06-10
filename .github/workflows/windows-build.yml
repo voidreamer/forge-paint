@@ -213,6 +213,20 @@ jobs:
               | Remove-Item -Force -ErrorAction SilentlyContinue
           }
 
+          # Second EXE copy inside usd\lib. The bundle-root EXE only
+          # bootstraps: at startup it computes the bundle environment
+          # and relaunches THIS copy with that environment in place.
+          # Running the app from usd\lib means the import table and
+          # USD's plug registry resolve the SAME usd_*.dll files —
+          # launching from the bundle root instead double-loads
+          # OpenUSD (imports bind to the root-level DLL copies, plug
+          # later LoadLibrary()s the usd\lib set) and deadlocks inside
+          # Hgi::CreatePlatformDefaultHgi on the first Hydra render.
+          # It also guarantees PXR_PLUGINPATH_NAME exists before
+          # usd_plug.dll's init constructor captures it, which no
+          # in-process set_var after process start can do.
+          Copy-Item target\release\forge-paint.exe "$stage\usd\lib\forge-paint.exe"
+
           # Windows resolves DLLs imported by forge-paint.exe before
           # main() runs, so the app's self-locating PATH setup is too
           # late for direct EXE launches. Keep the USD runtime DLLs
@@ -251,11 +265,20 @@ jobs:
             Copy-Item docs\release.md "$stage\RELEASE.md"
           }
           if (Test-Path hdnsi-package) {
-            $hdnsiPlugInfo = Get-ChildItem -Path hdnsi-package -Recurse -Filter plugInfo.json -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match 'hdNSI' } |
-              Select-Object -First 1
-            if (-not $hdnsiPlugInfo) {
-              throw "hdnsi-package exists but does not contain an hdNSI plugInfo.json"
+            # Require the INSTALLED plugin layout, exactly what the
+            # plugInfo.json relative paths assume:
+            #   hdNSI\hdNSI.dll
+            #   hdNSI\resources\plugInfo.json
+            # A v0.0.11-era artifact staged the raw CMake build tree
+            # here instead; USD then registered the delegate from the
+            # stray top-level plugInfo.json but resolved LibraryPath to
+            # a nonexistent plugins\usd\hdNSI.dll, and 3Delight could
+            # never load ("The specified module could not be found").
+            foreach ($required in @("hdnsi-package\hdNSI\hdNSI.dll",
+                                    "hdnsi-package\hdNSI\resources\plugInfo.json")) {
+              if (-not (Test-Path $required)) {
+                throw "hdnsi-package is not an installed hdNSI layout: missing $required"
+              }
             }
             New-Item -ItemType Directory -Path "$stage\plugins\usd" -Force | Out-Null
             Copy-Item -Recurse hdnsi-package\* "$stage\plugins\usd"
@@ -283,12 +306,19 @@ jobs:
           only resolve when launched through anvil; standalone runs are
           filesystem-only.
 
-          Hydra/Storm is bundled through OpenUSD.
-          On Windows, Storm is hidden by default in forge-paint because
-          the current offscreen Hydra bridge can crash inside native
-          graphics code before the app can show an error. Set
-          FORGE_PAINT_ENABLE_STORM=1 before launch only if you want to
-          test that path explicitly.
+          Hydra/Storm is bundled through OpenUSD and shows up in the
+          renderer picker by default. The first time a Hydra delegate
+          is selected for a stage, forge-paint runs a short
+          out-of-process startup check; if your machine cannot bring
+          up an OpenGL context (remote desktop, missing driver), the
+          viewport shows what failed instead of freezing. Set
+          FORGE_PAINT_ENABLE_STORM=0 to hide Storm explicitly.
+
+          The root forge-paint.exe is a thin bootstrap: it relaunches
+          the copy at usd\lib\forge-paint.exe with the bundle
+          environment set up, so the USD runtime loads exactly once.
+          Launch either one; task manager showing two forge-paint
+          processes is expected.
 
           3Delight: install 3Delight on this machine, then restart
           forge-paint. If this zip contains plugins\usd\hdNSI, the app

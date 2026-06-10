@@ -62,6 +62,14 @@ enum Cmd {
 }
 
 fn main() -> eframe::Result<()> {
+    // Hand-off bundles must not run the app from the bundle root —
+    // OpenUSD would load twice and deadlock. Relaunch from usd\lib
+    // before anything touches USD. See the function comment.
+    #[cfg(windows)]
+    if let Some(code) = relaunch_from_bundled_usd_lib() {
+        std::process::exit(code);
+    }
+
     setup_bundled_usd_env();
 
     // On Windows release builds `windows_subsystem = "windows"` detaches
@@ -226,10 +234,17 @@ fn run_hydra_probe_from_env() -> Option<i32> {
 /// that directory is writable, else `<temp>/forge-paint.log`. Returns
 /// None only if neither is usable (logging then stays stderr-only).
 fn init_file_log() -> Option<std::path::PathBuf> {
-    let candidates = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|p| p.join("forge-paint.log")))
+    // FORGE_PAINT_LOG_FILE wins when set: the bundle relaunch parent
+    // pins the log beside the user-facing EXE so the relaunched child
+    // in usd\lib doesn't scatter logs into the USD runtime tree.
+    let candidates = std::env::var_os("FORGE_PAINT_LOG_FILE")
+        .map(std::path::PathBuf::from)
         .into_iter()
+        .chain(
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|p| p.join("forge-paint.log"))),
+        )
         .chain(std::iter::once(std::env::temp_dir().join("forge-paint.log")));
     for path in candidates {
         // Probe writability by opening in append/create mode.
@@ -520,77 +535,185 @@ fn usd_plugin_dll_search_dirs(plugin_paths: &[PathBuf]) -> Vec<PathBuf> {
 fn setup_bundled_usd_env() {
     #[cfg(any(windows, target_os = "macos"))]
     {
+        // The relaunched bundle child (Windows) already inherits the
+        // fully-formed environment from its parent. Recomputing here
+        // would anchor everything at usd\lib (where this copy lives)
+        // and prepend nonsense paths.
+        #[cfg(windows)]
+        if std::env::var_os("FORGE_PAINT_BUNDLE_BOOTSTRAPPED").is_some() {
+            return;
+        }
         let Ok(exe) = std::env::current_exe() else {
             return;
         };
         let Some(dir) = exe.parent() else {
             return;
         };
-        let usd = dir.join("usd");
-        if !usd.is_dir() {
-            return;
-        }
-        #[cfg(windows)]
-        let sep = ";";
-        #[cfg(not(windows))]
-        let sep = ":";
-        #[cfg(windows)]
-        let delight_roots = delight_install_roots(dir);
-        #[cfg(windows)]
-        if std::env::var_os("DELIGHT").is_none() {
-            if let Some(delight_root) = delight_roots.first() {
-                // SAFETY: still before any eframe threads spawn.
-                unsafe {
-                    std::env::set_var("DELIGHT", delight_root);
-                }
+        for (name, value) in compute_bundled_usd_env(dir) {
+            // SAFETY: called from main before any threads spawn — eframe's
+            // render thread only starts inside run_native(). Edition 2024
+            // marks env::set_var unsafe because of cross-thread races; we
+            // have none here.
+            //
+            // Windows caveat: this is best-effort only. USD captures
+            // PXR_PLUGINPATH_NAME inside an ARCH_CONSTRUCTOR while
+            // usd_plug.dll is loading (before main), and C-runtime
+            // getenv snapshots the environment at process start, so
+            // these set_var calls are invisible to both. Bundled runs
+            // therefore go through relaunch_from_bundled_usd_lib(),
+            // which applies this same environment to a child process
+            // where it IS present from the first instruction. This
+            // in-process path remains for macOS (where the bundled
+            // plugins are found via plug's library-relative search)
+            // and as a fallback for old zips without the usd\lib EXE.
+            unsafe {
+                std::env::set_var(name, value);
             }
         }
-        let mut plugin_paths = Vec::new();
-        push_usd_plugin_path_dirs(&mut plugin_paths, &usd.join("plugin").join("usd"));
-        push_usd_plugin_path_dirs(&mut plugin_paths, &usd.join("lib").join("usd"));
-        let optional_plugins = dir.join("plugins").join("usd");
-        push_usd_plugin_path_dirs(&mut plugin_paths, &optional_plugins);
-        #[cfg(windows)]
-        for delight_root in &delight_roots {
-            push_hdnsi_plugin_dirs_from_delight(&mut plugin_paths, delight_root);
+    }
+}
+
+/// Environment the self-contained bundle needs, computed against the
+/// bundle root `dir` (the directory holding the user-facing EXE, the
+/// `usd/` runtime tree, and the optional `plugins/usd/` extras).
+/// Returns an empty list when `dir` doesn't look like a bundle.
+#[cfg(any(windows, target_os = "macos"))]
+fn compute_bundled_usd_env(dir: &Path) -> Vec<(&'static str, std::ffi::OsString)> {
+    let mut vars = Vec::new();
+    let usd = dir.join("usd");
+    if !usd.is_dir() {
+        return vars;
+    }
+    #[cfg(windows)]
+    let sep = ";";
+    #[cfg(not(windows))]
+    let sep = ":";
+    #[cfg(windows)]
+    let delight_roots = delight_install_roots(dir);
+    #[cfg(windows)]
+    if std::env::var_os("DELIGHT").is_none() {
+        if let Some(delight_root) = delight_roots.first() {
+            vars.push(("DELIGHT", delight_root.clone().into_os_string()));
         }
-        dedup_paths(&mut plugin_paths);
-        let mut plugin_path = plugin_paths
+    }
+    let mut plugin_paths = Vec::new();
+    push_usd_plugin_path_dirs(&mut plugin_paths, &usd.join("plugin").join("usd"));
+    push_usd_plugin_path_dirs(&mut plugin_paths, &usd.join("lib").join("usd"));
+    let optional_plugins = dir.join("plugins").join("usd");
+    push_usd_plugin_path_dirs(&mut plugin_paths, &optional_plugins);
+    #[cfg(windows)]
+    for delight_root in &delight_roots {
+        push_hdnsi_plugin_dirs_from_delight(&mut plugin_paths, delight_root);
+    }
+    dedup_paths(&mut plugin_paths);
+    let mut plugin_path = plugin_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(sep);
+    if let Ok(existing) = std::env::var("PXR_PLUGINPATH_NAME") {
+        if !existing.is_empty() {
+            plugin_path.push_str(sep);
+            plugin_path.push_str(&existing);
+        }
+    }
+    vars.push(("PXR_PLUGINPATH_NAME", plugin_path.into()));
+    #[cfg(windows)]
+    {
+        let mut path_dirs = vec![usd.join("lib"), usd.join("bin")];
+        path_dirs.extend(usd_plugin_dll_search_dirs(&plugin_paths));
+        path_dirs.extend(delight_runtime_dirs(&delight_roots));
+        dedup_paths(&mut path_dirs);
+        let prefix = path_dirs
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
-            .join(sep);
-        if let Ok(existing) = std::env::var("PXR_PLUGINPATH_NAME") {
-            if !existing.is_empty() {
-                plugin_path.push_str(sep);
-                plugin_path.push_str(&existing);
-            }
-        }
-        // SAFETY: called from main before any threads spawn — eframe's
-        // render thread only starts inside run_native(). Edition 2024
-        // marks env::set_var unsafe because of cross-thread races; we
-        // have none here.
-        unsafe {
-            std::env::set_var("PXR_PLUGINPATH_NAME", plugin_path);
-        }
-        #[cfg(windows)]
-        {
-            let mut path_dirs = vec![usd.join("lib"), usd.join("bin")];
-            path_dirs.extend(usd_plugin_dll_search_dirs(&plugin_paths));
-            path_dirs.extend(delight_runtime_dirs(&delight_roots));
-            dedup_paths(&mut path_dirs);
-            let prefix = path_dirs
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(";");
-            let new_path = match std::env::var("PATH") {
-                Ok(p) if !p.is_empty() => format!("{prefix};{p}"),
-                _ => prefix,
-            };
-            unsafe {
-                std::env::set_var("PATH", new_path);
-            }
+            .join(";");
+        let new_path = match std::env::var("PATH") {
+            Ok(p) if !p.is_empty() => format!("{prefix};{p}"),
+            _ => prefix,
+        };
+        vars.push(("PATH", new_path.into()));
+    }
+    vars
+}
+
+/// Relaunch hand-off bundles from `usd\lib` so OpenUSD loads exactly
+/// once and the environment exists before USD initializes.
+///
+/// Two Windows-specific traps make running the bundle-root EXE
+/// directly unworkable:
+///
+/// 1. Double-loaded OpenUSD. The zip keeps copies of the USD runtime
+///    DLLs beside forge-paint.exe because the loader resolves the
+///    import table before main() runs. But USD's plug registry later
+///    LoadLibrary()s the same libraries by absolute path from
+///    `usd\lib\usd_*.dll`. The loader dedupes modules by path, not by
+///    name, so every USD module then exists twice in the process —
+///    duplicate type registries and all — and the first Hydra renderer
+///    bring-up deadlocks inside Hgi::CreatePlatformDefaultHgi.
+///
+/// 2. Too-late environment. USD captures PXR_PLUGINPATH_NAME in an
+///    ARCH_CONSTRUCTOR while usd_plug.dll loads (before main), and
+///    C-runtime getenv (the 3Delight runtime, the hydra bridge's log
+///    gate) snapshots the environment at process start. The set_var
+///    calls in setup_bundled_usd_env are invisible to both, which is
+///    why double-clicked artifacts saw zero USD plugins ("Available:
+///    []", Stage::open null) while forge-paint.bat launches worked.
+///
+/// Both disappear by relaunching the second EXE copy that CI places at
+/// `usd\lib\forge-paint.exe` with the bundle environment computed and
+/// applied to the child up front: the child's import table resolves
+/// from usd\lib — the same files plug loads later — and every
+/// constructor / getenv sees the right environment from the start.
+///
+/// Returns Some(child exit code) when the relaunch ran; None when this
+/// process should continue normally (dev runs, the relaunched child
+/// itself, or old zips without the usd\lib EXE copy).
+#[cfg(windows)]
+fn relaunch_from_bundled_usd_lib() -> Option<i32> {
+    if std::env::var_os("FORGE_PAINT_BUNDLE_BOOTSTRAPPED").is_some() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    if !dir.join("usd").is_dir() {
+        return None;
+    }
+    let child_exe = dir.join("usd").join("lib").join(exe.file_name()?);
+    if !child_exe.is_file() {
+        // Old zip layout without the usd\lib copy: fall through to the
+        // best-effort in-process setup (forge-paint.bat still works).
+        return None;
+    }
+
+    let mut cmd = std::process::Command::new(&child_exe);
+    cmd.args(std::env::args_os().skip(1));
+    cmd.env("FORGE_PAINT_BUNDLE_BOOTSTRAPPED", "1");
+    // Keep the log beside the user-facing EXE rather than in usd\lib.
+    // Handing the bridge's log variable to the child here (instead of
+    // via set_var inside the child) also makes it visible to the C++
+    // side's getenv, so bridge breadcrumbs work in the app process and
+    // not just in probe children.
+    let log_path = dir.join("forge-paint.log");
+    cmd.env("FORGE_PAINT_LOG_FILE", &log_path);
+    if std::env::var_os("FORGE_PAINT_HYDRA_LOG").is_none() {
+        cmd.env("FORGE_PAINT_HYDRA_LOG", &log_path);
+    }
+    for (name, value) in compute_bundled_usd_env(dir) {
+        cmd.env(name, value);
+    }
+    match cmd.status() {
+        Ok(status) => Some(status.code().unwrap_or(0)),
+        Err(err) => {
+            // The logger isn't up yet (it initializes after this), so
+            // stderr is the best signal available; falling through to
+            // the in-process setup keeps .bat launches working.
+            eprintln!(
+                "forge-paint: bundle relaunch via {} failed: {err}",
+                child_exe.display()
+            );
+            None
         }
     }
 }

@@ -3,8 +3,9 @@
 The release zips are self-contained for the default renderer set:
 
 - `forge-paint(.exe)`
-- Windows only: root-level OpenUSD DLL copies for direct EXE launch, plus
-  `forge-paint.bat` for explicit USD / 3Delight environment setup
+- Windows only: root-level OpenUSD DLL copies for direct EXE launch, a second
+  `usd/lib/forge-paint.exe` copy the root EXE relaunches at startup (see
+  below), plus `forge-paint.bat` for explicit USD / 3Delight environment setup
 - `usd/` with OpenUSD runtime libraries, plugInfo files, file-format plugins, and Hydra/Storm
 - `assets/` with starter meshes, materials, HDRI, stencils, and displacement textures
 - `tools/` with small utility scripts such as `obj_to_usd.py`
@@ -36,10 +37,26 @@ because plugInfo discovery and plug-in-relative library paths depend on that
 layout. The generated `forge-paint.bat` launcher also prepends USD and 3Delight
 runtime paths for testers who prefer the old explicit shell setup.
 
-Storm is bundled with OpenUSD, but forge-paint hides it by default on Windows
-because the current offscreen Hydra bridge can terminate inside native graphics
-code before Rust can surface an error. Set `FORGE_PAINT_ENABLE_STORM=1` before
-launch when intentionally testing Storm on Windows.
+The app must not actually *run* from the bundle root, though: USD's plug
+registry later `LoadLibrary()`s `usd/lib/usd_*.dll` by absolute path, which
+would coexist with the import-loaded root-level copies — two instances of
+every USD module in one process, which deadlocks inside
+`Hgi::CreatePlatformDefaultHgi` on the first Hydra render. USD also captures
+`PXR_PLUGINPATH_NAME` in a static constructor while `usd_plug.dll` loads
+(before `main()`), so in-process `set_var` can never feed plugin discovery.
+The workflow therefore stages a second EXE copy at `usd/lib/forge-paint.exe`;
+the root EXE detects the bundle layout, computes the environment, relaunches
+that copy with the environment applied, and forwards its exit code. Imports
+and plug loads then resolve to the same `usd/lib` files, and the environment
+exists before USD initializes — for double-clicks, `forge-paint.bat`, and
+manual probe runs alike.
+
+Storm is bundled with OpenUSD and shows in the delegate picker by default.
+On Windows, every Hydra delegate switch is guarded by a short out-of-process
+startup probe, so a machine where no usable GL context can come up (remote
+desktop, missing driver) gets a viewport overlay naming the failure instead
+of a hang or crash. Set `FORGE_PAINT_ENABLE_STORM=0` to hide Storm
+explicitly.
 
 ## OBJ Import
 
@@ -67,17 +84,20 @@ The intended shipping model is:
 2. The tester installs 3Delight normally.
 3. forge-paint discovers both pieces at startup.
 
-The app should work without 3Delight. On Windows, the delegate picker then
-stays on `wgpu painter` unless `FORGE_PAINT_ENABLE_STORM=1` is set; on other
-platforms it can still show Storm.
+The app should work without 3Delight. The delegate picker then shows Storm
+only (on all platforms).
 
 The Windows workflow has an optional `include_hdnsi` dispatch input. Manual
 builds use that input, and `v*` tag builds attempt the same optional packaging
 automatically. CI runs `.github/scripts/package-hdnsi-windows.ps1` after
-OpenUSD and forge-paint are built. The script clones HydraNSI, configures it with
-`pxr_DIR` pointing at the just-built OpenUSD package, builds the delegate, and
-stages the delegate under `plugins/usd/hdNSI`. It strips common 3Delight
-runtime files from the staged delegate folder; the release zip must not
+OpenUSD and forge-paint are built. The script clones HydraNSI, configures it
+with `pxr_DIR` pointing at the just-built OpenUSD package, builds the
+delegate, runs `cmake --install`, and stages the *installed* layout
+(`hdNSI/hdNSI.dll` + `hdNSI/resources/plugInfo.json`, plus `usdNSI/` when
+built) under `plugins/usd/`. Staging the installed layout matters: the
+plugInfo.json relative paths only resolve from there, and both the script and
+the workflow fail the build if the layout is wrong. The script strips common
+3Delight runtime files from the staged folder; the release zip must not
 redistribute 3Delight itself.
 
 That optional step still needs 3Delight at build time because HydraNSI compiles

@@ -88,25 +88,6 @@ function Find-PxrConfig {
   throw "Could not find pxrConfig.cmake under $Root"
 }
 
-function Find-HdNsiPluginRoot {
-  param([string]$BuildDir)
-
-  $plugInfo = Get-ChildItem -Path $BuildDir -Recurse -Filter plugInfo.json |
-    Where-Object { $_.FullName -match 'hdNSI' } |
-    Select-Object -First 1
-  if (-not $plugInfo) {
-    throw "Could not find hdNSI plugInfo.json under $BuildDir"
-  }
-
-  # HydraNSI's README documents builddir/output/hdNSI/resources as the
-  # PXR_PLUGINPATH_NAME entry, so the package root is one level above
-  # resources.
-  if ($plugInfo.Directory.Name -eq "resources") {
-    return (Split-Path $plugInfo.Directory.FullName -Parent)
-  }
-  return $plugInfo.Directory.FullName
-}
-
 $delightRoot = Find-DelightRoot
 if (-not $delightRoot) {
   Write-Host "Skipping optional hdNSI packaging; no 3Delight install or archive was found."
@@ -175,10 +156,41 @@ if ($LASTEXITCODE -ne 0) {
   throw "hdNSI build failed (exit $LASTEXITCODE)."
 }
 
-$pluginRoot = Find-HdNsiPluginRoot -BuildDir $build
-$dest = Join-Path $OutputDir "hdNSI"
-New-Item -ItemType Directory -Path $dest -Force | Out-Null
-Copy-Item -Recurse (Join-Path $pluginRoot "*") $dest
+# Run the actual install step and stage from the installed prefix. The
+# install layout is what the generated plugInfo.json's relative paths
+# assume (Root: "..", LibraryPath: "hdNSI.dll", ResourcePath:
+# "resources"):
+#   <prefix>\hdNSI\hdNSI.dll
+#   <prefix>\hdNSI\resources\plugInfo.json
+#   <prefix>\hdNSI\resources\osl\*.oso
+#   <prefix>\usdNSI\...           (when HydraNSI builds the schema lib)
+# An earlier revision of this script skipped the install and staged the
+# first plugInfo.json found in the raw CMake BUILD tree. That copy sits
+# one directory too high (next to Release\hdNSI.dll instead of inside
+# resources\), so USD registered HdNSIRendererPlugin from its metadata
+# but resolved LibraryPath to a nonexistent plugins\usd\hdNSI.dll and
+# the delegate failed to load with "The specified module could not be
+# found".
+$installPrefix = Join-Path $env:GITHUB_WORKSPACE "HydraNSI-install"
+if (Test-Path $installPrefix) {
+  Remove-Item -Recurse -Force $installPrefix
+}
+cmake --install $build --config Release --prefix $installPrefix
+if ($LASTEXITCODE -ne 0) {
+  throw "hdNSI install failed (exit $LASTEXITCODE)."
+}
+
+foreach ($required in @(
+  (Join-Path $installPrefix "hdNSI\hdNSI.dll"),
+  (Join-Path $installPrefix "hdNSI\resources\plugInfo.json")
+)) {
+  if (-not (Test-Path $required)) {
+    throw "hdNSI install layout is missing $required"
+  }
+}
+
+New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+Copy-Item -Recurse (Join-Path $installPrefix "*") $OutputDir
 
 # The release bundle ships the Hydra delegate only. 3Delight itself is
 # installed by the user and discovered by forge-paint at startup, so
@@ -193,14 +205,15 @@ $runtimeNames = @(
   "libnsi*.dll"
 )
 foreach ($name in $runtimeNames) {
-  Get-ChildItem -Path $dest -Recurse -Filter $name -ErrorAction SilentlyContinue |
+  Get-ChildItem -Path $OutputDir -Recurse -Filter $name -ErrorAction SilentlyContinue |
     Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-$plugInfo = Get-ChildItem -Path $dest -Recurse -Filter plugInfo.json |
-  Select-Object -First 1
-if (-not $plugInfo) {
-  throw "hdNSI package is missing plugInfo.json"
+# Link-time leftovers the install rules copy along (hdNSI.lib is
+# installed OPTIONAL next to the DLL). Runtime needs neither.
+foreach ($pattern in @("*.lib", "*.pdb")) {
+  Get-ChildItem -Path $OutputDir -Recurse -Filter $pattern -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "Packaged hdNSI from $pluginRoot to $dest"
+Write-Host "Packaged installed hdNSI layout from $installPrefix to $OutputDir"

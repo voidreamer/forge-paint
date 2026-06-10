@@ -8,8 +8,6 @@ use crate::{
     viewport::{Tool, Viewport, ViewportSelection},
 };
 
-#[cfg(windows)]
-const HDNSI_DELEGATE: &str = "HdNSIRendererPlugin";
 const HYDRA_STARTUP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 struct HydraStartupProbe {
@@ -161,10 +159,12 @@ pub struct App {
     /// then sticks across stage opens so the user's pick (Storm /
     /// 3Delight / Arnold / ...) survives a close-reopen.
     hydra_delegate: Option<String>,
-    /// Windows hdNSI startup guard. HydraNSI can block forever while
-    /// loading 3Delight or its shader compiler; probing in a child
-    /// process keeps the main egui frame responsive and gives us a
-    /// timeout path before constructing the real renderer.
+    /// Windows Hydra startup guard. HydraNSI can block forever while
+    /// loading 3Delight or its shader compiler, and the first Hgi/GL
+    /// bring-up can hang or die in native code when no usable GL
+    /// context exists; probing each delegate in a child process keeps
+    /// the main egui frame responsive and gives us a timeout path
+    /// before constructing the real renderer.
     hydra_startup: Option<HydraStartupState>,
     /// Root cache dir for painted-material syncs. Each sync writes
     /// into a versioned subdir (`v<seq>`) of this so the material's
@@ -4410,9 +4410,19 @@ impl App {
     }
 
     fn hydra_delegate_needs_startup_probe(delegate: Option<&str>) -> bool {
+        // Every Hydra delegate goes through the out-of-process probe
+        // on Windows, not just hdNSI: HydraNSI can block forever in
+        // 3Delight startup, and the first Hgi/GL bring-up can hang or
+        // terminate in native code on machines without a usable GL
+        // context (remote desktop, missing driver). The probe turns
+        // both into a visible overlay instead of a frozen or vanishing
+        // app. Storm clears the probe in under a second and hdNSI in a
+        // few, and the result is only re-checked per (stage, delegate)
+        // change, so the cost stays negligible.
         #[cfg(windows)]
         {
-            matches!(delegate, Some(HDNSI_DELEGATE))
+            let _ = delegate;
+            true
         }
         #[cfg(not(windows))]
         {
@@ -4478,6 +4488,11 @@ impl App {
         hydra_startup: &mut Option<HydraStartupState>,
     ) -> bool {
         let delegate = delegate.filter(|id| !id.is_empty());
+        // Short UI label for overlay / error text: "Storm", "3Delight",
+        // or the raw plugin ID for delegates without a mapping.
+        let delegate_label = delegate
+            .map(crate::hydra_view::delegate_label)
+            .unwrap_or("Hydra");
         if !Self::hydra_delegate_needs_startup_probe(delegate) {
             if hydra_startup
                 .as_ref()
@@ -4506,7 +4521,8 @@ impl App {
                     *hydra_startup = Some(HydraStartupState::Running(probe));
                 }
                 Err(e) => {
-                    let message = format!("Could not start the 3Delight startup check: {e:#}");
+                    let message =
+                        format!("Could not start the {delegate_label} startup check: {e:#}");
                     log::warn!("Hydra startup probe launch failed: {message}");
                     *hydra_startup = Some(HydraStartupState::Failed(HydraStartupFailure {
                         stage_path: stage_path.to_path_buf(),
@@ -4534,21 +4550,21 @@ impl App {
                         |code| format!("exit code {code}"),
                     );
                     failure = Some(format!(
-                        "3Delight startup check failed ({status_text}). See forge-paint.log beside forge-paint.exe for the HydraNSI breadcrumb."
+                        "{delegate_label} startup check failed ({status_text}). See forge-paint.log beside forge-paint.exe for the Hydra breadcrumb."
                     ));
                 }
                 Ok(None) => {
                     let elapsed = probe.started_at.elapsed();
                     if elapsed >= HYDRA_STARTUP_PROBE_TIMEOUT {
                         failure = Some(format!(
-                            "3Delight startup check timed out after {}s. The UI stayed alive; see forge-paint.log for the last HydraNSI breadcrumb.",
+                            "{delegate_label} startup check timed out after {}s. The UI stayed alive; see forge-paint.log for the last Hydra breadcrumb.",
                             HYDRA_STARTUP_PROBE_TIMEOUT.as_secs()
                         ));
                     }
                 }
                 Err(e) => {
                     failure = Some(format!(
-                        "3Delight startup check failed to report status: {e}"
+                        "{delegate_label} startup check failed to report status: {e}"
                     ));
                 }
             }
@@ -4575,14 +4591,17 @@ impl App {
         match hydra_startup.as_ref() {
             Some(HydraStartupState::Running(probe)) => {
                 let elapsed = probe.started_at.elapsed().as_secs_f32();
-                let detail = format!("Checking HydraNSI outside the UI process ({elapsed:.1}s).");
-                Self::draw_hydra_startup_overlay(ui, rect, "Starting 3Delight", &detail, false);
+                let detail =
+                    format!("Checking {delegate_label} outside the UI process ({elapsed:.1}s).");
+                let title = format!("Starting {delegate_label}");
+                Self::draw_hydra_startup_overlay(ui, rect, &title, &detail, false);
             }
             Some(HydraStartupState::Failed(failure)) => {
+                let title = format!("{delegate_label} did not start");
                 let retry = Self::draw_hydra_startup_overlay(
                     ui,
                     rect,
-                    "3Delight did not start",
+                    &title,
                     &failure.message,
                     true,
                 );

@@ -130,11 +130,12 @@ impl HydraView {
     }
 
     /// Open a stage path through Hydra using a specific render
-    /// delegate when requested. On Windows, Storm is hidden unless
-    /// `FORGE_PAINT_ENABLE_STORM=1` is set: this headless bridge uses
-    /// `UsdImagingGLEngine` offscreen, and Storm can terminate in
-    /// native graphics code before Rust gets a recoverable error.
-    /// CPU/path-tracing delegates such as hdNSI are still allowed.
+    /// delegate when requested. On Windows every delegate goes through
+    /// the out-of-process startup probe first (see `app.rs`), so a
+    /// delegate that hangs or dies in native graphics code surfaces as
+    /// an overlay instead of taking the app down. Storm can still be
+    /// hidden explicitly with `FORGE_PAINT_ENABLE_STORM=0` on machines
+    /// where the offscreen GL bridge is known to misbehave.
     pub fn new_with_delegate(stage_path: &Path, delegate_id: Option<&str>) -> Result<Self> {
         // Diagnostic override: setting HYDRA_TEST_STAGE points the
         // renderer at any USDA you supply (e.g. the bundled
@@ -214,10 +215,10 @@ impl HydraView {
                 return Ok(id.clone());
             }
             anyhow::bail!(
-                "No safe Hydra render delegate is available. Storm is registered but disabled \
-                 in Windows hand-off builds because it can crash in native offscreen graphics \
-                 code. To use 3Delight, package or point PXR_PLUGINPATH_NAME at a compatible \
-                 hdNSI/resources plug-in. To test Storm anyway, set FORGE_PAINT_ENABLE_STORM=1."
+                "No Hydra render delegate is available. The bundled Storm delegate is either \
+                 missing from the USD plug registry or hidden by FORGE_PAINT_ENABLE_STORM=0. \
+                 To use 3Delight, package or point PXR_PLUGINPATH_NAME at a compatible \
+                 hdNSI/resources plug-in."
             );
         }
 
@@ -250,15 +251,23 @@ impl HydraView {
     fn storm_enabled() -> bool {
         #[cfg(windows)]
         {
+            // Default-on since the hydra-rs 0.0.11 hidden-WGL-context
+            // fix plus the single-instance bundle relaunch (see
+            // main.rs::relaunch_from_bundled_usd_lib). The
+            // out-of-process startup probe guards the remaining cases
+            // where no usable GL context can come up (remote desktop,
+            // missing driver). FORGE_PAINT_ENABLE_STORM=0/false/no/off
+            // hides Storm again; any other value — including the old
+            // opt-in `1` — keeps it visible.
             std::env::var_os("FORGE_PAINT_ENABLE_STORM")
                 .map(|value| {
                     let value = value.to_string_lossy();
-                    matches!(
+                    !matches!(
                         value.to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
+                        "0" | "false" | "no" | "off"
                     )
                 })
-                .unwrap_or(false)
+                .unwrap_or(true)
         }
         #[cfg(not(windows))]
         {
@@ -268,7 +277,7 @@ impl HydraView {
 
     pub fn disabled_delegate_message(plugin_id: &str) -> String {
         match plugin_id {
-            STORM_DELEGATE => "Storm is disabled by default on Windows because this offscreen Hydra bridge can crash inside native graphics code before Rust can recover. Set FORGE_PAINT_ENABLE_STORM=1 to test it anyway.".to_string(),
+            STORM_DELEGATE => "Storm is hidden because FORGE_PAINT_ENABLE_STORM=0 is set. Unset the variable (or set it to 1) to re-enable the Storm delegate.".to_string(),
             other => format!("Hydra render delegate is disabled: {other}"),
         }
     }
