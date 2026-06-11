@@ -182,6 +182,12 @@ pub struct App {
     /// run completes. Either "synced 14:32:05" on success or a
     /// short error message. Cleared when stage changes.
     hydra_paint_sync_status: Option<String>,
+    /// `.usda` authored by the last paint sync — a UsdPreviewSurface
+    /// over the exported per-tile PNGs. While set, the per-frame
+    /// binding push binds it (under `PAINTED_BINDING_ID`) to every
+    /// mesh prim no assigned library binding covers, so paint and
+    /// library materials coexist per prim. Cleared on stage change.
+    hydra_painted_source: Option<std::path::PathBuf>,
     /// `UsdGeomImageable::purpose` filter toggles for the Hydra view.
     /// Defaults: render = on (pipeline assets wrap detail geom in
     /// `Scope { purpose = "render" }`), proxy = on (playback proxies),
@@ -507,6 +513,10 @@ pub struct MaterialBindingInstance {
     /// right-click menu. Per-frame Hydra push skips unassigned.
     pub assigned: bool,
 }
+
+/// Reserved binding id for the painter's own synced material. User
+/// bindings count up from `next_binding_id`, so MAX can't collide.
+pub const PAINTED_BINDING_ID: u64 = u64::MAX;
 
 /// What we last sent to hydra-rs for a given binding id, used to
 /// figure out per-frame what changed. Stored separately from
@@ -1243,6 +1253,7 @@ impl eframe::App for App {
                             &mut self.hydra_paint_sync_seq,
                             &mut self.hydra_paint_sync_status,
                             &mut self.hydra_paint_sync_pending,
+                            &mut self.hydra_painted_source,
                             &mut self.hydra_show_render,
                             &mut self.hydra_show_proxy,
                             &mut self.hydra_show_guides,
@@ -3097,6 +3108,11 @@ fn uv_view_body(
             };
 
             if let Some(rs) = frame.wgpu_render_state() {
+                // Stroke start (no anchor yet) → snapshot for undo before
+                // the first stamp lands, mirroring the 3D paint path.
+                if last_paint_atlas_uv.is_none() {
+                    vp.push_uv_stroke_undo(&rs.device, &rs.queue);
+                }
                 for (uv, pressure) in &sequence {
                     let tile_u = uv.x.floor() as i32;
                     let tile_v = uv.y.floor() as i32;
@@ -3973,6 +3989,9 @@ impl App {
         self.active_binding_id = None;
         self.material_graph = crate::material_graph::MaterialGraph::default();
         self.last_pushed_bindings.clear();
+        // The synced painted material references the previous stage's
+        // tiles — don't let it bind onto the next stage's prims.
+        self.hydra_painted_source = None;
     }
 
     fn restore_material_bindings_from_sidecar(
@@ -4695,6 +4714,7 @@ impl App {
         hydra_paint_sync_seq: &mut u64,
         hydra_paint_sync_status: &mut Option<String>,
         hydra_paint_sync_pending: &mut bool,
+        hydra_painted_source: &mut Option<std::path::PathBuf>,
         show_render: &mut bool,
         show_proxy: &mut bool,
         show_guides: &mut bool,
@@ -4948,7 +4968,91 @@ impl App {
             }
             last_pushed_bindings.insert(b.id, new_snap);
         }
-        // Drop any bindings that disappeared from the App-side Vec.
+        // One-shot sync on Hydra mode entry. Triggered by the
+        // `update()` dispatch when the badge click flips wgpu → Hydra.
+        // Clearing the flag unconditionally (even on sync failure)
+        // keeps us out of an infinite "try again next frame" loop;
+        // the failure status is surfaced via `hydra_paint_sync_status`
+        // for the overlay. The sync exports the paint target to PNGs
+        // and authors the painted-material .usda; binding it to prims
+        // happens in the block below.
+        if *hydra_paint_sync_pending {
+            *hydra_paint_sync_pending = false;
+            let status = Self::sync_painted_material(
+                frame,
+                vp,
+                hydra_paint_cache_dir,
+                hydra_paint_sync_seq,
+                hydra_painted_source,
+            );
+            log::info!("Hydra paint mode-entry sync: {status}");
+            *hydra_paint_sync_status = Some(status);
+        }
+
+        // Painted-material binding — the painter's maps ride the same
+        // per-prim binding pipeline as the library materials, scoped
+        // to every mesh prim no assigned binding covers. Disjoint
+        // scopes mean no bind-strength fights in the session layer, so
+        // assigning a library material to one prim no longer hides the
+        // paint everywhere else (and vice versa).
+        if let Some(source) = hydra_painted_source.as_ref() {
+            let assigned: Vec<&MaterialBindingInstance> =
+                material_bindings.iter().filter(|b| b.assigned).collect();
+            let stage_wide_bound = assigned.iter().any(|b| b.target_prims.is_empty());
+            let all_prims = &vp.cpu_mesh().prim_ranges;
+            let scope: Option<Vec<String>> = if stage_wide_bound {
+                // A stage-wide library binding covers every prim.
+                None
+            } else if all_prims.is_empty() {
+                // Loader didn't record per-prim ranges — fall back to
+                // a stage-wide painted bind when nothing is assigned.
+                assigned.is_empty().then(Vec::new)
+            } else {
+                // Bindings may target ancestor Xforms/Scopes; a prim
+                // counts as covered when a target equals it or is a
+                // path prefix of it.
+                let covered = |prim: &str| {
+                    assigned.iter().any(|b| {
+                        b.target_prims.iter().any(|t| {
+                            prim == t
+                                || (prim.starts_with(t.as_str())
+                                    && prim[t.len()..].starts_with('/'))
+                        })
+                    })
+                };
+                let uncovered: Vec<String> = all_prims
+                    .iter()
+                    .map(|r| r.prim_path.clone())
+                    .filter(|p| !covered(p))
+                    .collect();
+                (!uncovered.is_empty()).then_some(uncovered)
+            };
+            if let Some(target_prims) = scope {
+                current_ids.insert(PAINTED_BINDING_ID);
+                let snap = MaterialBindingSnapshot {
+                    source: source.clone(),
+                    prim_path: "/Material".to_string(),
+                    inputs: crate::assets::MaterialInputs::default(),
+                    target_prims,
+                    assigned: true,
+                };
+                if last_pushed_bindings.get(&PAINTED_BINDING_ID) != Some(&snap) {
+                    if let Err(e) = hydra.apply_material_binding(
+                        PAINTED_BINDING_ID,
+                        &snap.source,
+                        &snap.prim_path,
+                        &snap.target_prims,
+                    ) {
+                        log::warn!("Hydra: painted-material binding failed: {e:#}");
+                    }
+                    last_pushed_bindings.insert(PAINTED_BINDING_ID, snap);
+                }
+            }
+            // scope == None → the dropped sweep below unbinds it.
+        }
+
+        // Drop any bindings that disappeared from the App-side Vec
+        // (including the painted binding when its scope vanished).
         let dropped: Vec<u64> = last_pushed_bindings
             .keys()
             .copied()
@@ -4961,37 +5065,6 @@ impl App {
         hydra.set_purposes(*show_render, *show_proxy, *show_guides);
         if let Err(e) = hydra.set_environment(env.as_ref()) {
             log::warn!("Hydra: set_environment failed: {e:#}");
-        }
-
-        // One-shot sync on Hydra mode entry. Triggered by the
-        // `update()` dispatch when the badge click flips wgpu → Hydra.
-        // Clearing the flag unconditionally (even on sync failure)
-        // keeps us out of an infinite "try again next frame" loop;
-        // the failure status is surfaced via `hydra_paint_sync_status`
-        // for the overlay.
-        //
-        // Skip the paint sync entirely when a library material is
-        // bound — the paint sync's `MaterialBindingAPI.Bind` would
-        // overwrite the external-material binding (UsdShade strength
-        // is "last-authored wins"), which the user sees as "the
-        // material I picked got unassigned every time I bounce
-        // through wgpu". With a library material active, leave the
-        // session layer alone.
-        if *hydra_paint_sync_pending {
-            *hydra_paint_sync_pending = false;
-            if material_bindings.is_empty() {
-                let status = Self::sync_painted_material(
-                    frame,
-                    vp,
-                    hydra,
-                    hydra_paint_cache_dir,
-                    hydra_paint_sync_seq,
-                );
-                log::info!("Hydra paint mode-entry sync: {status}");
-                *hydra_paint_sync_status = Some(status);
-            } else {
-                log::info!("Hydra: skipping paint mode-entry sync — library material bound",);
-            }
         }
 
         // Breadcrumb the first render on a freshly-switched delegate.
@@ -5079,15 +5152,15 @@ impl App {
             egui::Sense::click(),
         );
         if sync_resp.clicked() {
-            // Reuse the live `hydra` borrow from above — re-grabbing
-            // through `hydra_slot.as_mut()` here would shadow that
-            // earlier borrow and trip the borrow checker.
+            // Exports + authors a fresh versioned .usda; the painted-
+            // binding block picks up the new source path on the next
+            // frame's diff (continuous repaint keeps that immediate).
             let status = Self::sync_painted_material(
                 frame,
                 vp,
-                hydra,
                 hydra_paint_cache_dir,
                 hydra_paint_sync_seq,
+                hydra_painted_source,
             );
             log::info!("Hydra paint sync: {status}");
             *hydra_paint_sync_status = Some(status);
@@ -5213,9 +5286,9 @@ impl App {
     fn sync_painted_material(
         frame: &eframe::Frame,
         vp: &Viewport,
-        hydra: &mut crate::hydra_view::HydraView,
         cache_root: &mut Option<std::path::PathBuf>,
         sync_seq: &mut u64,
+        painted_source: &mut Option<std::path::PathBuf>,
     ) -> String {
         let Some(render_state) = frame.wgpu_render_state() else {
             return "Sync failed: no wgpu render state".to_string();
@@ -5276,13 +5349,28 @@ impl App {
         let metallic = path_for("metallic");
         let normal = path_for("normal");
 
-        let bc = std::path::PathBuf::from(&base_color);
-        let ro = std::path::PathBuf::from(&roughness);
-        let me = std::path::PathBuf::from(&metallic);
-        let nm = std::path::PathBuf::from(&normal);
-        if let Err(e) = hydra.set_painted_material(&bc, &ro, &me, &nm) {
-            return format!("Sync failed: set_painted_material: {e:#}");
+        // Author a UsdPreviewSurface over the exported maps. The painted
+        // material rides the same per-prim binding pipeline as library
+        // materials (under PAINTED_BINDING_ID) instead of a separate
+        // stage-wide bind that fought them for the binding slot.
+        let mut textures = DetectedMaterialTextures::empty("st");
+        if !base_color.is_empty() {
+            textures.base_color = Some(std::path::PathBuf::from(&base_color));
         }
+        if !roughness.is_empty() {
+            textures.roughness = Some(std::path::PathBuf::from(&roughness));
+        }
+        if !metallic.is_empty() {
+            textures.metallic = Some(std::path::PathBuf::from(&metallic));
+        }
+        if !normal.is_empty() {
+            textures.normal = Some(std::path::PathBuf::from(&normal));
+        }
+        let material_path = versioned_dir.join("painted_material.usda");
+        if let Err(e) = write_usd_preview_material(&material_path, &textures) {
+            return format!("Sync failed: author painted material: {e:#}");
+        }
+        *painted_source = Some(material_path);
 
         // Trim history: keep the current sync's dir plus one prior
         // (in case the delegate is still sampling from the previous
@@ -5937,6 +6025,14 @@ impl App {
                 vp.add_layer(&rs.device, &rs.queue);
                 let last = vp.layer_stack.layers.len() - 1;
                 vp.layer_stack.active = last;
+                {
+                    let layer = &mut vp.layer_stack.layers[last];
+                    layer.name = asset.name.clone();
+                    // The texture only fills base color — leave roughness/
+                    // metallic/normal to the layers below instead of covering
+                    // them with this layer's neutral seeds.
+                    layer.affects = crate::paint::ChannelMask::base_color_only();
+                }
                 let tile_count = vp.paint_target().tiles.len() as u32;
                 let res = vp.tile_resolution();
                 let layer = &vp.layer_stack.layers[last];
@@ -5953,6 +6049,7 @@ impl App {
                 let tile_count = vp.paint_target().tiles.len() as u32;
                 let res = vp.tile_resolution();
                 let active = vp.layer_stack.active;
+                vp.push_apply_undo(&rs.device, &rs.queue, crate::undo::SnapshotKind::BaseColor);
                 let layer = &vp.layer_stack.layers[active];
                 if let Err(e) =
                     assets::apply_as_base_color(&rs.queue, asset, layer, tile_count, res)
@@ -5970,6 +6067,7 @@ impl App {
                 }
                 let tile_count = vp.paint_target().tiles.len() as u32;
                 let res = vp.tile_resolution();
+                vp.push_apply_undo(&rs.device, &rs.queue, crate::undo::SnapshotKind::Mask);
                 let layer = &vp.layer_stack.layers[active];
                 if let Err(e) = assets::apply_as_mask(&rs.queue, asset, layer, tile_count, res) {
                     self.status = format!("Apply failed: {e}");
@@ -6030,6 +6128,13 @@ impl App {
         let tile_count = vp.paint_target().tiles.len() as u32;
         let res = vp.tile_resolution();
         let active_idx = vp.layer_stack.active;
+        let snapshot_kind = match slot {
+            MaterialSlot::BaseColor => crate::undo::SnapshotKind::BaseColor,
+            MaterialSlot::Roughness => crate::undo::SnapshotKind::Roughness,
+            MaterialSlot::Metallic => crate::undo::SnapshotKind::Metallic,
+            MaterialSlot::Normal => crate::undo::SnapshotKind::Normal,
+        };
+        vp.push_apply_undo(&rs.device, &rs.queue, snapshot_kind);
         let layer = &vp.layer_stack.layers[active_idx];
         let result = match slot {
             MaterialSlot::BaseColor => {

@@ -33,6 +33,49 @@ pub enum LayerKind {
     Fill(FillParams),
 }
 
+/// Which channels a layer contributes to the composite. A disabled
+/// channel passes the layers below through untouched, so a layer can
+/// e.g. supply base color without resetting painted roughness/metal/
+/// normal underneath to its own neutral seeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelMask {
+    pub base_color: bool,
+    pub roughness: bool,
+    pub metallic: bool,
+    pub normal: bool,
+}
+
+impl Default for ChannelMask {
+    fn default() -> Self {
+        Self {
+            base_color: true,
+            roughness: true,
+            metallic: true,
+            normal: true,
+        }
+    }
+}
+
+impl ChannelMask {
+    pub fn base_color_only() -> Self {
+        Self {
+            base_color: true,
+            roughness: false,
+            metallic: false,
+            normal: false,
+        }
+    }
+
+    /// Pack into the bit layout composite.wgsl reads:
+    /// bit0 base_color, bit1 roughness, bit2 metallic, bit3 normal.
+    pub fn bits(self) -> u32 {
+        (self.base_color as u32)
+            | (self.roughness as u32) << 1
+            | (self.metallic as u32) << 2
+            | (self.normal as u32) << 3
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlendMode {
     Normal,
@@ -65,6 +108,9 @@ pub struct Layer {
     pub visible: bool,
     pub blend_mode: BlendMode,
     pub kind: LayerKind,
+    /// Channels this layer composites into. All-on by default; texture
+    /// apply paths narrow it so the layer only covers what it carries.
+    pub affects: ChannelMask,
 
     pub base_color: wgpu::Texture,
     pub base_color_view: wgpu::TextureView, // full array view
@@ -296,6 +342,7 @@ impl Layer {
             visible: true,
             blend_mode: BlendMode::Normal,
             kind: LayerKind::Paint,
+            affects: ChannelMask::default(),
             base_color,
             base_color_view,
             base_color_layer_views,
@@ -330,6 +377,23 @@ impl Layer {
 
     pub fn is_fill(&self) -> bool {
         matches!(self.kind, LayerKind::Fill(_))
+    }
+
+    /// Ensure the channel a stamp is about to write actually composites.
+    /// Returns true when a previously-disabled flag flipped on — callers
+    /// run a full reflatten then, since every tile changes, not just the
+    /// stamped one. Mask and Displacement don't live in the channel mask.
+    pub fn enable_channel_for(&mut self, channel: crate::paint::PaintChannel) -> bool {
+        use crate::paint::PaintChannel;
+        let flag = match channel {
+            PaintChannel::BaseColor => &mut self.affects.base_color,
+            PaintChannel::Roughness => &mut self.affects.roughness,
+            PaintChannel::Metallic => &mut self.affects.metallic,
+            PaintChannel::Mask | PaintChannel::Displacement => return false,
+        };
+        let changed = !*flag;
+        *flag = true;
+        changed
     }
 
     pub fn fill_params(&self) -> Option<FillParams> {
@@ -405,6 +469,7 @@ impl Layer {
             visible: true,
             blend_mode: BlendMode::Normal,
             kind: LayerKind::Fill(FillParams::default()),
+            affects: ChannelMask::default(),
             base_color,
             base_color_view,
             base_color_layer_views,

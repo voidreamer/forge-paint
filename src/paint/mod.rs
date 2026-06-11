@@ -10,7 +10,7 @@ pub mod udim;
 
 pub use brush::{BrushPipeline, BrushUniforms, PaintChannel};
 pub use composite::Compositor;
-pub use layer::{BlendMode, FillParams, Layer, LayerKind, LayerStack, Mask};
+pub use layer::{BlendMode, ChannelMask, FillParams, Layer, LayerKind, LayerStack, Mask};
 pub use presets::SmartMaterialPreset;
 pub use projection::{ProjBrushUniforms, ProjectionBrushPipeline};
 pub use smart_mask::{SmartMaskParams, SmartMaskSource};

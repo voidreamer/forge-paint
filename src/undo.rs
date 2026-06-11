@@ -12,7 +12,7 @@
 use egui_wgpu::wgpu;
 use std::collections::VecDeque;
 
-use crate::paint::{Layer, LayerStack};
+use crate::paint::LayerStack;
 
 const DEFAULT_DEPTH: usize = 16;
 
@@ -21,6 +21,7 @@ pub enum SnapshotKind {
     BaseColor,
     Roughness,
     Metallic,
+    Normal,
     Mask,
 }
 
@@ -164,6 +165,7 @@ fn source_texture(
         SnapshotKind::BaseColor => Some(&layer.base_color),
         SnapshotKind::Roughness => Some(&layer.roughness),
         SnapshotKind::Metallic => Some(&layer.metallic),
+        SnapshotKind::Normal => Some(&layer.normal),
         SnapshotKind::Mask => layer.mask.as_ref().map(|m| &m.texture),
     }
 }
@@ -201,31 +203,22 @@ fn copy_full(encoder: &mut wgpu::CommandEncoder, src: &wgpu::Texture, dst: &wgpu
 }
 
 /// Which channel of the active layer a given brush configuration will stamp.
+/// `None` means the channel has no per-layer snapshot (Displacement lives on
+/// PaintTarget in v0) — callers skip push_pre_stroke for it.
 pub fn snapshot_kind_for_stamp(
     channel: crate::paint::PaintChannel,
     mask_edit: bool,
     active_has_mask: bool,
-) -> SnapshotKind {
+) -> Option<SnapshotKind> {
     use crate::paint::PaintChannel;
     if mask_edit && active_has_mask {
-        SnapshotKind::Mask
-    } else {
-        match channel {
-            PaintChannel::BaseColor => SnapshotKind::BaseColor,
-            PaintChannel::Roughness => SnapshotKind::Roughness,
-            PaintChannel::Metallic => SnapshotKind::Metallic,
-            PaintChannel::Mask => SnapshotKind::Mask,
-            // Displacement lives on PaintTarget in v0, outside the
-            // per-layer snapshot machinery. Undo is a follow-up; for
-            // now we route to BaseColor so the match is exhaustive —
-            // callers should skip push_pre_stroke for this channel.
-            PaintChannel::Displacement => SnapshotKind::BaseColor,
-        }
+        return Some(SnapshotKind::Mask);
     }
-}
-
-#[allow(dead_code)]
-impl Layer {
-    // Helpers to quiet `Layer` is unused warning if persistence calls above drop it.
-    fn _touch_for_docs() {}
+    match channel {
+        PaintChannel::BaseColor => Some(SnapshotKind::BaseColor),
+        PaintChannel::Roughness => Some(SnapshotKind::Roughness),
+        PaintChannel::Metallic => Some(SnapshotKind::Metallic),
+        PaintChannel::Mask => Some(SnapshotKind::Mask),
+        PaintChannel::Displacement => None,
+    }
 }

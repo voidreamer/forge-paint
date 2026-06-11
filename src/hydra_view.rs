@@ -306,34 +306,10 @@ impl HydraView {
         Ok(())
     }
 
-    /// Author a `UsdPreviewSurface` material into the stage's session
-    /// layer pointing at on-disk PNGs for the four PBR channels, and
-    /// bind it to every mesh. Each path can use the `<UDIM>` token so
-    /// a single material spans multi-tile UDIM layouts. Empty paths
-    /// skip that channel (the corresponding PBR input keeps its
-    /// UsdPreviewSurface default).
-    ///
-    /// Forwards straight to `hydra_rs::Renderer::set_painted_material`.
-    /// See the C++ bridge header for the source-colour-space split
-    /// (sRGB for base colour, raw for roughness/metallic/normal).
-    pub fn set_painted_material(
-        &mut self,
-        base_color: &Path,
-        roughness: &Path,
-        metallic: &Path,
-        normal: &Path,
-    ) -> Result<()> {
-        self.renderer
-            .set_painted_material(base_color, roughness, metallic, normal)
-            .map_err(|e| anyhow::anyhow!("set_painted_material failed: {}", e.what()))
-    }
-
-    /// Drop the painted material authored by `set_painted_material`
-    /// and unbind it from every mesh. The stage's originally-authored
-    /// bindings (if any) drive shading again afterwards.
-    pub fn clear_painted_material(&mut self) {
-        self.renderer.clear_painted_material();
-    }
+    // The old set_painted_material / clear_painted_material wrappers
+    // are gone: the painted material is now authored app-side as a
+    // .usda (sync_painted_material) and pushed through the same
+    // apply_material_binding path as library materials.
 
     /// Reference a library material into the stage's session layer
     /// and bind it to every mesh. `source` is the USD file from the

@@ -647,13 +647,19 @@ impl Viewport {
         if active_is_fill {
             return;
         }
-        let active = self.layer_stack.active_layer();
-        let has_mask = active.mask.is_some();
+        let has_mask = self.layer_stack.active_layer().mask.is_some();
         let channel = if self.brush.mask_edit && has_mask {
             PaintChannel::Mask
         } else {
             self.brush.channel
         };
+        // Painting into a channel the layer's channel mask hides would land
+        // in the texture but never show — flip it on first.
+        let affects_changed = self
+            .layer_stack
+            .active_layer_mut()
+            .enable_channel_for(channel);
+        let active = self.layer_stack.active_layer();
         // 400 px per UV is a reasonable default mapping for a square-ish
         // model view — matches how the main paint path picks
         // pixels-per-UV when the Jacobian probe fails. Clamp to half a
@@ -697,16 +703,71 @@ impl Viewport {
             self.paint_target.resolution,
         );
         if channel != PaintChannel::Displacement {
-            self.compositor.run_sparse(
-                device,
-                queue,
-                &mut encoder,
-                &self.layer_stack,
-                &self.paint_target,
-                &[tile_idx as usize],
-            );
+            if affects_changed {
+                // Channel just became visible on this layer — every tile's
+                // composite changes, not only the stamped one.
+                self.compositor.run(
+                    device,
+                    queue,
+                    &mut encoder,
+                    &self.layer_stack,
+                    &self.paint_target,
+                );
+            } else {
+                self.compositor.run_sparse(
+                    device,
+                    queue,
+                    &mut encoder,
+                    &self.layer_stack,
+                    &self.paint_target,
+                    &[tile_idx as usize],
+                );
+            }
         }
         queue.submit(Some(encoder.finish()));
+    }
+
+    /// Snapshot `kind` on the active layer so the next destructive write
+    /// (texture apply, slot assign) is undoable like a brush stroke.
+    pub fn push_apply_undo(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        kind: crate::undo::SnapshotKind,
+    ) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("apply_undo_snapshot"),
+        });
+        self.undo_stack.push_pre_stroke(
+            device,
+            &mut encoder,
+            &self.layer_stack,
+            self.layer_stack.active,
+            kind,
+        );
+        queue.submit(Some(encoder.finish()));
+    }
+
+    /// Snapshot whatever channel the next `stamp_at_uv` will hit. Call at
+    /// UV-view stroke start so Ctrl+Z covers UV strokes like 3D ones.
+    pub fn push_uv_stroke_undo(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.layer_stack.active_layer().is_fill() {
+            return;
+        }
+        let has_mask = self.layer_stack.active_layer().mask.is_some();
+        let channel = if self.brush.mask_edit && has_mask {
+            PaintChannel::Mask
+        } else {
+            self.brush.channel
+        };
+        let Some(kind) = crate::undo::snapshot_kind_for_stamp(
+            channel,
+            matches!(channel, PaintChannel::Mask),
+            has_mask,
+        ) else {
+            return;
+        };
+        self.push_apply_undo(device, queue, kind);
     }
 
     pub fn can_undo(&self) -> bool {
@@ -1380,8 +1441,7 @@ impl Viewport {
             );
             if is_stamping && !strokes.is_empty() && !active_is_fill {
                 let active_idx = self.layer_stack.active;
-                let active = self.layer_stack.active_layer();
-                let has_mask = active.mask.is_some();
+                let has_mask = self.layer_stack.active_layer().mask.is_some();
 
                 // Erase always routes to the mask. Stencil can write to
                 // either base color (default) or displacement (when the
@@ -1413,6 +1473,16 @@ impl Viewport {
                 // (e.g. add_mask_to failed silently — defensive).
                 let can_stamp = channel != PaintChannel::Mask || has_mask;
 
+                // Stamping into a channel the layer's channel mask hides
+                // would land in the texture but never show — flip it on.
+                // A flipped flag forces the full reflatten below.
+                let affects_changed = can_stamp
+                    && self
+                        .layer_stack
+                        .active_layer_mut()
+                        .enable_channel_for(channel);
+                let active = self.layer_stack.active_layer();
+
                 if can_stamp {
                     // Fill is one-shot per stroke; Paint/Erase stamp every
                     // interpolated position along the drag.
@@ -1430,22 +1500,23 @@ impl Viewport {
 
                     if !stamps.is_empty() {
                         // Snapshot BEFORE the stamp lands so Cmd+Z rolls back.
-                        // Only at stroke start. Displacement lives on
-                        // PaintTarget in v0 — outside the per-Layer
-                        // snapshot machinery — so we skip undo for it.
-                        if stroke_starting && channel != PaintChannel::Displacement {
-                            let kind = crate::undo::snapshot_kind_for_stamp(
+                        // Only at stroke start. Displacement maps to None
+                        // (lives on PaintTarget in v0, outside the per-Layer
+                        // snapshot machinery) and is skipped.
+                        if stroke_starting {
+                            if let Some(kind) = crate::undo::snapshot_kind_for_stamp(
                                 channel,
                                 matches!(channel, PaintChannel::Mask),
                                 has_mask,
-                            );
-                            self.undo_stack.push_pre_stroke(
-                                &render_state.device,
-                                &mut encoder,
-                                &self.layer_stack,
-                                active_idx,
-                                kind,
-                            );
+                            ) {
+                                self.undo_stack.push_pre_stroke(
+                                    &render_state.device,
+                                    &mut encoder,
+                                    &self.layer_stack,
+                                    active_idx,
+                                    kind,
+                                );
+                            }
                         }
 
                         // Erase zeroes the channel; every other tool takes its
@@ -1633,18 +1704,31 @@ impl Viewport {
                         // painted directly onto paint_target outside the
                         // layer stack, so no composite is needed for it.
                         if channel != PaintChannel::Displacement {
-                            let mut dirty: Vec<usize> =
-                                stamps.iter().map(|(l, _, _, _)| *l as usize).collect();
-                            dirty.sort_unstable();
-                            dirty.dedup();
-                            self.compositor.run_sparse(
-                                &render_state.device,
-                                &render_state.queue,
-                                &mut encoder,
-                                &self.layer_stack,
-                                &self.paint_target,
-                                &dirty,
-                            );
+                            if affects_changed {
+                                // Channel just became visible on this layer —
+                                // every tile's composite changes, not only
+                                // the stamped ones.
+                                self.compositor.run(
+                                    &render_state.device,
+                                    &render_state.queue,
+                                    &mut encoder,
+                                    &self.layer_stack,
+                                    &self.paint_target,
+                                );
+                            } else {
+                                let mut dirty: Vec<usize> =
+                                    stamps.iter().map(|(l, _, _, _)| *l as usize).collect();
+                                dirty.sort_unstable();
+                                dirty.dedup();
+                                self.compositor.run_sparse(
+                                    &render_state.device,
+                                    &render_state.queue,
+                                    &mut encoder,
+                                    &self.layer_stack,
+                                    &self.paint_target,
+                                    &dirty,
+                                );
+                            }
                         }
                     }
                 }

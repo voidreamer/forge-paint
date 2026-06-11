@@ -14,7 +14,10 @@ use crate::paint::target::{defaults, PaintTarget};
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct CompositeUniforms {
     pub opacity: f32,
-    pub _pad: [f32; 3],
+    /// `ChannelMask::bits()` — bit0 base_color, bit1 roughness,
+    /// bit2 metallic, bit3 normal.
+    pub affects: u32,
+    pub _pad: [f32; 2],
 }
 
 pub struct Compositor {
@@ -385,7 +388,8 @@ impl Compositor {
                     0,
                     bytemuck::bytes_of(&CompositeUniforms {
                         opacity: layer.opacity,
-                        _pad: [0.0; 3],
+                        affects: layer.affects.bits(),
+                        _pad: [0.0; 2],
                     }),
                 );
                 buf
