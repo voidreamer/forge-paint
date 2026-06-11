@@ -17,6 +17,12 @@ on:
   push:
     tags: ['v*']
 
+# The release-attach step creates/updates the GitHub Release for the
+# tag; the default GITHUB_TOKEN is read-only on this repo and 403s
+# without this.
+permissions:
+  contents: write
+
 env:
   # rust-usd / hydra-rs are verified against upstream OpenUSD 25.05.
   # Bump together if the bindings upgrade, otherwise the ABI may not match.
