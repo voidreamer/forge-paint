@@ -108,6 +108,11 @@ impl StageBrowser {
         &self.selected
     }
 
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.last_focused = None;
+    }
+
     /// Apply the same selection semantics as clicking a row in the
     /// hierarchy, but driven by another surface such as viewport picking.
     pub fn select_path(&mut self, path: &str, multi: bool) -> bool {
@@ -183,6 +188,19 @@ impl StageBrowser {
                     // tree feels like a usable outliner.
                     for child in &root.children {
                         self.draw_node(ui, child, &filter, 0);
+                    }
+                    // Click-away: the leftover space under the last row
+                    // deselects. When the tree fills the viewport there
+                    // is no leftover and this allocates nothing.
+                    let leftover = ui.available_size_before_wrap();
+                    if leftover.y > 0.0 {
+                        let (_, resp) = ui.allocate_exact_size(
+                            egui::vec2(leftover.x.max(1.0), leftover.y),
+                            egui::Sense::click(),
+                        );
+                        if resp.clicked() && !self.selected.is_empty() {
+                            self.clear_selection();
+                        }
                     }
                 });
         } else {

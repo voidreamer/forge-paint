@@ -235,6 +235,14 @@ pub struct App {
     /// otherwise it sits as a bottom strip inside the central area
     /// (same dock pattern as the UV view).
     material_editor_undocked: bool,
+    /// Material-graph canvas rect from the last frame. `raw_input_hook`
+    /// uses it to convert plain wheel scroll over the graph into
+    /// ctrl+scroll (egui zoom) before snarl reads the input. Reset at
+    /// the top of every update so a hidden editor stops capturing.
+    material_graph_canvas_rect: Option<egui::Rect>,
+    /// Last pointer position seen by `raw_input_hook`, tracked from raw
+    /// PointerMoved events (the hook runs before InputState exists).
+    last_raw_pointer_pos: Option<egui::Pos2>,
     /// Pixels-per-UV-unit for the UV atlas. Modified by scroll.
     uv_zoom: f32,
     /// Screen-pixel offset applied to the atlas (drag to pan).
@@ -615,7 +623,36 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Plain mouse wheel zooms the material network. While the
+        // pointer sits over the graph canvas, tag wheel events with
+        // ctrl so egui folds them into zoom_delta — the input
+        // egui-snarl's built-in viewport zoom listens to. Pinch
+        // gestures arrive as Event::Zoom and pass through untouched.
+        for ev in &mut raw_input.events {
+            match ev {
+                egui::Event::PointerMoved(pos) => {
+                    self.last_raw_pointer_pos = Some(*pos);
+                }
+                egui::Event::MouseWheel { modifiers, .. } => {
+                    let over_graph = self
+                        .material_graph_canvas_rect
+                        .zip(self.last_raw_pointer_pos)
+                        .is_some_and(|(rect, pos)| rect.contains(pos));
+                    if over_graph && !modifiers.ctrl && !modifiers.command {
+                        modifiers.ctrl = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Re-established by material_editor_body when the editor draws
+        // this frame; cleared here so closing the editor releases the
+        // wheel-zoom capture in raw_input_hook.
+        self.material_graph_canvas_rect = None;
         if self.viewport.is_none() {
             if let Some(render_state) = frame.wgpu_render_state() {
                 let cpu = mesh::cube();
@@ -1233,6 +1270,7 @@ impl eframe::App for App {
                                     &mut self.material_graph,
                                     &browser_sel,
                                     &mut self.material_editor_undocked,
+                                    &mut self.material_graph_canvas_rect,
                                 );
                             });
                     }
@@ -1349,6 +1387,7 @@ impl eframe::App for App {
                         &mut self.material_graph,
                         &browser_sel,
                         &mut self.material_editor_undocked,
+                        &mut self.material_graph_canvas_rect,
                     );
                 });
             if !open {
@@ -1569,6 +1608,7 @@ fn material_editor_body(
     graph: &mut crate::material_graph::MaterialGraph,
     browser_selection: &std::collections::HashSet<String>,
     undocked: &mut bool,
+    canvas_rect_out: &mut Option<egui::Rect>,
 ) {
     ui.horizontal(|ui| {
         let n = bindings.len();
@@ -1594,10 +1634,12 @@ fn material_editor_body(
     ui.separator();
 
     let mut pending: Vec<crate::material_graph::GraphAction> = Vec::new();
+    let mut graph_scale = graph.last_scale.unwrap_or(1.0);
     let mut viewer = crate::material_graph::GraphViewer {
         bindings,
         browser_selection,
         pending_actions: &mut pending,
+        scale_out: &mut graph_scale,
     };
     let graph_rect = ui.available_rect_before_wrap();
     let graph_size = egui::vec2(graph_rect.width().max(1.0), graph_rect.height().max(160.0));
@@ -1612,6 +1654,10 @@ fn material_editor_body(
     graph
         .snarl
         .show(&mut viewer, &style, "material_graph", &mut graph_ui);
+    graph.last_scale = Some(graph_scale);
+    // Hand the canvas rect back to App so raw_input_hook can route
+    // plain wheel scroll over this area into snarl's zoom next frame.
+    *canvas_rect_out = Some(graph_rect);
     material_graph_canvas_nav(ui, graph_rect, graph);
 
     // Apply right-click menu actions emitted by the viewer. Done
@@ -1685,7 +1731,10 @@ fn material_graph_canvas_nav(
         )
     });
     if inside && middle_down && delta != egui::Vec2::ZERO {
-        graph.pan_nodes_by(delta);
+        // Screen-space delta → graph space: at snarl scale s the same
+        // on-screen travel covers 1/s graph units.
+        let scale = graph.last_scale.unwrap_or(1.0).max(0.05);
+        graph.pan_nodes_by(delta / scale);
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         ui.ctx().request_repaint();
     }
@@ -4411,12 +4460,23 @@ impl App {
     }
 
     fn apply_viewport_selection(&mut self, selection: ViewportSelection, ctx: &egui::Context) {
-        if self
-            .stage_browser
-            .select_path(&selection.prim_path, selection.multi)
-        {
-            self.status = format!("Selected {}", selection.prim_path);
-            ctx.request_repaint();
+        match selection.prim_path {
+            Some(path) => {
+                if self.stage_browser.select_path(&path, selection.multi) {
+                    self.status = format!("Selected {path}");
+                    ctx.request_repaint();
+                }
+            }
+            None => {
+                // Empty-space click clears the selection. Skip for
+                // multi-select clicks — ctrl-clicking past a silhouette
+                // shouldn't dump the whole set.
+                if !selection.multi && !self.stage_browser.selected().is_empty() {
+                    self.stage_browser.clear_selection();
+                    self.status = "Selection cleared".to_string();
+                    ctx.request_repaint();
+                }
+            }
         }
     }
 

@@ -253,7 +253,8 @@ pub struct BakeStatus {
 
 #[derive(Debug, Clone)]
 pub struct ViewportSelection {
-    pub prim_path: String,
+    /// `None` — the click landed on empty space; clear the selection.
+    pub prim_path: Option<String>,
     pub multi: bool,
 }
 
@@ -365,7 +366,9 @@ impl Viewport {
             return None;
         }
         let aspect = rect.width() / rect.height().max(1.0);
-        let path = self.prim_path_at_screen_pos(pos, rect, aspect)?;
+        // A miss (None) still produces a selection event — clicking
+        // empty space deselects instead of doing nothing.
+        let path = self.prim_path_at_screen_pos(pos, rect, aspect);
         Some(ViewportSelection {
             prim_path: path,
             multi: modifiers.command || modifiers.ctrl || modifiers.mac_cmd,

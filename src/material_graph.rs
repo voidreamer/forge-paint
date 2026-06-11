@@ -58,6 +58,11 @@ pub struct MaterialGraph {
     /// each spawn so chips dropped in quick succession don't all
     /// pile up at the same position.
     next_node_pos: [f32; 2],
+    /// snarl's viewport scale as of the last draw, captured by the
+    /// viewer's `draw_background`. Runtime-only — used to convert
+    /// screen-space pan deltas into graph space.
+    #[serde(skip)]
+    pub last_scale: Option<f32>,
 }
 
 impl Default for MaterialGraph {
@@ -65,6 +70,7 @@ impl Default for MaterialGraph {
         Self {
             snarl: Snarl::new(),
             next_node_pos: [40.0, 40.0],
+            last_scale: None,
         }
     }
 }
@@ -223,6 +229,9 @@ pub struct GraphViewer<'a> {
     pub bindings: &'a mut Vec<crate::app::MaterialBindingInstance>,
     pub browser_selection: &'a std::collections::HashSet<String>,
     pub pending_actions: &'a mut Vec<GraphAction>,
+    /// Written every frame from `draw_background` — snarl's viewport
+    /// scale, which the show() API doesn't otherwise expose.
+    pub scale_out: &'a mut f32,
 }
 
 impl<'a> GraphViewer<'a> {
@@ -239,6 +248,23 @@ impl<'a> GraphViewer<'a> {
 }
 
 impl<'a> SnarlViewer<MaterialNode> for GraphViewer<'a> {
+    /// Default background drawing plus a scale capture — snarl passes
+    /// its live viewport here and nowhere else we can reach.
+    fn draw_background(
+        &mut self,
+        background: Option<&egui_snarl::ui::BackgroundPattern>,
+        viewport: &egui_snarl::ui::Viewport,
+        snarl_style: &egui_snarl::ui::SnarlStyle,
+        style: &egui::Style,
+        painter: &egui::Painter,
+        _snarl: &Snarl<MaterialNode>,
+    ) {
+        *self.scale_out = viewport.scale;
+        if let Some(background) = background {
+            background.draw(viewport, snarl_style, style, painter);
+        }
+    }
+
     fn title(&mut self, node: &MaterialNode) -> String {
         match node {
             MaterialNode::Shader { binding_id } => {
