@@ -45,6 +45,16 @@ jobs:
         with:
           python-version: '3.11'
 
+      # GitHub's macos-14 image ships CMake 4.x, which hard-errors on
+      # Alembic 1.8.5's explicit `cmake_policy(SET CMP0042 OLD)` (OLD
+      # behavior was removed in CMake 4.0; the block is Darwin-only,
+      # which is why the Windows job doesn't hit it). Pin the last 3.x
+      # release until build_usd.py pulls a fixed Alembic.
+      - name: Pin CMake 3.x (Alembic 1.8.5 configure needs pre-4.0)
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31.6'
+
       - name: Setup Rust (stable, aarch64-apple-darwin)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -208,3 +218,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/forge-paint-macos-arm64.zip
+          # Whichever platform job lands first creates the release for
+          # the tag (with commit-derived notes); the other appends its
+          # zip to the same release.
+          generate_release_notes: true
+          fail_on_unmatched_files: true

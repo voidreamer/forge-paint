@@ -348,3 +348,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist\forge-paint-windows.zip
+          # Whichever platform job lands first creates the release for
+          # the tag (with commit-derived notes); the other appends its
+          # zip to the same release.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
