@@ -64,8 +64,10 @@ and coupling, not rot:
    `cargo test`/`clippy`/`fmt` anywhere. *Fixed:* `ci.yml` gates every
    push/PR with fmt + clippy (`-D warnings`) + texture-baker tests on
    ubuntu.
-3. **Proprietary 3Delight SDK zip (11.8 MB) committed** to a public
-   repo at `.github/3delight-windows.zip`. *Fixed:* removed from HEAD;
+3. **Proprietary 3Delight SDK zip (11.8 MB) committed** at
+   `.github/3delight-windows.zip` — a redistribution problem (and a
+   blocker for ever making the repo public), plus permanent history
+   bloat. *Fixed:* removed from HEAD;
    packaging uses the `DELIGHT_WINDOWS_ARCHIVE_URL` secret (or
    `DELIGHT`/`DELIGHT_WINDOWS_ARCHIVE_PATH` on self-hosted runners).
    The blob is still in *history* — purge is a deferred opt-in (§5).

@@ -58,7 +58,7 @@ hdNSI packaging requires 3Delight.
 Add a DELIGHT_WINDOWS_ARCHIVE_URL repository secret that points at a zip
 containing a 3Delight install tree, or (on a self-hosted runner) set
 DELIGHT to an existing install / DELIGHT_WINDOWS_ARCHIVE_PATH to a local
-archive. The proprietary SDK zip must not be committed to this public repo.
+archive. The proprietary SDK zip must not be committed to the repo.
 "@
   if ($SkipIfMissing) {
     Write-Warning $message
