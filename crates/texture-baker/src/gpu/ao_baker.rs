@@ -225,7 +225,10 @@ pub fn bake_ao_gpu(
     let num_batches = (wg_y + max_rows_per_batch - 1) / max_rows_per_batch;
 
     if num_batches > 1 {
-        log::info!("  GPU AO: splitting into {} batches to avoid timeout", num_batches);
+        log::info!(
+            "  GPU AO: splitting into {} batches to avoid timeout",
+            num_batches
+        );
     }
 
     for batch in 0..num_batches {
@@ -247,11 +250,26 @@ pub fn bake_ao_gpu(
             label: Some("ao_bg_batch"),
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: texel_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: node_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: tri_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: batch_param_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: output_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: texel_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: node_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: tri_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: batch_param_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: output_buffer.as_entire_binding(),
+                },
             ],
         });
 

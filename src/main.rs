@@ -87,9 +87,8 @@ fn run_convert(args: &ConvertArgs) -> i32 {
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
     let result = match ext.as_str() {
-        "obj" => obj_to_usd::convert_obj_to_usd(&args.source, &args.dest).map(|summary| {
-            format!("{} verts, {} tris", summary.vertices, summary.triangles)
-        }),
+        "obj" => obj_to_usd::convert_obj_to_usd(&args.source, &args.dest)
+            .map(|summary| format!("{} verts, {} tris", summary.vertices, summary.triangles)),
         "gltf" | "glb" => {
             gltf_to_usd::convert_gltf_to_usd(&args.source, &args.dest).map(|summary| {
                 format!(
@@ -317,7 +316,9 @@ fn init_file_log() -> Option<std::path::PathBuf> {
                 .ok()
                 .and_then(|e| e.parent().map(|p| p.join("forge-paint.log"))),
         )
-        .chain(std::iter::once(std::env::temp_dir().join("forge-paint.log")));
+        .chain(std::iter::once(
+            std::env::temp_dir().join("forge-paint.log"),
+        ));
     for path in candidates {
         // Probe writability by opening in append/create mode.
         if std::fs::OpenOptions::new()
@@ -397,8 +398,7 @@ fn install_native_crash_logger(log_path: Option<std::path::PathBuf>) {
     // One-shot guard: an access violation may have corrupted the heap,
     // and the file-open below allocates — if that re-faults we must not
     // recurse into ourselves forever. Log at most once.
-    static LOGGED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     unsafe extern "system" fn handler(info: *mut ExceptionPointers) -> i32 {
         unsafe {

@@ -297,11 +297,7 @@ trait Vec3NormalizeOr {
 impl Vec3NormalizeOr for Vec3 {
     fn normalize_or(self, fallback: Vec3) -> Vec3 {
         let len = self.length();
-        if len > 1e-6 {
-            self / len
-        } else {
-            fallback
-        }
+        if len > 1e-6 { self / len } else { fallback }
     }
 }
 

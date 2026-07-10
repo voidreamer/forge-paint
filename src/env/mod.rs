@@ -11,10 +11,10 @@ pub mod prefilter;
 pub mod skybox;
 pub use brdf_lut::BrdfLut;
 pub use irradiance::IrradianceBaker;
-pub use prefilter::{PrefilterBaker, PREFILTER_MIPS};
+pub use prefilter::{PREFILTER_MIPS, PrefilterBaker};
 pub use skybox::SkyboxPipeline;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
 use half::f16;

@@ -1,4 +1,4 @@
-use bevy_mikktspace::{generate_tangents, Geometry, TangentSpace};
+use bevy_mikktspace::{Geometry, TangentSpace, generate_tangents};
 use glam::{Vec3, Vec4};
 
 use crate::mesh::Mesh;

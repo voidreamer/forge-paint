@@ -15,4 +15,4 @@ pub use presets::SmartMaterialPreset;
 pub use projection::{ProjBrushUniforms, ProjectionBrushPipeline};
 pub use smart_mask::{SmartMaskParams, SmartMaskSource};
 pub use smart_mask_pipeline::SmartMaskPipeline;
-pub use target::{MaterialUniforms, PaintTarget, MAX_TILES};
+pub use target::{MAX_TILES, MaterialUniforms, PaintTarget};

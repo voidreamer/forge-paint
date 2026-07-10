@@ -48,11 +48,7 @@ pub struct RasterInput<'a> {
 /// position, normal, tangent, and bitangent using barycentric coordinates.
 /// If a cage mesh is provided, cage positions and cage→lowpoly directions are also interpolated.
 /// Uses conservative rasterization (half-pixel expansion) to avoid gaps.
-pub fn rasterize_uv_space(
-    inputs: &[RasterInput],
-    width: u32,
-    height: u32,
-) -> TexelGrid {
+pub fn rasterize_uv_space(inputs: &[RasterInput], width: u32, height: u32) -> TexelGrid {
     let total = (width * height) as usize;
     let mut data: Vec<Option<TexelData>> = vec![None; total];
 
@@ -99,16 +95,16 @@ pub fn rasterize_uv_space(
                     if let Some((w0, w1, w2)) = barycentric_2d(px_center, px) {
                         // Conservative rasterization: accept if close to the triangle
                         if w0 >= -0.01 && w1 >= -0.01 && w2 >= -0.01 {
-                            let position = positions[0] * w0 + positions[1] * w1 + positions[2] * w2;
+                            let position =
+                                positions[0] * w0 + positions[1] * w1 + positions[2] * w2;
                             let normal =
                                 (normals[0] * w0 + normals[1] * w1 + normals[2] * w2).normalize();
-                            let tangent =
-                                (tan0 * w0 + tan1 * w1 + tan2 * w2).normalize();
-                            let bitangent =
-                                (bitan0 * w0 + bitan1 * w1 + bitan2 * w2).normalize();
+                            let tangent = (tan0 * w0 + tan1 * w1 + tan2 * w2).normalize();
+                            let bitangent = (bitan0 * w0 + bitan1 * w1 + bitan2 * w2).normalize();
 
                             // Interpolate cage data if available
-                            let (cage_position, cage_direction) = if let Some(cp) = &cage_positions {
+                            let (cage_position, cage_direction) = if let Some(cp) = &cage_positions
+                            {
                                 let cage_pos = cp[0] * w0 + cp[1] * w1 + cp[2] * w2;
                                 let dir = (position - cage_pos).normalize();
                                 (Some(cage_pos), Some(dir))

@@ -88,10 +88,7 @@ impl FlatBvh {
                         _pad2: 0,
                     });
                 }
-                BvhNode::Leaf {
-                    shape_index,
-                    ..
-                } => {
+                BvhNode::Leaf { shape_index, .. } => {
                     let tri = &accel.triangles[*shape_index];
                     let min = tri.v0.min(tri.v1).min(tri.v2);
                     let max = tri.v0.max(tri.v1).max(tri.v2);

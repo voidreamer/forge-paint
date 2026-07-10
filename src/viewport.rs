@@ -12,12 +12,12 @@ use crate::env::{
 use crate::fxaa::FxaaPipeline;
 use crate::mesh::{CpuMesh, GpuMesh};
 use crate::paint::{
-    target::MaterialUniforms, udim, BrushPipeline, BrushUniforms, Compositor, Layer, LayerStack,
-    PaintChannel, PaintTarget, ProjBrushUniforms, ProjectionBrushPipeline,
+    BrushPipeline, BrushUniforms, Compositor, Layer, LayerStack, PaintChannel, PaintTarget,
+    ProjBrushUniforms, ProjectionBrushPipeline, target::MaterialUniforms, udim,
 };
 use crate::pick;
 use crate::post::{PostPipeline, PostUniforms};
-use crate::render::{FrameUniforms, Renderer, TonemapMode, ViewMode, HDR_FORMAT, LDR_FORMAT};
+use crate::render::{FrameUniforms, HDR_FORMAT, LDR_FORMAT, Renderer, TonemapMode, ViewMode};
 use crate::wireframe::WireframePipeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

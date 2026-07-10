@@ -29,9 +29,7 @@ pub fn bake_position_texel(texel: &TexelData, normalization: &PositionNormalizat
 }
 
 /// Compute the bounding box of all texels in the grid.
-pub fn compute_texel_bounds(
-    data: &[Option<TexelData>],
-) -> (Vec3, Vec3) {
+pub fn compute_texel_bounds(data: &[Option<TexelData>]) -> (Vec3, Vec3) {
     let mut min = Vec3::splat(f32::MAX);
     let mut max = Vec3::splat(f32::MIN);
 

@@ -132,11 +132,26 @@ pub fn project_rays_gpu(
         label: Some("proj_bg"),
         layout: &bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: texel_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: node_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: tri_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: param_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: output_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: texel_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: node_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: tri_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: param_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: output_buffer.as_entire_binding(),
+            },
         ],
     });
 

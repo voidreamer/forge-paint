@@ -1,5 +1,5 @@
 use crate::usd_out::{fmt_f32, sanitize_identifier, write_usda_document};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::fmt::Write as _;
 use std::path::Path;
 

@@ -32,11 +32,7 @@ pub fn dilate_rgb_gpu(
 
     // Unflatten back to RGB
     for i in 0..total {
-        buffer[i] = [
-            result[i * 3],
-            result[i * 3 + 1],
-            result[i * 3 + 2],
-        ];
+        buffer[i] = [result[i * 3], result[i * 3 + 1], result[i * 3 + 2]];
     }
 }
 
@@ -167,22 +163,52 @@ fn run_jfa(
         label: Some("jfa_bg_a2b"),
         layout: &bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: param_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: data_buf_a.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: data_buf_b.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: mask_buf_a.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: mask_buf_b.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: param_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: data_buf_a.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: data_buf_b.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: mask_buf_a.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: mask_buf_b.as_entire_binding(),
+            },
         ],
     });
     let bg_b_to_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("jfa_bg_b2a"),
         layout: &bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: param_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: data_buf_b.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: data_buf_a.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: mask_buf_b.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: mask_buf_a.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: param_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: data_buf_b.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: data_buf_a.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: mask_buf_b.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: mask_buf_a.as_entire_binding(),
+            },
         ],
     });
 
@@ -243,7 +269,11 @@ fn run_jfa(
     }
 
     // Read back from whichever buffer has the final result
-    let final_data_buf = if use_a_as_input { &data_buf_a } else { &data_buf_b };
+    let final_data_buf = if use_a_as_input {
+        &data_buf_a
+    } else {
+        &data_buf_b
+    };
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jfa_readback"),
         size: (total_floats * 4) as u64,

@@ -12,7 +12,11 @@ pub fn dilate_rgb(
     let w = width as usize;
     let h = height as usize;
     let mut current_mask = mask.to_vec();
-    let max_iters = if iterations == 0 { w.max(h) as u32 } else { iterations };
+    let max_iters = if iterations == 0 {
+        w.max(h) as u32
+    } else {
+        iterations
+    };
 
     for _ in 0..max_iters {
         let mut new_pixels: Vec<(usize, [f32; 3])> = Vec::new();
@@ -30,22 +34,30 @@ pub fn dilate_rgb(
 
                 if x > 0 && current_mask[idx - 1] {
                     let n = buffer[idx - 1];
-                    sum[0] += n[0]; sum[1] += n[1]; sum[2] += n[2];
+                    sum[0] += n[0];
+                    sum[1] += n[1];
+                    sum[2] += n[2];
                     count += 1;
                 }
                 if x + 1 < w && current_mask[idx + 1] {
                     let n = buffer[idx + 1];
-                    sum[0] += n[0]; sum[1] += n[1]; sum[2] += n[2];
+                    sum[0] += n[0];
+                    sum[1] += n[1];
+                    sum[2] += n[2];
                     count += 1;
                 }
                 if y > 0 && current_mask[idx - w] {
                     let n = buffer[idx - w];
-                    sum[0] += n[0]; sum[1] += n[1]; sum[2] += n[2];
+                    sum[0] += n[0];
+                    sum[1] += n[1];
+                    sum[2] += n[2];
                     count += 1;
                 }
                 if y + 1 < h && current_mask[idx + w] {
                     let n = buffer[idx + w];
-                    sum[0] += n[0]; sum[1] += n[1]; sum[2] += n[2];
+                    sum[0] += n[0];
+                    sum[1] += n[1];
+                    sum[2] += n[2];
                     count += 1;
                 }
 
@@ -68,17 +80,15 @@ pub fn dilate_rgb(
 }
 
 /// Dilate a single-channel (grayscale) buffer.
-pub fn dilate_gray(
-    buffer: &mut Vec<f32>,
-    mask: &[bool],
-    width: u32,
-    height: u32,
-    iterations: u32,
-) {
+pub fn dilate_gray(buffer: &mut Vec<f32>, mask: &[bool], width: u32, height: u32, iterations: u32) {
     let w = width as usize;
     let h = height as usize;
     let mut current_mask = mask.to_vec();
-    let max_iters = if iterations == 0 { w.max(h) as u32 } else { iterations };
+    let max_iters = if iterations == 0 {
+        w.max(h) as u32
+    } else {
+        iterations
+    };
 
     for _ in 0..max_iters {
         let mut new_pixels: Vec<(usize, f32)> = Vec::new();

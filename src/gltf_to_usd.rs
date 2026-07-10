@@ -13,7 +13,7 @@
 //! vertex-interpolated normals/st — much smaller files.
 
 use crate::usd_out::{fmt_f32, sanitize_identifier, write_usda_document};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -106,7 +106,11 @@ fn collect_node(
             let normal_mat = glam::Mat3::from_mat4(world).inverse().transpose();
             let points: Vec<[f32; 3]> = raw_points
                 .iter()
-                .map(|p| world.transform_point3(glam::Vec3::from_array(*p)).to_array())
+                .map(|p| {
+                    world
+                        .transform_point3(glam::Vec3::from_array(*p))
+                        .to_array()
+                })
                 .collect();
             let normals: Vec<[f32; 3]> = match reader.read_normals() {
                 Some(iter) => iter
@@ -300,8 +304,12 @@ mod tests {
         let bin_path = temp_file("quad.bin");
         let usda = temp_file("quad_out.usda");
 
-        let positions: [[f32; 3]; 4] =
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
+        let positions: [[f32; 3]; 4] = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
         // v=1 at the bottom row in glTF's top-left convention; the
         // converter must emit st v=0 there.
         let uvs: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];

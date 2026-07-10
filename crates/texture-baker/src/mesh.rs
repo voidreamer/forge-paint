@@ -36,13 +36,20 @@ impl Mesh {
             let vertex_count = m.positions.len() / 3;
 
             let positions: Vec<Vec3> = (0..vertex_count)
-                .map(|i| Vec3::new(m.positions[i * 3], m.positions[i * 3 + 1], m.positions[i * 3 + 2]))
+                .map(|i| {
+                    Vec3::new(
+                        m.positions[i * 3],
+                        m.positions[i * 3 + 1],
+                        m.positions[i * 3 + 2],
+                    )
+                })
                 .collect();
 
             let normals: Vec<Vec3> = if m.normals.len() == vertex_count * 3 {
                 (0..vertex_count)
                     .map(|i| {
-                        Vec3::new(m.normals[i * 3], m.normals[i * 3 + 1], m.normals[i * 3 + 2]).normalize()
+                        Vec3::new(m.normals[i * 3], m.normals[i * 3 + 1], m.normals[i * 3 + 2])
+                            .normalize()
                     })
                     .collect()
             } else {
@@ -115,9 +122,13 @@ impl Mesh {
 
                 let normals: Vec<Vec3> = reader
                     .read_normals()
-                    .map(|iter| iter.map(|n| Vec3::new(n[0], n[1], n[2]).normalize()).collect())
+                    .map(|iter| {
+                        iter.map(|n| Vec3::new(n[0], n[1], n[2]).normalize())
+                            .collect()
+                    })
                     .unwrap_or_else(|| {
-                        let flat_indices: Vec<u32> = indices.iter().flat_map(|t| t.iter().copied()).collect();
+                        let flat_indices: Vec<u32> =
+                            indices.iter().flat_map(|t| t.iter().copied()).collect();
                         compute_vertex_normals(&positions, &flat_indices)
                     });
 
@@ -154,7 +165,9 @@ impl Mesh {
         match path.extension().and_then(|e| e.to_str()) {
             Some("obj") => Self::load_obj(path),
             Some("gltf") | Some("glb") => Self::load_gltf(path),
-            Some(ext) => Err(format!("Unsupported mesh format: .{ext} (supported: .obj, .gltf, .glb)")),
+            Some(ext) => Err(format!(
+                "Unsupported mesh format: .{ext} (supported: .obj, .gltf, .glb)"
+            )),
             None => Err("No file extension, cannot determine mesh format".to_string()),
         }
     }

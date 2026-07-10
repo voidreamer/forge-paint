@@ -31,12 +31,7 @@ pub fn downsample_rgb(
 }
 
 /// Downsample a grayscale buffer from (w*factor, h*factor) to (w, h) using box filter.
-pub fn downsample_gray(
-    buffer: &[f32],
-    src_width: u32,
-    src_height: u32,
-    factor: u32,
-) -> Vec<f32> {
+pub fn downsample_gray(buffer: &[f32], src_width: u32, src_height: u32, factor: u32) -> Vec<f32> {
     let dst_width = src_width / factor;
     let dst_height = src_height / factor;
     let mut result = vec![0.0f32; (dst_width * dst_height) as usize];
@@ -60,12 +55,7 @@ pub fn downsample_gray(
 }
 
 /// Downsample a boolean mask — a texel is valid if any source texel was valid.
-pub fn downsample_mask(
-    mask: &[bool],
-    src_width: u32,
-    src_height: u32,
-    factor: u32,
-) -> Vec<bool> {
+pub fn downsample_mask(mask: &[bool], src_width: u32, src_height: u32, factor: u32) -> Vec<bool> {
     let dst_width = src_width / factor;
     let dst_height = src_height / factor;
     let mut result = vec![false; (dst_width * dst_height) as usize];

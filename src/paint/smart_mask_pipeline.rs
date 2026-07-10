@@ -5,8 +5,8 @@
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
 
-use crate::bake::integration::MapKind;
 use crate::bake::MeshMaps;
+use crate::bake::integration::MapKind;
 use crate::paint::layer::{Layer, Mask};
 use crate::paint::smart_mask::{SmartMaskParams, SmartMaskSource};
 
