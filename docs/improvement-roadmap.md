@@ -65,12 +65,12 @@ and coupling, not rot:
    push/PR with fmt + clippy (`-D warnings`) + texture-baker tests on
    ubuntu.
 3. **Proprietary 3Delight SDK zip (11.8 MB) committed** at
-   `.github/3delight-windows.zip` — a redistribution problem (and a
-   blocker for ever making the repo public), plus permanent history
-   bloat. *Fixed:* removed from HEAD;
-   packaging uses the `DELIGHT_WINDOWS_ARCHIVE_URL` secret (or
-   `DELIGHT`/`DELIGHT_WINDOWS_ARCHIVE_PATH` on self-hosted runners).
-   The blob is still in *history* — purge is a deferred opt-in (§5).
+   `.github/3delight-windows.zip` — a redistribution problem (the repo
+   is public), plus permanent history bloat. *Fixed:* removed from
+   HEAD; packaging uses the `DELIGHT_WINDOWS_ARCHIVE_URL` secret (or
+   `DELIGHT`/`DELIGHT_WINDOWS_ARCHIVE_PATH` on self-hosted runners);
+   history rewritten 2026-07-10 to purge the blob from all commits
+   (§5).
 4. **No README, no LICENSE.** *Fixed:* both added (MIT).
 
 ### MEDIUM — correctness/robustness debt (Phases 2–6)
@@ -292,9 +292,14 @@ UI-touching phases (P4/P5) also need the runtime smoke.
 
 ## 5. Deferred / opt-in items
 
-- **History purge of the 3Delight zip** (`git filter-repo` + force
-  push): invalidates existing clones; coordinate before doing it. Until
-  then the blob remains in old commits.
+- ✅ **History purge of the 3Delight zip** — done 2026-07-10 when the
+  repo went public (`git filter-repo --invert-paths` over all branches
+  and tags + force-push; all SHAs from the zip's introduction onward
+  changed). Any clone made before the rewrite needs
+  `git fetch && git reset --hard origin/<branch>` or a fresh clone.
+  Residual: GitHub may retain old objects behind pull-request refs and
+  cached views — ask GitHub Support to garbage-collect the repository
+  if complete removal matters.
 - **`DELIGHT_WINDOWS_ARCHIVE_URL` secret**: must be set in repo
   settings for hosted Windows hdNSI builds now that the in-repo zip is
   gone (tag builds skip hdNSI gracefully without it).
