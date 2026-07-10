@@ -20,10 +20,11 @@ texture-baker = { path = "crates/texture-baker" }
 # own build.rs reads.
 rust-usd = "0.0.5"
 # hydra-rs is the sibling Hydra (Storm) binding from the same repo.
-# Public dep is a version range; `[patch.crates-io]` at the bottom of
-# this file redirects to the local ../rust-usd/hydra-rs checkout, so
-# day-to-day dev uses the source tree. Release CI strips the local
-# patch block and builds from these published crates.
+# Both crates resolve from crates.io by default (CI and fresh clones
+# build without any sibling checkout). To develop against a local
+# ../rust-usd source tree instead, create an untracked
+# .cargo/config.toml with a [patch.crates-io] block — see README.md
+# ("Developing against rust-usd sources").
 hydra-rs = "0.0.11"
 
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu"] }
@@ -48,7 +49,6 @@ rayon = "1.10"
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
-thiserror = "2"
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }
 # glTF / GLB parsing for the static model -> USD converter (same crate
@@ -81,19 +81,7 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
-# Local-dev source overrides — the public deps above stay as version
-# requirements so the published surface is clean (one line per crate,
-# version-pinned). These patches redirect Cargo to the local checkout
-# while the rust-usd repo is sitting next to forge-paint on disk.
-#
-# Cargo expects the paths to exist when this manifest is read. CI and
-# anyone cloning without `../rust-usd/` next door will need to either
-# check out that sibling repo, rewrite the paths, or strip this block
-# before building.
-#
-# Bump or remove these entries as crates publish: once hydra-rs 0.0.4
-# lands on crates.io the patch can go (or stay, your call — it'll
-# keep favouring the local source tree as long as the path resolves).
-[patch.crates-io]
-rust-usd = { path = "../rust-usd" }
-hydra-rs = { path = "../rust-usd/hydra-rs" }
+# Local-dev source overrides for rust-usd / hydra-rs live in an
+# untracked .cargo/config.toml (see README.md), NOT in this manifest,
+# so that fresh clones and CI resolve straight from crates.io without
+# needing the private ../rust-usd sibling checkout.

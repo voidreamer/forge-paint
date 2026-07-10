@@ -43,16 +43,10 @@ jobs:
       - name: Checkout forge-paint
         uses: actions/checkout@v4
 
-      - name: Use published USD bindings
-        shell: pwsh
-        run: |
-          $toml = Get-Content Cargo.toml -Raw
-          $toml = [regex]::Replace(
-            $toml,
-            '(?ms)\r?\n# Local-dev source overrides.*?\[patch\.crates-io\].*\z',
-            "`n"
-          )
-          Set-Content Cargo.toml $toml -NoNewline
+      # rust-usd / hydra-rs resolve from crates.io — the local-dev
+      # [patch.crates-io] override lives in an untracked
+      # .cargo/config.toml (see README.md), so no manifest surgery
+      # is needed here.
 
       # build_usd.py is a Python script. We don't need Python at link
       # time (USD itself is built --no-python), only as a build driver.

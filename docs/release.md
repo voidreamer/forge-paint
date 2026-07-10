@@ -25,10 +25,11 @@ The workflows build OpenUSD with imaging enabled because `hydra-rs` links Hydra
 and `UsdImagingGL`, and the bundled app must include the Storm render delegate.
 They still disable Python, tests, examples, tutorials, docs, and `usdview`.
 
-CI uses the published `rust-usd` and `hydra-rs` crates. The repository keeps a
-local `[patch.crates-io]` block for day-to-day development against
-`../rust-usd`; the workflows strip that block before building so they do not
-need access to a private sibling checkout.
+CI uses the published `rust-usd` and `hydra-rs` crates — `Cargo.toml` resolves
+straight from crates.io, so the workflows need no manifest surgery and no
+access to a private sibling checkout. Day-to-day development against local
+`../rust-usd` sources opts in via an untracked `.cargo/config.toml` with a
+`[patch.crates-io]` block (see README.md).
 
 On Windows, DLLs imported by `forge-paint.exe` must be discoverable before
 `main()` runs, so the workflow copies the top-level OpenUSD runtime DLLs from

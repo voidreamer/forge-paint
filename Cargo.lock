@@ -1426,7 +1426,6 @@ dependencies = [
  "serde",
  "serde_json",
  "texture-baker",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1729,6 +1728,8 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 [[package]]
 name = "hydra-rs"
 version = "0.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3a606fe4f5009f8c271be13cf0e30cce8c9799e98b6b4394fc896803db03db6"
 dependencies = [
  "cxx",
  "cxx-build",
@@ -3295,6 +3296,8 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 [[package]]
 name = "rust-usd"
 version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88eb7d4360f51831c25d9af2181540a63352fd05a53ceb879684a3483260790c"
 dependencies = [
  "cxx",
  "cxx-build",

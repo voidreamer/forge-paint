@@ -2,6 +2,10 @@
 **/*.rs.bk
 .DS_Store
 
+# Local-dev source overrides for rust-usd / hydra-rs ([patch.crates-io]
+# pointing at ../rust-usd) — machine-specific, see README.md.
+/.cargo/config.toml
+
 # HDRIs — bring your own (Poly Haven CC0 recommended). Keep the folder,
 # skip the heavy binaries.
 /assets/hdri/*.hdr
