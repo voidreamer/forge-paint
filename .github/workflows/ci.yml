@@ -1,0 +1,41 @@
+name: ci
+
+# Fast Linux checks on every push and pull request — the counterpart to
+# the heavyweight macos-build / windows-build release workflows (which
+# compile OpenUSD and only run on dispatch or v* tags).
+#
+# The forge-paint binary itself needs a prebuilt OpenUSD (rust-usd's
+# build.rs), which this job deliberately avoids. What CAN run on a bare
+# ubuntu runner:
+#   - workspace resolution (rust-usd / hydra-rs come from crates.io)
+#   - rustfmt over the whole tree
+#   - clippy + the unit-test suite for crates/texture-baker, which has
+#     no USD dependency
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (texture-baker)
+        run: cargo clippy -p texture-baker --all-targets -- -D warnings
+
+      - name: tests (texture-baker)
+        run: cargo test -p texture-baker
