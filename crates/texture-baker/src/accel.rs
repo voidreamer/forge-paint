@@ -135,13 +135,14 @@ impl AccelStructure {
         let hits = self.bvh.traverse(&ray, &self.triangles);
 
         for tri in hits {
-            if let Some(hit) = ray_triangle_intersect(origin, direction, tri) {
-                if hit.t > min_t && hit.t < max_t {
-                    if ignore_backface && hit.is_backface {
-                        continue;
-                    }
-                    return true;
+            if let Some(hit) = ray_triangle_intersect(origin, direction, tri)
+                && hit.t > min_t
+                && hit.t < max_t
+            {
+                if ignore_backface && hit.is_backface {
+                    continue;
                 }
+                return true;
             }
         }
 
@@ -187,4 +188,46 @@ fn ray_triangle_intersect(origin: Vec3, dir: Vec3, tri: &Triangle) -> Option<Hit
         mesh_index: tri.mesh_index,
         is_backface,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit_triangle() -> Mesh {
+        Mesh {
+            name: "tri".into(),
+            positions: vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+            normals: vec![Vec3::Z; 3],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            indices: vec![[0, 1, 2]],
+        }
+    }
+
+    #[test]
+    fn ray_hits_front_face_at_expected_distance() {
+        let accel = AccelStructure::build(&[unit_triangle()]);
+        let hit = accel
+            .trace_closest(Vec3::new(0.25, 0.25, 1.0), -Vec3::Z, 10.0, 0.0, false)
+            .expect("ray through the triangle interior must hit");
+        assert!((hit.t - 1.0).abs() < 1e-5);
+        assert_eq!(hit.tri_index, 0);
+        assert_eq!(hit.mesh_index, 0);
+        // Triangle winding gives a +Z normal; a -Z ray sees the front face.
+        assert!(!hit.is_backface);
+    }
+
+    #[test]
+    fn ray_outside_the_triangle_misses() {
+        let accel = AccelStructure::build(&[unit_triangle()]);
+        assert!(
+            accel
+                .trace_closest(Vec3::new(2.0, 2.0, 1.0), -Vec3::Z, 10.0, 0.0, false)
+                .is_none()
+        );
+    }
 }

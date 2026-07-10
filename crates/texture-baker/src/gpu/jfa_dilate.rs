@@ -16,7 +16,7 @@ struct JfaParams {
 /// Runs in O(log N) passes where N = max(width, height).
 pub fn dilate_rgb_gpu(
     ctx: &GpuContext,
-    buffer: &mut Vec<[f32; 3]>,
+    buffer: &mut [[f32; 3]],
     mask: &[bool],
     width: u32,
     height: u32,
@@ -39,7 +39,7 @@ pub fn dilate_rgb_gpu(
 /// Dilate a grayscale buffer on the GPU using Jump Flooding Algorithm.
 pub fn dilate_gray_gpu(
     ctx: &GpuContext,
-    buffer: &mut Vec<f32>,
+    buffer: &mut [f32],
     mask: &[bool],
     width: u32,
     height: u32,
@@ -227,8 +227,8 @@ fn run_jfa(
         cache: None,
     });
 
-    let wg_x = (width + 7) / 8;
-    let wg_y = (height + 7) / 8;
+    let wg_x = width.div_ceil(8);
+    let wg_y = height.div_ceil(8);
 
     // JFA passes: step_size = max_dim/2, max_dim/4, ..., 2, 1
     let max_dim = width.max(height);

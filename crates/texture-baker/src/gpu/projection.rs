@@ -45,10 +45,10 @@ pub fn project_rays_gpu(
     let gpu_texels = common::pack_texels(texel_data);
 
     let workgroup_size = 64u32;
-    let total_workgroups = (total as u32 + workgroup_size - 1) / workgroup_size;
+    let total_workgroups = (total as u32).div_ceil(workgroup_size);
     let max_dim = 65535u32;
     let wg_x = total_workgroups.min(max_dim);
-    let wg_y = (total_workgroups + wg_x - 1) / wg_x;
+    let wg_y = total_workgroups.div_ceil(wg_x);
 
     let params = GpuParams {
         frontal_distance,

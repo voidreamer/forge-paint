@@ -43,9 +43,11 @@ impl GpuContext {
         // range. The defaults stay at wgpu::Limits::default() for every
         // other knob.
         let adapter_limits = adapter.limits();
-        let mut limits = wgpu::Limits::default();
-        limits.max_buffer_size = adapter_limits.max_buffer_size;
-        limits.max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size;
+        let limits = wgpu::Limits {
+            max_buffer_size: adapter_limits.max_buffer_size,
+            max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+            ..wgpu::Limits::default()
+        };
 
         log::info!(
             "GPU buffer limits: max_buffer={} MB, max_storage_binding={} MB",

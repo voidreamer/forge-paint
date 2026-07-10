@@ -161,3 +161,78 @@ fn barycentric_2d(p: [f32; 2], tri: [[f32; 2]; 3]) -> Option<(f32, f32, f32)> {
 
     Some((w0, w1, w2))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tangent::compute_tangents;
+
+    /// Unit quad in the XY plane whose UVs equal its XY coordinates, so the
+    /// interpolated world position at a texel is exactly its UV coordinate.
+    fn uv_quad() -> Mesh {
+        Mesh {
+            name: "quad".into(),
+            positions: vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+            normals: vec![Vec3::Z; 4],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            indices: vec![[0, 1, 2], [0, 2, 3]],
+        }
+    }
+
+    #[test]
+    fn full_uv_quad_covers_every_texel() {
+        let mesh = uv_quad();
+        let tangents = compute_tangents(&mesh);
+        let grid = rasterize_uv_space(
+            &[RasterInput {
+                mesh_index: 0,
+                mesh: &mesh,
+                tangent_data: &tangents,
+                cage: None,
+            }],
+            8,
+            8,
+        );
+
+        assert!(grid.data.iter().all(Option::is_some));
+
+        // Texel (3, 5): u = 3.5/8; pixel y = (1 - v) * h, so v = 1 - 5.5/8.
+        let texel = grid.get(3, 5).expect("covered texel");
+        assert!((texel.position.x - 3.5 / 8.0).abs() < 1e-4);
+        assert!((texel.position.y - (1.0 - 5.5 / 8.0)).abs() < 1e-4);
+        assert!(texel.position.z.abs() < 1e-6);
+        assert!((texel.normal - Vec3::Z).length() < 1e-5);
+        assert_eq!(texel.mesh_index, 0);
+    }
+
+    #[test]
+    fn texels_outside_the_islands_stay_none() {
+        // Shrink the quad's UVs into the lower-left quadrant; the opposite
+        // corner of the atlas must stay empty while the island interior fills.
+        let mut mesh = uv_quad();
+        for uv in &mut mesh.uvs {
+            uv[0] *= 0.5;
+            uv[1] *= 0.5;
+        }
+        let tangents = compute_tangents(&mesh);
+        let grid = rasterize_uv_space(
+            &[RasterInput {
+                mesh_index: 0,
+                mesh: &mesh,
+                tangent_data: &tangents,
+                cage: None,
+            }],
+            16,
+            16,
+        );
+
+        // v < 0.5 maps to the bottom half of the pixel grid (y >= 8).
+        assert!(grid.get(2, 13).is_some(), "island interior should be hit");
+        assert!(grid.get(15, 0).is_none(), "far corner should stay empty");
+    }
+}

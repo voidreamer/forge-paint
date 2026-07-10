@@ -40,7 +40,7 @@ pub fn bake_ao_gpu(
     let gpu_texels = common::pack_texels(texel_data);
 
     let workgroup_size = 64u32;
-    let total_workgroups = (total as u32 + workgroup_size - 1) / workgroup_size;
+    let total_workgroups = (total as u32).div_ceil(workgroup_size);
     let max_dim = 65535u32;
     let wg_x = total_workgroups.min(max_dim);
 
@@ -82,12 +82,6 @@ pub fn bake_ao_gpu(
         label: Some("triangles"),
         contents: bytemuck::cast_slice(&flat_bvh.triangles),
         usage: wgpu::BufferUsages::STORAGE,
-    });
-
-    let param_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
     });
 
     let output_size = (total * std::mem::size_of::<f32>()) as u64;
@@ -173,32 +167,8 @@ pub fn bake_ao_gpu(
         ],
     });
 
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("ao_bg"),
-        layout: &bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: texel_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: node_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: tri_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: param_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: output_buffer.as_entire_binding(),
-            },
-        ],
-    });
+    // The actual bind groups are created per batch in the dispatch loop
+    // below (each batch rewrites the y_offset param buffer).
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("ao_pl"),
@@ -216,13 +186,13 @@ pub fn bake_ao_gpu(
     });
 
     // Dispatch (wg_x, wg_y already computed above)
-    let wg_y = (total_workgroups + wg_x - 1) / wg_x;
+    let wg_y = total_workgroups.div_ceil(wg_x);
 
     // For large workloads (4K+, 256 rays), a single dispatch can exceed
     // Metal's command buffer timeout (~5s). We add a y_offset uniform to
     // the params and dispatch in row-batches, each in its own command buffer.
     let max_rows_per_batch = 128u32;
-    let num_batches = (wg_y + max_rows_per_batch - 1) / max_rows_per_batch;
+    let num_batches = wg_y.div_ceil(max_rows_per_batch);
 
     if num_batches > 1 {
         log::info!(

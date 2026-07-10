@@ -227,7 +227,7 @@ fn sample_hemisphere(
 
 /// Van der Corput radical inverse (base 2) for Hammersley sequence.
 fn radical_inverse_vdc(mut bits: u32) -> f32 {
-    bits = (bits << 16) | (bits >> 16);
+    bits = bits.rotate_right(16);
     bits = ((bits & 0x55555555) << 1) | ((bits & 0xAAAAAAAA) >> 1);
     bits = ((bits & 0x33333333) << 2) | ((bits & 0xCCCCCCCC) >> 2);
     bits = ((bits & 0x0F0F0F0F) << 4) | ((bits & 0xF0F0F0F0) >> 4);

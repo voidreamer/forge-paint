@@ -166,7 +166,7 @@ pub fn bake_single_map_preview(
     // Compute tangents for the first low-poly mesh
     let tangent_data: Vec<_> = low_poly_meshes
         .iter()
-        .map(|m| tangent::compute_tangents(m))
+        .map(tangent::compute_tangents)
         .collect();
 
     // Rasterize
@@ -389,7 +389,7 @@ pub fn bake_with_progress(
     );
     let tangent_data: Vec<_> = low_poly_meshes
         .iter()
-        .map(|m| tangent::compute_tangents(m))
+        .map(tangent::compute_tangents)
         .collect();
 
     // Validate cage meshes if provided
@@ -594,32 +594,32 @@ pub fn bake_with_progress(
 
     // --- Helper closures for AA-aware output ---
     // Downsample + dilate + write for RGB maps
-    let write_rgb =
-        |buffer: &[[f32; 3]],
-         name: &str,
-         ext: &str,
-         dil: u32,
-         write_fn: fn(&[[f32; 3]], u32, u32, &std::path::Path) -> Result<(), String>|
-         -> Result<(), String> {
-            let (mut final_buf, final_mask) = if aa > 1 {
-                (
-                    supersample::downsample_rgb(buffer, w, h, aa),
-                    supersample::downsample_mask(&mask, w, h, aa),
-                )
-            } else {
-                (buffer.to_vec(), mask.clone())
-            };
-            // Use GPU JFA dilation if available and dilation is infinite (0)
-            if let (Some(ctx), 0) = (gpu_ctx_ref, dil) {
-                gpu::jfa_dilate::dilate_rgb_gpu(ctx, &mut final_buf, &final_mask, out_w, out_h);
-            } else {
-                dilate::dilate_rgb(&mut final_buf, &final_mask, out_w, out_h, dil);
-            }
-            let path = out_dir.join(format!("{}_{}.{}", config.output_prefix, name, ext));
-            write_fn(&final_buf, out_w, out_h, &path)?;
-            log::info!("  -> {}", path.display());
-            Ok(())
+    type RgbWriteFn = fn(&[[f32; 3]], u32, u32, &std::path::Path) -> Result<(), String>;
+    let write_rgb = |buffer: &[[f32; 3]],
+                     name: &str,
+                     ext: &str,
+                     dil: u32,
+                     write_fn: RgbWriteFn|
+     -> Result<(), String> {
+        let (mut final_buf, final_mask) = if aa > 1 {
+            (
+                supersample::downsample_rgb(buffer, w, h, aa),
+                supersample::downsample_mask(&mask, w, h, aa),
+            )
+        } else {
+            (buffer.to_vec(), mask.clone())
         };
+        // Use GPU JFA dilation if available and dilation is infinite (0)
+        if let (Some(ctx), 0) = (gpu_ctx_ref, dil) {
+            gpu::jfa_dilate::dilate_rgb_gpu(ctx, &mut final_buf, &final_mask, out_w, out_h);
+        } else {
+            dilate::dilate_rgb(&mut final_buf, &final_mask, out_w, out_h, dil);
+        }
+        let path = out_dir.join(format!("{}_{}.{}", config.output_prefix, name, ext));
+        write_fn(&final_buf, out_w, out_h, &path)?;
+        log::info!("  -> {}", path.display());
+        Ok(())
+    };
 
     // Downsample + dilate + write for grayscale maps
     let write_gray = |buffer: &[f32], name: &str, dil: u32| -> Result<(), String> {
