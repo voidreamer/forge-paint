@@ -43,8 +43,6 @@ pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.29"
 bevy_mikktspace = "1"
-bvh = "0.9"
-nalgebra = "0.32"
 rayon = "1.10"
 log = "0.4"
 env_logger = "0.11"

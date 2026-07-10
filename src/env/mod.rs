@@ -509,6 +509,3 @@ pub fn discover_bundled_hdris(root: &Path) -> Vec<(String, std::path::PathBuf)> 
     }
     Vec::new()
 }
-
-#[allow(dead_code)]
-fn _unused(_: anyhow::Error) {}

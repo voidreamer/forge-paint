@@ -2,7 +2,6 @@ use eframe::egui;
 use egui_wgpu::wgpu;
 use glam::Vec2;
 
-use crate::accel::MeshAccel;
 use crate::background::BackgroundPipeline;
 use crate::bake::{Baker, MeshMaps};
 use crate::camera::OrbitCamera;
@@ -97,7 +96,6 @@ pub struct Viewport {
 
     mesh: GpuMesh,
     pub cpu_mesh: CpuMesh,
-    accel: MeshAccel,
     /// Composited display textures — this is what the PBR shader samples.
     pub paint_target: PaintTarget,
     /// The paint stack. Brushes stamp into `layers[active]`; the compositor
@@ -452,7 +450,6 @@ impl Viewport {
         camera.distance = (gpu.radius * 2.5).max(1.5);
         let scene_radius = gpu.radius.max(0.001);
 
-        let accel = MeshAccel::build(cpu);
         Self {
             renderer,
             background,
@@ -469,7 +466,6 @@ impl Viewport {
             egui_tex_id: None,
             mesh: gpu,
             cpu_mesh: cpu.clone(),
-            accel,
             paint_target,
             layer_stack,
             material_buf,
@@ -556,7 +552,6 @@ impl Viewport {
         self.scene_radius = gpu.radius.max(0.001);
         self.mesh = gpu;
         self.cpu_mesh = cpu.clone();
-        self.accel = MeshAccel::build(cpu);
         self.paint_target = PaintTarget::new(
             device,
             queue,
