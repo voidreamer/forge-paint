@@ -22,10 +22,7 @@ fn main() {
         .expect("usage: forge_uri_smoke <usd-path-or-forge-uri>");
 
     let path = PathBuf::from(&uri);
-    let asset = path
-        .to_str()
-        .expect("non-utf8 input")
-        .to_string();
+    let asset = path.to_str().expect("non-utf8 input").to_string();
 
     println!("opening: {}", asset);
     let stage = match rust_usd::Stage::open(&asset) {
@@ -65,6 +62,9 @@ fn main() {
 
     println!(
         "totals: {} points across {} prims, {} faces, {} face-vertex indices",
-        total_points, meshes.len(), total_faces, total_fvi
+        total_points,
+        meshes.len(),
+        total_faces,
+        total_fvi
     );
 }

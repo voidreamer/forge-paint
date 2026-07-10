@@ -25,10 +25,11 @@ The workflows build OpenUSD with imaging enabled because `hydra-rs` links Hydra
 and `UsdImagingGL`, and the bundled app must include the Storm render delegate.
 They still disable Python, tests, examples, tutorials, docs, and `usdview`.
 
-CI uses the published `rust-usd` and `hydra-rs` crates. The repository keeps a
-local `[patch.crates-io]` block for day-to-day development against
-`../rust-usd`; the workflows strip that block before building so they do not
-need access to a private sibling checkout.
+CI uses the published `rust-usd` and `hydra-rs` crates — `Cargo.toml` resolves
+straight from crates.io, so the workflows need no manifest surgery and no
+access to a private sibling checkout. Day-to-day development against local
+`../rust-usd` sources opts in via an untracked `.cargo/config.toml` with a
+`[patch.crates-io]` block (see README.md).
 
 On Windows, DLLs imported by `forge-paint.exe` must be discoverable before
 `main()` runs, so the workflow copies the top-level OpenUSD runtime DLLs from
@@ -126,9 +127,12 @@ builds still attempt hdNSI packaging opportunistically and skip it if 3Delight
 is unavailable. Use one of:
 
 - a self-hosted runner with `DELIGHT` pointing at the 3Delight install, or
-- a repo archive at `.github/3delight-windows.zip`, or
 - a repository secret named `DELIGHT_WINDOWS_ARCHIVE_URL` pointing at a private
-  zip that contains a 3Delight install tree with `bin/renderdl.exe`.
+  zip that contains a 3Delight install tree with `bin/renderdl.exe` (the SDK is
+  proprietary and must not be committed to the repo — an earlier in-repo
+  `.github/3delight-windows.zip` was removed for that reason; a local archive
+  path can still be supplied via `DELIGHT_WINDOWS_ARCHIVE_PATH` on self-hosted
+  runners).
 
 At runtime on Windows, forge-paint searches for 3Delight in this order:
 

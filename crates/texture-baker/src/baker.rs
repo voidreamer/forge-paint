@@ -2,7 +2,6 @@ use rayon::prelude::*;
 use std::path::Path;
 
 use crate::accel::AccelStructure;
-use crate::gpu;
 use crate::bakers::ao::{self, AoSettings, RaySettings};
 use crate::bakers::curvature::{self, CurvatureSettings};
 use crate::bakers::height;
@@ -10,6 +9,7 @@ use crate::bakers::id::{self, IdSource};
 use crate::bakers::normal::{self, NormalMapFormat};
 use crate::bakers::position::{self, PositionNormalization};
 use crate::dilate;
+use crate::gpu;
 use crate::mesh::Mesh;
 use crate::output;
 use crate::raster;
@@ -164,7 +164,10 @@ pub fn bake_single_map_preview(
     let total = (w * h) as usize;
 
     // Compute tangents for the first low-poly mesh
-    let tangent_data: Vec<_> = low_poly_meshes.iter().map(|m| tangent::compute_tangents(m)).collect();
+    let tangent_data: Vec<_> = low_poly_meshes
+        .iter()
+        .map(tangent::compute_tangents)
+        .collect();
 
     // Rasterize
     let raster_inputs: Vec<raster::RasterInput> = low_poly_meshes
@@ -219,12 +222,13 @@ pub fn bake_single_map_preview(
             let buffer = if let Some((ref ctx, ref flat_bvh)) = gpu_ctx {
                 gpu::ao_baker::bake_ao_gpu(ctx, &grid.data, flat_bvh, &settings, false)
             } else {
-                (0..total).into_par_iter().map(|idx| {
-                    match &grid.data[idx] {
+                (0..total)
+                    .into_par_iter()
+                    .map(|idx| match &grid.data[idx] {
                         Some(texel) => ao::bake_ao_texel(texel, &accel, &settings, idx as u32),
                         None => 1.0,
-                    }
-                }).collect()
+                    })
+                    .collect()
             };
             let mut buf = buffer;
             dilate::dilate_gray(&mut buf, &mask, w, h, 0);
@@ -233,12 +237,21 @@ pub fn bake_single_map_preview(
         MapType::Curvature => {
             // Curvature needs world-space normals first
             let mut wn_buffer = vec![[0.5f32, 0.5, 1.0]; total];
-            wn_buffer.par_iter_mut().enumerate().for_each(|(idx, pixel)| {
-                if let Some(texel) = &grid.data[idx] {
-                    *pixel = normal::bake_world_normal_texel(texel, None);
-                }
-            });
-            let buffer = curvature::compute_curvature_from_normals(&wn_buffer, &mask, w, h, &config.curvature_settings);
+            wn_buffer
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(idx, pixel)| {
+                    if let Some(texel) = &grid.data[idx] {
+                        *pixel = normal::bake_world_normal_texel(texel, None);
+                    }
+                });
+            let buffer = curvature::compute_curvature_from_normals(
+                &wn_buffer,
+                &mask,
+                w,
+                h,
+                &config.curvature_settings,
+            );
             let mut buf = buffer;
             dilate::dilate_gray(&mut buf, &mask, w, h, 0);
             Ok(PreviewResult::Gray(buf, w, h))
@@ -252,12 +265,15 @@ pub fn bake_single_map_preview(
             let buffer = if let Some((ref ctx, ref flat_bvh)) = gpu_ctx {
                 gpu::ao_baker::bake_ao_gpu(ctx, &grid.data, flat_bvh, &settings, true)
             } else {
-                (0..total).into_par_iter().map(|idx| {
-                    match &grid.data[idx] {
-                        Some(texel) => ao::bake_thickness_texel(texel, &accel, &settings, idx as u32),
+                (0..total)
+                    .into_par_iter()
+                    .map(|idx| match &grid.data[idx] {
+                        Some(texel) => {
+                            ao::bake_thickness_texel(texel, &accel, &settings, idx as u32)
+                        }
                         None => 1.0,
-                    }
-                }).collect()
+                    })
+                    .collect()
             };
             let mut buf = buffer;
             dilate::dilate_gray(&mut buf, &mask, w, h, 0);
@@ -269,18 +285,29 @@ pub fn bake_single_map_preview(
             }
             let hp = merged_hp.unwrap();
             // Projection rays
-            let hits: Vec<Option<crate::accel::HitRecord>> = (0..total).into_par_iter().map(|idx| {
-                let texel = match &grid.data[idx] { Some(t) => t, None => return None };
-                let origin = texel.position + texel.normal * config.max_frontal_distance;
-                let direction = -texel.normal;
-                let max_t = config.max_frontal_distance + config.max_rear_distance;
-                accel.trace_closest(origin, direction, max_t, auto_bias, config.ignore_backface)
-            }).collect();
+            let hits: Vec<Option<crate::accel::HitRecord>> = (0..total)
+                .into_par_iter()
+                .map(|idx| {
+                    let texel = match &grid.data[idx] {
+                        Some(t) => t,
+                        None => return None,
+                    };
+                    let origin = texel.position + texel.normal * config.max_frontal_distance;
+                    let direction = -texel.normal;
+                    let max_t = config.max_frontal_distance + config.max_rear_distance;
+                    accel.trace_closest(origin, direction, max_t, auto_bias, config.ignore_backface)
+                })
+                .collect();
 
             let mut buffer = vec![[0.5f32, 0.5, 1.0]; total];
             buffer.par_iter_mut().enumerate().for_each(|(idx, pixel)| {
                 if let (Some(texel), Some(hit)) = (&grid.data[idx], &hits[idx]) {
-                    *pixel = normal::bake_normal_texel(texel, hit, std::slice::from_ref(hp), config.normal_format);
+                    *pixel = normal::bake_normal_texel(
+                        texel,
+                        hit,
+                        std::slice::from_ref(hp),
+                        config.normal_format,
+                    );
                 }
             });
             let mut buf = buffer;
@@ -300,7 +327,10 @@ pub fn bake_single_map_preview(
         }
         MapType::Position => {
             let (bmin, bmax) = position::compute_texel_bounds(&grid.data);
-            let norm = PositionNormalization::BoundingBox { min: bmin, max: bmax };
+            let norm = PositionNormalization::BoundingBox {
+                min: bmin,
+                max: bmax,
+            };
             let mut buffer = vec![[0.0f32; 3]; total];
             buffer.par_iter_mut().enumerate().for_each(|(idx, pixel)| {
                 if let Some(texel) = &grid.data[idx] {
@@ -323,7 +353,13 @@ pub fn bake(
     cage_meshes: Option<&[Mesh]>,
     config: &BakeConfig,
 ) -> Result<(), String> {
-    bake_with_progress(low_poly_meshes, high_poly_meshes, cage_meshes, config, |_| {})
+    bake_with_progress(
+        low_poly_meshes,
+        high_poly_meshes,
+        cage_meshes,
+        config,
+        |_| {},
+    )
 }
 
 /// Run the full bake pipeline with a progress callback.
@@ -347,8 +383,14 @@ pub fn bake_with_progress(
     }
 
     // 1. Compute tangent basis for all low-poly meshes
-    log::info!("Computing MikkTSpace tangents for {} low-poly mesh(es)...", low_poly_meshes.len());
-    let tangent_data: Vec<_> = low_poly_meshes.iter().map(|m| tangent::compute_tangents(m)).collect();
+    log::info!(
+        "Computing MikkTSpace tangents for {} low-poly mesh(es)...",
+        low_poly_meshes.len()
+    );
+    let tangent_data: Vec<_> = low_poly_meshes
+        .iter()
+        .map(tangent::compute_tangents)
+        .collect();
 
     // Validate cage meshes if provided
     if let Some(cages) = cage_meshes {
@@ -363,7 +405,11 @@ pub fn bake_with_progress(
             if lp.positions.len() != cage.positions.len() {
                 return Err(format!(
                     "Cage mesh {} ('{}') has {} vertices but low-poly ('{}') has {} — must match",
-                    i, cage.name, cage.positions.len(), lp.name, lp.positions.len()
+                    i,
+                    cage.name,
+                    cage.positions.len(),
+                    lp.name,
+                    lp.positions.len()
                 ));
             }
         }
@@ -388,7 +434,11 @@ pub fn bake_with_progress(
     // Compute validity mask
     let mask: Vec<bool> = grid.data.iter().map(|t| t.is_some()).collect();
     let valid_count = mask.iter().filter(|&&v| v).count();
-    log::info!("{} texels covered ({:.1}% of texture)", valid_count, valid_count as f64 / total as f64 * 100.0);
+    log::info!(
+        "{} texels covered ({:.1}% of texture)",
+        valid_count,
+        valid_count as f64 / total as f64 * 100.0
+    );
 
     // 3. Merge and build BVH for high-poly
     // We merge all high-poly meshes into one so that GPU projection's global
@@ -396,7 +446,12 @@ pub fn bake_with_progress(
     let has_high_poly = !high_poly_meshes.is_empty();
     let merged_hp = if has_high_poly {
         let hp = if config.match_by_name {
-            filter_matched_meshes(high_poly_meshes, low_poly_meshes, &config.low_suffix, &config.high_suffix)
+            filter_matched_meshes(
+                high_poly_meshes,
+                low_poly_meshes,
+                &config.low_suffix,
+                &config.high_suffix,
+            )
         } else {
             high_poly_meshes.to_vec()
         };
@@ -445,7 +500,12 @@ pub fn bake_with_progress(
             if cap_distance && s.max_distance > diagonal {
                 s.max_distance = diagonal * 0.1;
             }
-            log::info!("Auto {} bias: {:.6} (mesh diagonal: {:.3})", label, s.bias, diagonal);
+            log::info!(
+                "Auto {} bias: {:.6} (mesh diagonal: {:.3})",
+                label,
+                s.bias,
+                diagonal
+            );
         }
         s
     };
@@ -465,8 +525,10 @@ pub fn bake_with_progress(
 
     // Auto-bias each ray-based baker independently
     let ao_settings = auto_bias_settings(config.ao_settings.clone(), "AO", false);
-    let thickness_settings = auto_bias_settings(config.thickness_settings.clone(), "thickness", true);
-    let bent_normal_settings = auto_bias_settings(config.bent_normal_settings.clone(), "bent-normal", false);
+    let thickness_settings =
+        auto_bias_settings(config.thickness_settings.clone(), "thickness", true);
+    let bent_normal_settings =
+        auto_bias_settings(config.bent_normal_settings.clone(), "bent-normal", false);
 
     // Initialize GPU if requested
     // We keep two flat BVHs: one for projection (high-poly) and one for
@@ -478,7 +540,8 @@ pub fn bake_with_progress(
                 let flat_bvh = gpu::flat_bvh::FlatBvh::from_accel(accel_ref);
                 log::info!(
                     "  GPU BVH: {} nodes, {} tris",
-                    flat_bvh.nodes.len(), flat_bvh.triangles.len()
+                    flat_bvh.nodes.len(),
+                    flat_bvh.triangles.len()
                 );
                 Some((ctx, flat_bvh))
             }
@@ -496,8 +559,8 @@ pub fn bake_with_progress(
         .map_err(|e| format!("Failed to create output directory: {e}"))?;
 
     // 4. Per-texel ray casting (for maps that need high-poly projection)
-    let needs_projection = has_high_poly
-        && (config.maps.normal || config.maps.world_normal || config.maps.height);
+    let needs_projection =
+        has_high_poly && (config.maps.normal || config.maps.world_normal || config.maps.height);
 
     let has_cage = cage_meshes.is_some();
     let hits: Vec<Option<crate::accel::HitRecord>> = if needs_projection {
@@ -531,7 +594,13 @@ pub fn bake_with_progress(
 
     // --- Helper closures for AA-aware output ---
     // Downsample + dilate + write for RGB maps
-    let write_rgb = |buffer: &[[f32; 3]], name: &str, ext: &str, dil: u32, write_fn: fn(&[[f32; 3]], u32, u32, &std::path::Path) -> Result<(), String>| -> Result<(), String> {
+    type RgbWriteFn = fn(&[[f32; 3]], u32, u32, &std::path::Path) -> Result<(), String>;
+    let write_rgb = |buffer: &[[f32; 3]],
+                     name: &str,
+                     ext: &str,
+                     dil: u32,
+                     write_fn: RgbWriteFn|
+     -> Result<(), String> {
         let (mut final_buf, final_mask) = if aa > 1 {
             (
                 supersample::downsample_rgb(buffer, w, h, aa),
@@ -580,17 +649,25 @@ pub fn bake_with_progress(
         progress("Baking normal map...");
         let mut buffer = vec![[0.5f32, 0.5, 1.0]; total];
 
-        buffer
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(idx, pixel)| {
-                if let (Some(texel), Some(hit)) = (&grid.data[idx], &hits[idx]) {
-                    let hp = merged_hp.as_ref().unwrap();
-                    *pixel = normal::bake_normal_texel(texel, hit, std::slice::from_ref(hp), config.normal_format);
-                }
-            });
+        buffer.par_iter_mut().enumerate().for_each(|(idx, pixel)| {
+            if let (Some(texel), Some(hit)) = (&grid.data[idx], &hits[idx]) {
+                let hp = merged_hp.as_ref().unwrap();
+                *pixel = normal::bake_normal_texel(
+                    texel,
+                    hit,
+                    std::slice::from_ref(hp),
+                    config.normal_format,
+                );
+            }
+        });
 
-        write_rgb(&buffer, "normal", "png", config.dilation, output::write_rgb_png)?;
+        write_rgb(
+            &buffer,
+            "normal",
+            "png",
+            config.dilation,
+            output::write_rgb_png,
+        )?;
     }
 
     // --- World Space Normal ---
@@ -599,22 +676,27 @@ pub fn bake_with_progress(
         progress("Baking world-space normals...");
         let mut buffer = vec![[0.5f32, 0.5, 1.0]; total];
 
-        buffer
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(idx, pixel)| {
-                if let Some(texel) = &grid.data[idx] {
-                    let hit_ref = if has_high_poly {
-                        hits[idx].as_ref().map(|h| (h, std::slice::from_ref(merged_hp.as_ref().unwrap())))
-                    } else {
-                        None
-                    };
-                    *pixel = normal::bake_world_normal_texel(texel, hit_ref);
-                }
-            });
+        buffer.par_iter_mut().enumerate().for_each(|(idx, pixel)| {
+            if let Some(texel) = &grid.data[idx] {
+                let hit_ref = if has_high_poly {
+                    hits[idx]
+                        .as_ref()
+                        .map(|h| (h, std::slice::from_ref(merged_hp.as_ref().unwrap())))
+                } else {
+                    None
+                };
+                *pixel = normal::bake_world_normal_texel(texel, hit_ref);
+            }
+        });
 
         if config.maps.world_normal {
-            write_rgb(&buffer, "world_normal", "png", config.dilation, output::write_rgb_png)?;
+            write_rgb(
+                &buffer,
+                "world_normal",
+                "png",
+                config.dilation,
+                output::write_rgb_png,
+            )?;
         }
 
         Some(buffer)
@@ -625,20 +707,22 @@ pub fn bake_with_progress(
     // --- Ambient Occlusion ---
     if config.maps.ao {
         let buffer = if let Some((ref ctx, ref flat_bvh)) = gpu_ctx {
-            log::info!("Baking ambient occlusion on GPU ({} rays per texel)...", ao_settings.ray_count);
+            log::info!(
+                "Baking ambient occlusion on GPU ({} rays per texel)...",
+                ao_settings.ray_count
+            );
             progress("Baking ambient occlusion...");
             gpu::ao_baker::bake_ao_gpu(ctx, &grid.data, flat_bvh, &ao_settings, false)
         } else {
-            log::info!("Baking ambient occlusion ({} rays per texel)...", ao_settings.ray_count);
+            log::info!(
+                "Baking ambient occlusion ({} rays per texel)...",
+                ao_settings.ray_count
+            );
             (0..total)
                 .into_par_iter()
-                .map(|idx| {
-                    match &grid.data[idx] {
-                        Some(texel) => {
-                            ao::bake_ao_texel(texel, accel_ref, &ao_settings, idx as u32)
-                        }
-                        None => 1.0,
-                    }
+                .map(|idx| match &grid.data[idx] {
+                    Some(texel) => ao::bake_ao_texel(texel, accel_ref, &ao_settings, idx as u32),
+                    None => 1.0,
                 })
                 .collect()
         };
@@ -653,7 +737,8 @@ pub fn bake_with_progress(
         let wn = world_normal_buffer
             .as_ref()
             .expect("World-space normals needed for curvature");
-        let buffer = curvature::compute_curvature_from_normals(wn, &mask, w, h, &curvature_settings);
+        let buffer =
+            curvature::compute_curvature_from_normals(wn, &mask, w, h, &curvature_settings);
 
         write_gray(&buffer, "curvature", config.dilation)?;
     }
@@ -669,35 +754,45 @@ pub fn bake_with_progress(
         };
 
         let mut buffer = vec![[0.0f32; 3]; total];
-        buffer
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(idx, pixel)| {
-                if let Some(texel) = &grid.data[idx] {
-                    *pixel = position::bake_position_texel(texel, &norm);
-                }
-            });
+        buffer.par_iter_mut().enumerate().for_each(|(idx, pixel)| {
+            if let Some(texel) = &grid.data[idx] {
+                *pixel = position::bake_position_texel(texel, &norm);
+            }
+        });
 
-        write_rgb(&buffer, "position", "exr", config.dilation, output::write_rgb_exr)?;
+        write_rgb(
+            &buffer,
+            "position",
+            "exr",
+            config.dilation,
+            output::write_rgb_exr,
+        )?;
     }
 
     // --- Thickness ---
     if config.maps.thickness {
         let buffer = if let Some((ref ctx, ref flat_bvh)) = gpu_ctx {
-            log::info!("Baking thickness on GPU ({} rays per texel)...", thickness_settings.ray_count);
+            log::info!(
+                "Baking thickness on GPU ({} rays per texel)...",
+                thickness_settings.ray_count
+            );
             progress("Baking thickness...");
             gpu::ao_baker::bake_ao_gpu(ctx, &grid.data, flat_bvh, &thickness_settings, true)
         } else {
-            log::info!("Baking thickness ({} rays per texel)...", thickness_settings.ray_count);
+            log::info!(
+                "Baking thickness ({} rays per texel)...",
+                thickness_settings.ray_count
+            );
             (0..total)
                 .into_par_iter()
-                .map(|idx| {
-                    match &grid.data[idx] {
-                        Some(texel) => {
-                            ao::bake_thickness_texel(texel, thickness_accel, &thickness_settings, idx as u32)
-                        }
-                        None => 1.0,
-                    }
+                .map(|idx| match &grid.data[idx] {
+                    Some(texel) => ao::bake_thickness_texel(
+                        texel,
+                        thickness_accel,
+                        &thickness_settings,
+                        idx as u32,
+                    ),
+                    None => 1.0,
                 })
                 .collect()
         };
@@ -730,25 +825,43 @@ pub fn bake_with_progress(
     // --- Bent Normals ---
     if config.maps.bent_normals {
         let buffer = if let Some((ref ctx, ref flat_bvh)) = gpu_ctx {
-            log::info!("Baking bent normals on GPU ({} rays per texel)...", bent_normal_settings.ray_count);
+            log::info!(
+                "Baking bent normals on GPU ({} rays per texel)...",
+                bent_normal_settings.ray_count
+            );
             progress("Baking bent normals...");
-            gpu::bent_normals::bake_bent_normals_gpu(ctx, &grid.data, flat_bvh, &bent_normal_settings)
+            gpu::bent_normals::bake_bent_normals_gpu(
+                ctx,
+                &grid.data,
+                flat_bvh,
+                &bent_normal_settings,
+            )
         } else {
-            log::info!("Baking bent normals ({} rays per texel)...", bent_normal_settings.ray_count);
+            log::info!(
+                "Baking bent normals ({} rays per texel)...",
+                bent_normal_settings.ray_count
+            );
             (0..total)
                 .into_par_iter()
-                .map(|idx| {
-                    match &grid.data[idx] {
-                        Some(texel) => {
-                            ao::bake_bent_normal_texel(texel, accel_ref, &bent_normal_settings, idx as u32)
-                        }
-                        None => [0.5, 0.5, 1.0],
-                    }
+                .map(|idx| match &grid.data[idx] {
+                    Some(texel) => ao::bake_bent_normal_texel(
+                        texel,
+                        accel_ref,
+                        &bent_normal_settings,
+                        idx as u32,
+                    ),
+                    None => [0.5, 0.5, 1.0],
                 })
                 .collect()
         };
 
-        write_rgb(&buffer, "bent_normals", "png", config.dilation, output::write_rgb_png)?;
+        write_rgb(
+            &buffer,
+            "bent_normals",
+            "png",
+            config.dilation,
+            output::write_rgb_png,
+        )?;
     }
 
     // --- ID Map ---
@@ -757,20 +870,14 @@ pub fn bake_with_progress(
         progress("Baking ID map...");
         let mut buffer = vec![[0.0f32; 3]; total];
 
-        buffer
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(idx, pixel)| {
-                if let Some(hit) = &hits[idx] {
-                    *pixel = id::bake_id_texel(hit, config.id_source);
-                } else if let Some(texel) = &grid.data[idx] {
-                    *pixel = id::bake_id_from_lowpoly(
-                        texel.mesh_index,
-                        texel.tri_index,
-                        config.id_source,
-                    );
-                }
-            });
+        buffer.par_iter_mut().enumerate().for_each(|(idx, pixel)| {
+            if let Some(hit) = &hits[idx] {
+                *pixel = id::bake_id_texel(hit, config.id_source);
+            } else if let Some(texel) = &grid.data[idx] {
+                *pixel =
+                    id::bake_id_from_lowpoly(texel.mesh_index, texel.tri_index, config.id_source);
+            }
+        });
 
         // Minimal dilation for ID maps (crisp edges)
         dilate::dilate_rgb(&mut buffer, &mask, w, h, 4);
@@ -841,10 +948,7 @@ fn filter_matched_meshes(
     high_poly
         .iter()
         .filter(|hp| {
-            let hp_base = hp
-                .name
-                .strip_suffix(high_suffix)
-                .unwrap_or(&hp.name);
+            let hp_base = hp.name.strip_suffix(high_suffix).unwrap_or(&hp.name);
             low_base_names.iter().any(|lb| hp_base.starts_with(lb))
         })
         .cloned()

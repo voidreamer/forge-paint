@@ -8,7 +8,7 @@ use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
 
 use crate::paint::layer::{BlendMode, LayerStack};
-use crate::paint::target::{defaults, PaintTarget};
+use crate::paint::target::{PaintTarget, defaults};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]

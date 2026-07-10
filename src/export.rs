@@ -3,7 +3,7 @@
 //! All copies are batched into a single encoder submission, all buffer maps
 //! into one `device.poll(Wait)`, and PNG encoding is parallelised with rayon.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use egui_wgpu::wgpu;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};

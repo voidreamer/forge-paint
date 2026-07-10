@@ -60,7 +60,14 @@ pub fn bake_ao_texel(
     let mut unoccluded = 0u32;
 
     for i in 0..settings.ray_count {
-        let dir = sample_hemisphere(texel.normal, i, settings.ray_count, rng_seed, settings.spread_angle, settings.distribution);
+        let dir = sample_hemisphere(
+            texel.normal,
+            i,
+            settings.ray_count,
+            rng_seed,
+            settings.spread_angle,
+            settings.distribution,
+        );
 
         let occluded = accel.trace_any_hit(
             origin,
@@ -90,7 +97,14 @@ pub fn bake_bent_normal_texel(
     let mut bent = Vec3::ZERO;
 
     for i in 0..settings.ray_count {
-        let dir = sample_hemisphere(texel.normal, i, settings.ray_count, rng_seed, settings.spread_angle, settings.distribution);
+        let dir = sample_hemisphere(
+            texel.normal,
+            i,
+            settings.ray_count,
+            rng_seed,
+            settings.spread_angle,
+            settings.distribution,
+        );
 
         let occluded = accel.trace_any_hit(
             origin,
@@ -111,11 +125,7 @@ pub fn bake_bent_normal_texel(
         texel.normal
     };
 
-    [
-        bent.x * 0.5 + 0.5,
-        bent.y * 0.5 + 0.5,
-        bent.z * 0.5 + 0.5,
-    ]
+    [bent.x * 0.5 + 0.5, bent.y * 0.5 + 0.5, bent.z * 0.5 + 0.5]
 }
 
 /// Bake thickness at a single texel.
@@ -138,7 +148,14 @@ pub fn bake_thickness_texel(
     let mut unoccluded = 0u32;
 
     for i in 0..settings.ray_count {
-        let dir = sample_hemisphere(inverted_normal, i, settings.ray_count, rng_seed, settings.spread_angle, settings.distribution);
+        let dir = sample_hemisphere(
+            inverted_normal,
+            i,
+            settings.ray_count,
+            rng_seed,
+            settings.spread_angle,
+            settings.distribution,
+        );
 
         let occluded = accel.trace_any_hit(
             origin,
@@ -210,7 +227,7 @@ fn sample_hemisphere(
 
 /// Van der Corput radical inverse (base 2) for Hammersley sequence.
 fn radical_inverse_vdc(mut bits: u32) -> f32 {
-    bits = (bits << 16) | (bits >> 16);
+    bits = bits.rotate_right(16);
     bits = ((bits & 0x55555555) << 1) | ((bits & 0xAAAAAAAA) >> 1);
     bits = ((bits & 0x33333333) << 2) | ((bits & 0xCCCCCCCC) >> 2);
     bits = ((bits & 0x0F0F0F0F) << 4) | ((bits & 0xF0F0F0F0) >> 4);

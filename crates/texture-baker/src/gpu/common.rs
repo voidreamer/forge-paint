@@ -34,7 +34,10 @@ pub fn pack_texels(texel_data: &[Option<TexelData>]) -> Vec<GpuTexel> {
 }
 
 /// Read back data from a GPU buffer. Blocks until the data is available.
-pub fn read_back_buffer<'a>(device: &wgpu::Device, buffer: &'a wgpu::Buffer) -> wgpu::BufferView<'a> {
+pub fn read_back_buffer<'a>(
+    device: &wgpu::Device,
+    buffer: &'a wgpu::Buffer,
+) -> wgpu::BufferView<'a> {
     let slice = buffer.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {

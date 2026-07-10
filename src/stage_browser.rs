@@ -229,11 +229,7 @@ impl StageBrowser {
             // row label so clicking the name selects without
             // collapsing.
             let chevron = if has_children {
-                if is_expanded {
-                    "▼"
-                } else {
-                    "▶"
-                }
+                if is_expanded { "▼" } else { "▶" }
             } else {
                 "  "
             };

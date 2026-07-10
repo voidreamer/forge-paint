@@ -170,20 +170,6 @@ pub fn load_cage(path: &std::path::Path) -> Result<CpuMesh, String> {
     })
 }
 
-/// Convert a forge-paint mesh into a single texture-baker mesh. UVs
-/// stay in their UDIM-tiled space; the per-tile splitter below handles
-/// the [0, 1] remap.
-#[allow(dead_code)]
-fn to_baker_mesh(name: &str, mesh: &CpuMesh) -> BakerMesh {
-    BakerMesh {
-        name: name.to_string(),
-        positions: mesh.positions.clone(),
-        normals: mesh.normals.clone(),
-        uvs: mesh.uvs.iter().map(|uv| [uv.x, uv.y]).collect(),
-        indices: mesh.indices.clone(),
-    }
-}
-
 /// Build a per-tile mesh + optional matching cage. Triangles are kept
 /// when their UV centroid lands in `tile_id`; UVs get remapped into
 /// `[0, 1]` so texture-baker rasterises them as a single tile.
@@ -526,9 +512,3 @@ pub fn bake_map(
         tile_count,
     })
 }
-
-// Use sites in the GUI come in phase 3 (MeshMaps slots) and phase 4
-// (panel UI). Until then the function is dead; the unused-import
-// allowance keeps cargo quiet across the partial-rollout window.
-#[allow(dead_code)]
-const _: () = ();

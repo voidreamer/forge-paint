@@ -2,7 +2,7 @@
 //! that can be dropped onto layers. Mirrors ArmorPaint's Browser/Meshes/Textures
 //! tabs at the bottom of the viewport.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use egui_wgpu::wgpu;
 use std::path::{Path, PathBuf};
 

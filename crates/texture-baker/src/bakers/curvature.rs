@@ -89,7 +89,11 @@ fn sobel_at_radius(
             [n[0] * 2.0 - 1.0, n[1] * 2.0 - 1.0, n[2] * 2.0 - 1.0]
         } else {
             let center = normals[y * w + x];
-            [center[0] * 2.0 - 1.0, center[1] * 2.0 - 1.0, center[2] * 2.0 - 1.0]
+            [
+                center[0] * 2.0 - 1.0,
+                center[1] * 2.0 - 1.0,
+                center[2] * 2.0 - 1.0,
+            ]
         }
     };
 
@@ -109,12 +113,10 @@ fn sobel_at_radius(
     let bc = decode(x, yd);
     let br = decode(xr, yd);
 
-    let gx = |c: usize| -> f32 {
-        (-tl[c] + tr[c] - 2.0 * ml[c] + 2.0 * mr[c] - bl[c] + br[c]) / 8.0
-    };
-    let gy = |c: usize| -> f32 {
-        (-tl[c] - 2.0 * tc[c] - tr[c] + bl[c] + 2.0 * bc[c] + br[c]) / 8.0
-    };
+    let gx =
+        |c: usize| -> f32 { (-tl[c] + tr[c] - 2.0 * ml[c] + 2.0 * mr[c] - bl[c] + br[c]) / 8.0 };
+    let gy =
+        |c: usize| -> f32 { (-tl[c] - 2.0 * tc[c] - tr[c] + bl[c] + 2.0 * bc[c] + br[c]) / 8.0 };
 
     // Divergence (signed curvature)
     let div = gx(0) + gy(1);

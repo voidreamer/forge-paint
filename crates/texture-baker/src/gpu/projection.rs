@@ -45,10 +45,10 @@ pub fn project_rays_gpu(
     let gpu_texels = common::pack_texels(texel_data);
 
     let workgroup_size = 64u32;
-    let total_workgroups = (total as u32 + workgroup_size - 1) / workgroup_size;
+    let total_workgroups = (total as u32).div_ceil(workgroup_size);
     let max_dim = 65535u32;
     let wg_x = total_workgroups.min(max_dim);
-    let wg_y = (total_workgroups + wg_x - 1) / wg_x;
+    let wg_y = total_workgroups.div_ceil(wg_x);
 
     let params = GpuParams {
         frontal_distance,
@@ -132,11 +132,26 @@ pub fn project_rays_gpu(
         label: Some("proj_bg"),
         layout: &bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: texel_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: node_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: tri_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: param_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: output_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: texel_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: node_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: tri_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: param_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: output_buffer.as_entire_binding(),
+            },
         ],
     });
 

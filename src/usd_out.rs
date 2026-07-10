@@ -11,7 +11,7 @@
 //! terribly with vertex count, the crate format is the production
 //! choice.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 pub fn write_usda_document(text: &str, dest: &Path) -> Result<()> {

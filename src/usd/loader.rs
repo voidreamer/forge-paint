@@ -4,7 +4,7 @@
 //! `ForgeAwareResolver` becomes the no-op primary, our resolver wins for
 //! `forge://`.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use glam::{Mat3, Mat4, Vec2, Vec3};
 use std::path::Path;
 
@@ -528,11 +528,7 @@ fn normal_matrix_from_xform(m: &Mat4) -> Mat3 {
     // correction when reading the stage, which is why mirrored
     // sub-meshes look right in the Hydra view but were wrong on the
     // wgpu side.
-    if m3.determinant() < 0.0 {
-        -it
-    } else {
-        it
-    }
+    if m3.determinant() < 0.0 { -it } else { it }
 }
 
 fn compute_face_normal(m: &UsdMesh, off: usize, count: usize) -> Vec3 {
@@ -549,11 +545,7 @@ fn compute_face_normal(m: &UsdMesh, off: usize, count: usize) -> Vec3 {
     // leftHanded winds CW from the outside, so the cross product
     // yields the inward normal. Flip so the per-face fallback (used
     // when no authored normals primvar exists) still points outward.
-    if m.left_handed {
-        -n
-    } else {
-        n
-    }
+    if m.left_handed { -n } else { n }
 }
 
 #[allow(clippy::too_many_arguments)]

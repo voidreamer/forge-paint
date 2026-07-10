@@ -4734,13 +4734,8 @@ impl App {
             }
             Some(HydraStartupState::Failed(failure)) => {
                 let title = format!("{delegate_label} did not start");
-                let retry = Self::draw_hydra_startup_overlay(
-                    ui,
-                    rect,
-                    &title,
-                    &failure.message,
-                    true,
-                );
+                let retry =
+                    Self::draw_hydra_startup_overlay(ui, rect, &title, &failure.message, true);
                 if retry {
                     *hydra_startup = None;
                 }
@@ -4942,9 +4937,7 @@ impl App {
             // the console-less release build otherwise vanishes with no
             // trace. The matching "switch OK" line tells us whether the
             // crash is in SetRendererPlugin itself or the render after.
-            log::info!(
-                "Hydra: switching delegate '{current_delegate}' -> '{desired_delegate}'"
-            );
+            log::info!("Hydra: switching delegate '{current_delegate}' -> '{desired_delegate}'");
             match hydra.set_delegate(&desired_delegate) {
                 Ok(()) => log::info!("Hydra: delegate switch to '{desired_delegate}' returned OK"),
                 Err(e) => log::warn!("Hydra: delegate switch failed: {e:#}"),
@@ -5148,9 +5141,7 @@ impl App {
             }
         });
         if first_on_delegate {
-            log::info!(
-                "Hydra: first render begin on delegate '{active_delegate}' ({w}x{h})"
-            );
+            log::info!("Hydra: first render begin on delegate '{active_delegate}' ({w}x{h})");
         }
         match hydra.render(&view_row, &proj_row) {
             Ok(pixels) => {

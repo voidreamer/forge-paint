@@ -16,7 +16,7 @@ struct JfaParams {
 /// Runs in O(log N) passes where N = max(width, height).
 pub fn dilate_rgb_gpu(
     ctx: &GpuContext,
-    buffer: &mut Vec<[f32; 3]>,
+    buffer: &mut [[f32; 3]],
     mask: &[bool],
     width: u32,
     height: u32,
@@ -32,18 +32,14 @@ pub fn dilate_rgb_gpu(
 
     // Unflatten back to RGB
     for i in 0..total {
-        buffer[i] = [
-            result[i * 3],
-            result[i * 3 + 1],
-            result[i * 3 + 2],
-        ];
+        buffer[i] = [result[i * 3], result[i * 3 + 1], result[i * 3 + 2]];
     }
 }
 
 /// Dilate a grayscale buffer on the GPU using Jump Flooding Algorithm.
 pub fn dilate_gray_gpu(
     ctx: &GpuContext,
-    buffer: &mut Vec<f32>,
+    buffer: &mut [f32],
     mask: &[bool],
     width: u32,
     height: u32,
@@ -167,22 +163,52 @@ fn run_jfa(
         label: Some("jfa_bg_a2b"),
         layout: &bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: param_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: data_buf_a.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: data_buf_b.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: mask_buf_a.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: mask_buf_b.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: param_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: data_buf_a.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: data_buf_b.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: mask_buf_a.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: mask_buf_b.as_entire_binding(),
+            },
         ],
     });
     let bg_b_to_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("jfa_bg_b2a"),
         layout: &bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: param_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: data_buf_b.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: data_buf_a.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: mask_buf_b.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: mask_buf_a.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: param_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: data_buf_b.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: data_buf_a.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: mask_buf_b.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: mask_buf_a.as_entire_binding(),
+            },
         ],
     });
 
@@ -201,8 +227,8 @@ fn run_jfa(
         cache: None,
     });
 
-    let wg_x = (width + 7) / 8;
-    let wg_y = (height + 7) / 8;
+    let wg_x = width.div_ceil(8);
+    let wg_y = height.div_ceil(8);
 
     // JFA passes: step_size = max_dim/2, max_dim/4, ..., 2, 1
     let max_dim = width.max(height);
@@ -243,7 +269,11 @@ fn run_jfa(
     }
 
     // Read back from whichever buffer has the final result
-    let final_data_buf = if use_a_as_input { &data_buf_a } else { &data_buf_b };
+    let final_data_buf = if use_a_as_input {
+        &data_buf_a
+    } else {
+        &data_buf_b
+    };
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jfa_readback"),
         size: (total_floats * 4) as u64,

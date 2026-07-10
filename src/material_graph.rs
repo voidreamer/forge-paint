@@ -18,8 +18,8 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use egui_snarl::{
-    ui::{PinInfo, SnarlViewer},
     InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
+    ui::{PinInfo, SnarlViewer},
 };
 
 use crate::assets::ShaderInputNames;

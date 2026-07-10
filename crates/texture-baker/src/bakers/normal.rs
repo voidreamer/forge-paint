@@ -26,7 +26,8 @@ pub fn bake_normal_texel(
 
     // Interpolate high-poly normal at hit point using barycentric coords
     let w0 = 1.0 - hit.u - hit.v;
-    let hp_normal = (hp_normals[0] * w0 + hp_normals[1] * hit.u + hp_normals[2] * hit.v).normalize();
+    let hp_normal =
+        (hp_normals[0] * w0 + hp_normals[1] * hit.u + hp_normals[2] * hit.v).normalize();
 
     // Transform high-poly world-space normal into low-poly tangent space
     // TBN^-1 * N_highpoly = (dot(T, N_hp), dot(B, N_hp), dot(N, N_hp))
@@ -50,10 +51,7 @@ pub fn bake_normal_texel(
 }
 
 /// Bake a world-space normal at a texel (from low-poly if no hit, from high-poly if hit).
-pub fn bake_world_normal_texel(
-    texel: &TexelData,
-    hit: Option<(&HitRecord, &[Mesh])>,
-) -> [f32; 3] {
+pub fn bake_world_normal_texel(texel: &TexelData, hit: Option<(&HitRecord, &[Mesh])>) -> [f32; 3] {
     let normal = if let Some((h, meshes)) = hit {
         let hp_mesh = &meshes[h.mesh_index];
         let hp_tri = &hp_mesh.indices[h.tri_index];
