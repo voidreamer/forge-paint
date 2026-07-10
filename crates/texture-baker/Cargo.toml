@@ -2,6 +2,7 @@
 name = "texture-baker"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [lib]
 name = "texture_baker"

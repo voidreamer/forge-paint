@@ -5,6 +5,7 @@ members = ["crates/texture-baker"]
 name = "forge-paint"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 build = "build.rs"
 
 [dependencies]
