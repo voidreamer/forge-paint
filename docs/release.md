@@ -127,9 +127,12 @@ builds still attempt hdNSI packaging opportunistically and skip it if 3Delight
 is unavailable. Use one of:
 
 - a self-hosted runner with `DELIGHT` pointing at the 3Delight install, or
-- a repo archive at `.github/3delight-windows.zip`, or
 - a repository secret named `DELIGHT_WINDOWS_ARCHIVE_URL` pointing at a private
-  zip that contains a 3Delight install tree with `bin/renderdl.exe`.
+  zip that contains a 3Delight install tree with `bin/renderdl.exe` (the SDK is
+  proprietary, so it must not be committed to this public repo — an earlier
+  in-repo `.github/3delight-windows.zip` was removed for that reason; a local
+  archive path can still be supplied via `DELIGHT_WINDOWS_ARCHIVE_PATH` on
+  self-hosted runners).
 
 At runtime on Windows, forge-paint searches for 3Delight in this order:
 

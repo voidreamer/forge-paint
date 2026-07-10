@@ -55,9 +55,10 @@ function Find-DelightRoot {
 
   $message = @"
 hdNSI packaging requires 3Delight.
-Set DELIGHT on a self-hosted runner, commit .github/3delight-windows.zip,
-or add a DELIGHT_WINDOWS_ARCHIVE_URL repository secret that points at a zip
-containing a 3Delight install tree.
+Add a DELIGHT_WINDOWS_ARCHIVE_URL repository secret that points at a zip
+containing a 3Delight install tree, or (on a self-hosted runner) set
+DELIGHT to an existing install / DELIGHT_WINDOWS_ARCHIVE_PATH to a local
+archive. The proprietary SDK zip must not be committed to this public repo.
 "@
   if ($SkipIfMissing) {
     Write-Warning $message

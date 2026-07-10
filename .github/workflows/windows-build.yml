@@ -155,7 +155,6 @@ jobs:
         shell: pwsh
         env:
           DELIGHT_WINDOWS_ARCHIVE_URL: ${{ secrets.DELIGHT_WINDOWS_ARCHIVE_URL }}
-          DELIGHT_WINDOWS_ARCHIVE_PATH: ${{ github.workspace }}\.github\3delight-windows.zip
         run: |
           .github\scripts\package-hdnsi-windows.ps1 `
             -UsdInstallDir "$env:USD_INSTALL_DIR" `
@@ -166,7 +165,6 @@ jobs:
         shell: pwsh
         env:
           DELIGHT_WINDOWS_ARCHIVE_URL: ${{ secrets.DELIGHT_WINDOWS_ARCHIVE_URL }}
-          DELIGHT_WINDOWS_ARCHIVE_PATH: ${{ github.workspace }}\.github\3delight-windows.zip
         run: |
           .github\scripts\package-hdnsi-windows.ps1 `
             -UsdInstallDir "$env:USD_INSTALL_DIR" `
